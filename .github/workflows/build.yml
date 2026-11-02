@@ -1,0 +1,112 @@
+name: Build nine9wham IPA
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "tweak/**"
+      - "scripts/**"
+      - ".github/workflows/build.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  BASE_TAG: base
+  OUT_TAG: nine9wham
+  BASE_IPA: com.burbn.instagram_453.0_und3fined.ipa
+  OUT_IPA: nine9wham_instagram_453.ipa
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Telecharger la base IPA (release asset "base")
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release download "$BASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$BASE_IPA" \
+            --dir "$RUNNER_TEMP/base" \
+            --clobber
+          ls -lh "$RUNNER_TEMP/base"
+          test -f "$RUNNER_TEMP/base/$BASE_IPA"
+
+      - name: Compiler Peter.dylib (arm64, iOS)
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          xcrun -sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=16.3 \
+            -O2 -fobjc-arc \
+            -Wall -Wextra -Wno-unused-parameter \
+            -dynamiclib \
+            -install_name @rpath/Peter.dylib \
+            -framework Foundation -framework UIKit -framework CoreLocation -framework Security \
+            -o build/Peter.dylib \
+            tweak/Peter.m
+          echo "--- infos dylib ---"
+          vtool -show build/Peter.dylib | sed -n '1,40p' || true
+          file build/Peter.dylib
+          ls -lh build/Peter.dylib
+
+      - name: Injecter @rpath/Peter.dylib dans le binaire Instagram
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/ipa"
+          mkdir -p "$WORK"
+          ditto -x -k "$RUNNER_TEMP/base/$BASE_IPA" "$WORK"
+          APP="$WORK/Payload/Instagram.app"
+          test -f "$APP/Instagram"
+
+          python3 scripts/inject_dylib.py "$APP/Instagram" Peter.dylib
+
+          # Le dylib partage le LC_RPATH deja present: @executable_path/Frameworks
+          mkdir -p "$APP/Frameworks"
+          cp build/Peter.dylib "$APP/Frameworks/Peter.dylib"
+          codesign --force --sign - --timestamp=none "$APP/Frameworks/Peter.dylib"
+          echo "Framework copie + signe (ad-hoc)"
+
+      - name: Repacker l'IPA
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/ipa"
+          OUT="$RUNNER_TEMP/$OUT_IPA"
+          rm -f "$OUT"
+          cd "$WORK"
+          # zip -r sans metadonnees Apple, ordre Payload/ en premier
+          ditto -c -k --sequesterRsrc --keepParent Payload "$OUT"
+          ls -lh "$OUT"
+          echo "OUT=$OUT" >> "$GITHUB_ENV"
+
+      - name: Verifier l'IPA (structure + signature)
+        run: |
+          set -euo pipefail
+          python3 scripts/verify_ipa.py "$OUT"
+
+      - name: Publier l'IPA en release publique
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$OUT_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$OUT_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "@nine9wham - Instagram modifie (conteneurs + fake GPS)" \
+              --notes "Build automatique. Installe via Sideloadly (cert 7 jours)."
+          fi
+          gh release upload "$OUT_TAG" "$OUT" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          echo "URL: https://github.com/$GITHUB_REPOSITORY/releases/download/$OUT_TAG/$OUT_IPA"
+
+      - name: Lien de telechargement
+        run: |
+          echo "### @nine9wham" >> "$GITHUB_STEP_SUMMARY"
+          echo "IPA: https://github.com/$GITHUB_REPOSITORY/releases/download/$OUT_TAG/$OUT_IPA" >> "$GITHUB_STEP_SUMMARY"

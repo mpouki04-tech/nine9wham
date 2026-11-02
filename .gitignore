@@ -1,0 +1,18 @@
+# Build
+build/
+*.dylib
+*.ipa
+!base_ipa/.gitkeep
+
+# OS / editeurs
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Secrets (jamais committer)
+*.p12
+*.mobileprovision
+*.cer
+.env
