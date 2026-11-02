@@ -28,7 +28,6 @@
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
 #import <dispatch/dispatch.h>
 #include <stdlib.h>
 #include <string.h>
@@ -460,8 +459,8 @@ static void NWRebindGOT(void) {
             if (slots[i] == targets[t]) {
                 // ecriture : __DATA_CONST,__got est passe en lecture seule apres
                 // binding. Pages iOS = 16 Ko -> alignement sur 0x4000.
-                mach_vm_address_t page = (mach_vm_address_t)((uintptr_t)&slots[i] & ~(uintptr_t)0x3FFF);
-                vm_protect(mach_task_self(), page, 0x4000, 0,
+                vm_address_t page = (vm_address_t)((uintptr_t)&slots[i] & ~(uintptr_t)0x3FFF);
+                vm_protect(mach_task_self(), page, (vm_size_t)0x4000, 0,
                            VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
                 *(origs[t]) = targets[t];
                 slots[i] = repls[t];
@@ -1270,8 +1269,10 @@ static void NWInstallFloatingButton(void) {
 
         CGPoint pos = CGPointMake(key.bounds.size.width - 56, key.bounds.size.height * 0.42);
         NSDictionary *ui = (NWState ?: @{})[@"ui"];
-        if ([ui[@"x"] isKindOfClass:[NSNumber class]]) {
-            pos = CGPointMake(ui[@"x"].doubleValue, ui[@"y"].doubleValue);
+        NSNumber *ux = ([ui[@"x"] isKindOfClass:[NSNumber class]]) ? ui[@"x"] : nil;
+        NSNumber *uy = ([ui[@"y"] isKindOfClass:[NSNumber class]]) ? ui[@"y"] : nil;
+        if (ux && uy) {
+            pos = CGPointMake(ux.doubleValue, uy.doubleValue);
         }
 
         NWMenuButton = [NWFloatingButton buttonWithType:UIButtonTypeCustom];
