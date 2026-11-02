@@ -28,6 +28,8 @@
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
 #import <mach/mach.h>
+#import <mach/mach_vm.h>
+#import <dispatch/dispatch.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -456,9 +458,10 @@ static void NWRebindGOT(void) {
         for (int t = 0; t < 3; t++) {
             if (!targets[t]) continue;
             if (slots[i] == targets[t]) {
-                // ecriture : la section peut etre en lecture seule -> vm_protect
-                mach_vm_address_t page = (mach_vm_address_t)((uintptr_t)&slots[i] & ~(uintptr_t)0xFFF);
-                vm_protect(mach_task_self(), page, 0x1000, false,
+                // ecriture : __DATA_CONST,__got est passe en lecture seule apres
+                // binding. Pages iOS = 16 Ko -> alignement sur 0x4000.
+                mach_vm_address_t page = (mach_vm_address_t)((uintptr_t)&slots[i] & ~(uintptr_t)0x3FFF);
+                vm_protect(mach_task_self(), page, 0x4000, 0,
                            VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
                 *(origs[t]) = targets[t];
                 slots[i] = repls[t];
