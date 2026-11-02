@@ -1244,16 +1244,7 @@ static void NWAskRelaunch(NSString *raison) {
     [top presentViewController:a animated:YES completion:nil];
 }
 
-// ---------------------------------------------------------------------------
-// Fenetre overlay persistante (corrige le bouton qui disparaissait)
-// ---------------------------------------------------------------------------
-
-static UIWindow *NWOverlayWindow = nil;
-static UIViewController *NWOverlayRoot = nil;
-static UIButton *NWMenuButton = nil;
-static UIViewController *NWDashInstance = nil;
-
-static void NWTogglePanel(void);   // declaration anticipee
+// Fenetre overlay persistante (geree plus bas)
 
 @interface NWPassthroughView : UIView @end
 @implementation NWPassthroughView
