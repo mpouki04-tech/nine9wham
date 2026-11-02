@@ -1441,7 +1441,7 @@ static void NWInstallFloatingButton(void) {
                        title:(NSString *)title
                     subtitle:(NSString *)subtitle
                         tint:(UIColor *)tint {
-    self = [super initWithFrame:CGRectZero];
+    self = [super initWithFrame:CGRectMake(0, 0, 0, 0)];
     if (!self) return nil;
     self.backgroundColor = NWCardColor();
     self.layer.cornerRadius = 16;
@@ -1509,7 +1509,7 @@ static void NWInstallFloatingButton(void) {
 @implementation NWRowView
 
 - (instancetype)initWithIcon:(NSString *)icon title:(NSString *)title value:(NSString *)value {
-    self = [super initWithFrame:CGRectZero];
+    self = [super initWithFrame:CGRectMake(0, 0, 0, 0)];
     if (!self) return nil;
     self.backgroundColor = UIColor.clearColor;
 
@@ -1578,7 +1578,7 @@ static void NWInstallFloatingButton(void) {
 @implementation NWSwitchRow
 
 - (instancetype)initWithIcon:(NSString *)icon title:(NSString *)title on:(BOOL)on {
-    self = [super initWithFrame:CGRectZero];
+    self = [super initWithFrame:CGRectMake(0, 0, 0, 0)];
     if (!self) return nil;
 
     _iconView = [[UIImageView alloc] initWithImage:NWSymbol(icon, 15)];
@@ -1649,7 +1649,7 @@ static void NWInstallFloatingButton(void) {
     UIButton *close = NWIconButton(@"xmark", ^(id s){ [self closeSelf]; });
     [sheet addSubview:close];
 
-    UITableView *table = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
+    UITableView *table = [[UITableView alloc] initWithFrame:CGRectMake(0, 0, 0, 0) style:UITableViewStylePlain];
     table.backgroundColor = UIColor.clearColor;
     table.separatorColor = NWLine();
     table.dataSource = self;
@@ -1869,7 +1869,7 @@ static void NWInstallFloatingButton(void) {
 
 - (void)openModule:(NSString *)module {
     self.module = module;
-    [self.scroll setContentOffset:CGPointZero animated:NO];
+    [self.scroll setContentOffset:CGPointMake(0, 0) animated:NO];
     [self rebuild];
 }
 
