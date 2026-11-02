@@ -1323,6 +1323,8 @@ static void NWEnsureOverlay(void) {
 // Bouton flottant (draggable, design Blaze)
 // ---------------------------------------------------------------------------
 
+static void NWTogglePanel(void);   // declare avant NWFloatingButton
+
 @interface NWFloatingButton : UIButton
 @property (nonatomic, assign) CGPoint touchStart;
 @property (nonatomic, assign) BOOL dragging;
