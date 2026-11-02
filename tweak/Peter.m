@@ -18,7 +18,6 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <CoreLocation/CoreLocation.h>
-#import <CFNetwork/CFNetwork.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -1181,6 +1180,12 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
 
 // --- Alertes / navigation ------------------------------------------------
 
+// Etat de l'overlay (declare tot : utilise par NWTopVC).
+static UIWindow *NWOverlayWindow = nil;
+static UIViewController *NWOverlayRoot = nil;
+static UIButton *NWMenuButton = nil;
+static UIViewController *NWDashInstance = nil;
+
 static UIViewController *NWTopVC(void);
 
 static void NWAlert(NSString *title, NSString *msg) {
@@ -2075,7 +2080,6 @@ static void NWInstallFloatingButton(void) {
 
 - (void)buildLocation {
     NSDictionary *loc = NWActiveLoc ?: @{};
-    NSDictionary *c = NWActiveContainerDict();
     BOOL on = [loc[@"on"] boolValue];
     double lat = [loc[@"lat"] doubleValue];
     double lon = [loc[@"lon"] doubleValue];
@@ -2787,12 +2791,12 @@ static id NWHook_defaultSessionCfg(id self, SEL _cmd) {
     NSDictionary *p = NWActiveProxy();
     if ([p[@"on"] boolValue] && [p[@"host"] length] && [p[@"port"] length]) {
         NSMutableDictionary *proxy = [NSMutableDictionary dictionary];
-        proxy[(__bridge NSString *)kCFNetworkProxiesHTTPSEnable] = @YES;
-        proxy[(__bridge NSString *)kCFNetworkProxiesHTTPSProxy] = p[@"host"];
-        proxy[(__bridge NSString *)kCFNetworkProxiesHTTPSPort] = @([p[@"port"] integerValue]);
-        proxy[(__bridge NSString *)kCFNetworkProxiesHTTPEnable] = @YES;
-        proxy[(__bridge NSString *)kCFNetworkProxiesHTTPProxy] = p[@"host"];
-        proxy[(__bridge NSString *)kCFNetworkProxiesHTTPPort] = @([p[@"port"] integerValue]);
+        proxy[@"HTTPSEnable"] = @YES;
+        proxy[@"HTTPSProxy"] = p[@"host"];
+        proxy[@"HTTPSPort"] = @([p[@"port"] integerValue]);
+        proxy[@"HTTPEnable"] = @YES;
+        proxy[@"HTTPProxy"] = p[@"host"];
+        proxy[@"HTTPPort"] = @([p[@"port"] integerValue]);
         [cfg setConnectionProxyDictionary:proxy];
     }
     return cfg;
