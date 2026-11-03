@@ -1412,15 +1412,26 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
     pin.userInteractionEnabled = NO;
     [self.view addSubview:pin];
 
-    // Barre de recherche
+    // Barre de recherche (design Blaze : champ arrondi sombre, texte blanc)
     _search = [[UISearchBar alloc] initWithFrame:CGRectZero];
     _search.translatesAutoresizingMaskIntoConstraints = NO;
-    _search.placeholder = @"Search...";
     _search.delegate = self;
     _search.searchBarStyle = UISearchBarStyleMinimal;
-    _search.backgroundColor = [UIColor colorWithWhite:0 alpha:0.35];
-    _search.layer.cornerRadius = 12;
-    _search.clipsToBounds = YES;
+    _search.backgroundColor = UIColor.clearColor;
+    _search.tintColor = NWAccent();
+    if (@available(iOS 13.0, *)) {
+        UITextField *tf = _search.searchTextField;
+        tf.backgroundColor = [UIColor colorWithWhite:1 alpha:0.10];
+        tf.textColor = UIColor.whiteColor;
+        tf.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
+        tf.layer.cornerRadius = 14;
+        tf.layer.masksToBounds = YES;
+        tf.attributedPlaceholder = [[NSAttributedString alloc]
+            initWithString:@"Search a place..."
+                attributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.45]}];
+    } else {
+        _search.placeholder = @"Search a place...";
+    }
     [self.view addSubview:_search];
 
     // Résultats de recherche
@@ -1873,9 +1884,9 @@ static void NWInstallFloatingButton(void) {
         b.layer.shadowOpacity = 0.55;
         b.layer.shadowRadius = 10;
         b.layer.shadowOffset = CGSizeMake(0, 4);
-        [b setTitle:@"9" forState:UIControlStateNormal];
+        [b setTitle:@"99" forState:UIControlStateNormal];
         [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-        b.titleLabel.font = [UIFont systemFontOfSize:24 weight:UIFontWeightHeavy];
+        b.titleLabel.font = [UIFont systemFontOfSize:21 weight:UIFontWeightHeavy];
         b.accessibilityLabel = @"Menu nine9wham";
         NWMenuButton = b;
     }
@@ -2230,6 +2241,10 @@ static void NWInstallFloatingButton(void) {
     UISwitch *_ghostSwitch;
     UILabel *_locValue;
     NSDictionary *_loc;
+    UIButton *_create;
+    NSLayoutConstraint *_cardBottom;
+    UIView *_cardView;
+    CGFloat _kbOverlap;
 }
 
 - (void)viewDidLoad {
@@ -2239,7 +2254,7 @@ static void NWInstallFloatingButton(void) {
     UIControl *dim = [[UIControl alloc] initWithFrame:CGRectZero];
     dim.translatesAutoresizingMaskIntoConstraints = NO;
     dim.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
-    [dim addTarget:self action:@selector(closeSelf) forControlEvents:UIControlEventTouchUpInside];
+    [dim addTarget:self action:@selector(dimTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:dim];
 
     UIView *card = [[UIView alloc] init];
@@ -2385,7 +2400,7 @@ static void NWInstallFloatingButton(void) {
     });
     [stack addArrangedSubview:locRow];
 
-    // --- Create (rayon 27.5 comme Blaze) ---
+    // --- Create (rayon 27.5 comme Blaze) : inactif tant que le nom est vide ---
     UIButton *create = [UIButton buttonWithType:UIButtonTypeSystem];
     [create setTitle:@"Create" forState:UIControlStateNormal];
     create.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
@@ -2394,8 +2409,13 @@ static void NWInstallFloatingButton(void) {
     if (@available(iOS 13.0, *)) create.layer.cornerCurve = kCACornerCurveContinuous;
     create.translatesAutoresizingMaskIntoConstraints = NO;
     [create.heightAnchor constraintEqualToConstant:55].active = YES;
+    create.enabled = NO;
+    create.alpha = 0.45;
     NWBind(create, ^(id s){ [weakSelf doCreate]; });
     [stack addArrangedSubview:create];
+    _create = create;
+    [_field addTarget:self action:@selector(nameChanged:)
+     forControlEvents:UIControlEventEditingChanged];
 
     [NSLayoutConstraint activateConstraints:@[
         [dim.topAnchor constraintEqualToAnchor:self.view.topAnchor],
@@ -2404,12 +2424,69 @@ static void NWInstallFloatingButton(void) {
         [dim.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
         [card.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [card.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
-        [card.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
         [stack.topAnchor constraintEqualToAnchor:card.topAnchor],
         [stack.leadingAnchor constraintEqualToAnchor:card.leadingAnchor],
         [stack.trailingAnchor constraintEqualToAnchor:card.trailingAnchor],
         [stack.bottomAnchor constraintEqualToAnchor:card.bottomAnchor],
     ]];
+
+    // Evitement clavier (copy Blaze : keyboardWillShow / keyboardWillHide).
+    // Sans ca, le clavier recouvre le bouton Create.
+    _cardBottom = [card.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor];
+    _cardBottom.active = YES;
+    _cardView = card;
+    _kbOverlap = 0;
+    [NSNotificationCenter.defaultCenter addObserver:self
+                                           selector:@selector(keyboardFrame:)
+                                               name:UIKeyboardWillChangeFrameNotification
+                                             object:nil];
+}
+
+- (void)dealloc {
+    [NSNotificationCenter.defaultCenter removeObserver:self];
+}
+
+// Premier tap sur le fond : on ferme le clavier (le 2e tap ferme la feuille),
+// comme dans Blaze (contentViewLostFocus).
+- (void)dimTapped {
+    if (_field.isFirstResponder) {
+        [_field resignFirstResponder];
+        return;
+    }
+    [self closeSelf];
+}
+
+// Copy Blaze (textFieldDidChange:) : Create inactif tant que le nom est vide.
+- (void)nameChanged:(UITextField *)tf {
+    NSString *t = [tf.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    BOOL ok = t.length > 0;
+    _create.enabled = ok;
+    _create.alpha = ok ? 1.0 : 0.45;
+}
+
+// Recadre la carte au-dessus du clavier (affichage / masquage / retour clavier).
+- (void)keyboardFrame:(NSNotification *)note {
+    [self.view layoutIfNeeded];   // garantit une hauteur de carte valide
+    CGRect end = [note.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
+    CGRect endInView = [self.view convertRect:end fromView:nil];
+    CGFloat overlap = self.view.bounds.size.height - endInView.origin.y;
+    if (overlap < 0) overlap = 0;
+    if (_cardBottom) {
+        // Ne jamais faire remonter la carte au-dela de son propre haut.
+        CGFloat cardH = _cardView ? _cardView.bounds.size.height : 0;
+        CGFloat maxLift = self.view.bounds.size.height - cardH - 8;
+        if (maxLift < 0) maxLift = 0;
+        if (overlap > maxLift) overlap = maxLift;
+        _cardBottom.constant = -overlap;
+    }
+    NSTimeInterval dur = [note.userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
+    if (dur <= 0) dur = 0.25;
+    UIViewAnimationCurve curve = [note.userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue];
+    [UIView animateWithDuration:dur
+                          delay:0
+                        options:(UIViewAnimationOptions)(curve << 16)
+                     animations:^{ [self.view layoutIfNeeded]; }
+                     completion:nil];
 }
 
 - (void)openMap {
@@ -2442,6 +2519,114 @@ static void NWInstallFloatingButton(void) {
 @end
 
 // ---------------------------------------------------------------------------
+// Cellule "container" (copy Blaze : dossier + nom + icones Ghost/Orbit/Proxy)
+// Blaze : hauteur 70, bordure accent 1.3 si active, 4 iconees a droite.
+// ---------------------------------------------------------------------------
+@interface NWContainerCellView : UIControl
++ (UIButton *)iconButton:(NSString *)sym;
+@property (nonatomic, strong) UIImageView *folderView;
+@property (nonatomic, strong) UILabel *titleLabel;
+@property (nonatomic, strong) UILabel *subLabel;
+@property (nonatomic, strong) UIButton *ghostBtn;
+@property (nonatomic, strong) UIButton *locBtn;
+@property (nonatomic, strong) UIButton *proxyBtn;
+@property (nonatomic, strong) UIButton *moreBtn;
+@property (nonatomic, copy) void (^onGhost)(void);
+@property (nonatomic, copy) void (^onLocation)(void);
+@property (nonatomic, copy) void (^onProxy)(void);
+@property (nonatomic, copy) void (^onMore)(void);
+@end
+
+@implementation NWContainerCellView
+
++ (UIButton *)iconButton:(NSString *)sym {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    [b setImage:NWSymbol(sym, 16) forState:UIControlStateNormal];
+    b.tintColor = [UIColor colorWithWhite:1 alpha:0.55];
+    b.imageView.contentMode = UIViewContentModeScaleAspectFit;
+    b.accessibilityLabel = sym;
+    return b;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    self.backgroundColor = NWCardColor();
+    self.layer.cornerRadius = 16;
+    self.layer.borderWidth = 1;
+    self.layer.borderColor = NWLine().CGColor;
+
+    _folderView = [[UIImageView alloc] initWithImage:NWSymbol(@"folder.fill", 18)];
+    _folderView.contentMode = UIViewContentModeScaleAspectFit;
+    _folderView.tintColor = NWDim();
+    [self addSubview:_folderView];
+
+    _titleLabel = NWLabelMake(@"", 15, UIColor.whiteColor, UIFontWeightSemibold);
+    _titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [self addSubview:_titleLabel];
+
+    _subLabel = NWLabelMake(@"", 11, NWDim(), UIFontWeightRegular);
+    _subLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [self addSubview:_subLabel];
+
+    _ghostBtn  = [NWContainerCellView iconButton:@"shield.lefthalf.filled"];
+    _locBtn    = [NWContainerCellView iconButton:@"location.fill"];
+    _proxyBtn  = [NWContainerCellView iconButton:@"network"];
+    _moreBtn   = [NWContainerCellView iconButton:@"ellipsis"];
+    [self addSubview:_ghostBtn];
+    [self addSubview:_locBtn];
+    [self addSubview:_proxyBtn];
+    [self addSubview:_moreBtn];
+
+    __weak typeof(self) weakSelf = self;
+    NWBind(_ghostBtn, ^(id s){
+        __strong typeof(weakSelf) c = weakSelf;
+        if (c.onGhost) c.onGhost();
+    });
+    NWBind(_locBtn, ^(id s){
+        __strong typeof(weakSelf) c = weakSelf;
+        if (c.onLocation) c.onLocation();
+    });
+    NWBind(_proxyBtn, ^(id s){
+        __strong typeof(weakSelf) c = weakSelf;
+        if (c.onProxy) c.onProxy();
+    });
+    NWBind(_moreBtn, ^(id s){
+        __strong typeof(weakSelf) c = weakSelf;
+        if (c.onMore) c.onMore();
+    });
+    return self;
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat w = self.bounds.size.width;
+    CGFloat h = self.bounds.size.height;
+    if (w <= 0 || h <= 0) return;
+    CGFloat pad = 14;
+    CGFloat btnW = 34, gap = 2;
+    CGFloat iconsW = 4 * btnW + 3 * gap;
+    CGFloat iconsX = w - pad - iconsW;
+    CGFloat by = (h - btnW) / 2;
+    _ghostBtn.frame = CGRectMake(iconsX, by, btnW, btnW);
+    _locBtn.frame   = CGRectMake(iconsX + (btnW + gap), by, btnW, btnW);
+    _proxyBtn.frame = CGRectMake(iconsX + 2 * (btnW + gap), by, btnW, btnW);
+    _moreBtn.frame  = CGRectMake(iconsX + 3 * (btnW + gap), by, btnW, btnW);
+
+    _folderView.frame = CGRectMake(pad, (h - 22) / 2, 22, 22);
+
+    CGFloat textX = pad + 22 + 10;
+    CGFloat textW = iconsX - 10 - textX;
+    if (textW < 60) textW = 60;
+    CGFloat titleH = 18, subH = 14;
+    CGFloat top = (h - (titleH + 2 + subH)) / 2;
+    _titleLabel.frame = CGRectMake(textX, top, textW, titleH);
+    _subLabel.frame = CGRectMake(textX, top + titleH + 2, textW, subH);
+}
+
+@end
+
+// ---------------------------------------------------------------------------
 // Dashboard principal
 // ---------------------------------------------------------------------------
 
@@ -2450,6 +2635,8 @@ static void NWInstallFloatingButton(void) {
 @property (nonatomic, strong) UIStackView *bar;
 @property (nonatomic, strong) UIScrollView *scroll;
 @property (nonatomic, strong) UIStackView *content;
+@property (nonatomic, strong) UIView *footer;
+@property (nonatomic, strong) NSLayoutConstraint *contentBottom;
 @end
 
 @implementation NWDashboardViewController
@@ -2479,6 +2666,7 @@ static void NWInstallFloatingButton(void) {
     [_scroll addSubview:_content];
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    _contentBottom = [_content.bottomAnchor constraintEqualToAnchor:_scroll.contentLayoutGuide.bottomAnchor constant:-28];
     [NSLayoutConstraint activateConstraints:@[
         [_bar.topAnchor constraintEqualToAnchor:safe.topAnchor constant:6],
         [_bar.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:14],
@@ -2491,8 +2679,23 @@ static void NWInstallFloatingButton(void) {
         [_content.topAnchor constraintEqualToAnchor:_scroll.contentLayoutGuide.topAnchor constant:10],
         [_content.leadingAnchor constraintEqualToAnchor:_scroll.contentLayoutGuide.leadingAnchor constant:14],
         [_content.trailingAnchor constraintEqualToAnchor:_scroll.contentLayoutGuide.trailingAnchor constant:-14],
-        [_content.bottomAnchor constraintEqualToAnchor:_scroll.contentLayoutGuide.bottomAnchor constant:-28],
+        _contentBottom,
         [_content.widthAnchor constraintEqualToAnchor:_scroll.frameLayoutGuide.widthAnchor constant:-28],
+    ]];
+
+    // Pied de page flottant "New Container" (copy Blaze : + etiquette centree,
+    // 55 pt du bas). Vue passeuse : seule la zone du bouton capte le toucher.
+    NWPassthroughView *footer = [[NWPassthroughView alloc] initWithFrame:CGRectZero];
+    footer.translatesAutoresizingMaskIntoConstraints = NO;
+    footer.backgroundColor = UIColor.clearColor;
+    footer.hidden = YES;
+    [self.view addSubview:footer];
+    _footer = footer;
+    [NSLayoutConstraint activateConstraints:@[
+        [footer.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [footer.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [footer.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [footer.heightAnchor constraintEqualToConstant:140],
     ]];
 
     [self rebuild];
@@ -2514,6 +2717,13 @@ static void NWInstallFloatingButton(void) {
     }
 
     [self buildTopBar];
+
+    // Pied de page "New Container" : uniquement sur l'ecran Containers.
+    BOOL isContainers = [self.module isEqualToString:@"containers"];
+    self.footer.hidden = !isContainers;
+    for (UIView *v in [self.footer.subviews copy]) [v removeFromSuperview];
+    self.contentBottom.constant = isContainers ? -170 : -28;
+    if (isContainers) [self buildContainersFooter];
 
     if (!self.module) {
         [self buildHome];
@@ -2587,6 +2797,19 @@ static void NWInstallFloatingButton(void) {
         [titles addArrangedSubview:t];
         [titles addArrangedSubview:s];
         [self.bar addArrangedSubview:titles];
+
+        // Copy Blaze : bouton "ellipsis" = menu "Sort by" sur l'ecran Containers.
+        if ([self.module isEqualToString:@"containers"]) {
+            UIButton *sortBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+            [sortBtn setImage:NWSymbol(@"ellipsis", 20) forState:UIControlStateNormal];
+            sortBtn.tintColor = UIColor.whiteColor;
+            sortBtn.showsMenuAsPrimaryAction = YES;
+            sortBtn.menu = [self sortMenu];
+            sortBtn.translatesAutoresizingMaskIntoConstraints = NO;
+            [sortBtn.widthAnchor constraintEqualToConstant:38].active = YES;
+            [sortBtn.heightAnchor constraintEqualToConstant:38].active = YES;
+            [self.bar addArrangedSubview:sortBtn];
+        }
     }
 
     [self.bar addArrangedSubview:NWSpacer()];
@@ -2599,6 +2822,115 @@ static void NWInstallFloatingButton(void) {
     self.module = module;
     [self.scroll setContentOffset:CGPointMake(0, 0) animated:NO];
     [self rebuild];
+}
+
+// --- Tri des conteneurs (copy Blaze : "Sort by") --------------------------
+- (NSString *)currentSort {
+    id ui = (NWState ?: @{})[@"ui"];
+    if ([ui isKindOfClass:[NSDictionary class]]) {
+        id s = ((NSDictionary *)ui)[@"sort"];
+        if ([s isKindOfClass:[NSString class]]) return s;
+    }
+    return @"date_new";
+}
+
+- (void)setSort:(NSString *)sort {
+    NSDictionary *st = NWState ?: @{};
+    id raw = st[@"ui"];
+    NSMutableDictionary *ui = [raw isKindOfClass:[NSDictionary class]]
+        ? [raw mutableCopy] : [NSMutableDictionary dictionary];
+    if (![ui isKindOfClass:[NSMutableDictionary class]]) ui = [NSMutableDictionary dictionary];
+    ui[@"sort"] = sort;
+    NSMutableDictionary *newSt = [st isKindOfClass:[NSDictionary class]] ? [st mutableCopy] : [NSMutableDictionary dictionary];
+    if (![newSt isKindOfClass:[NSMutableDictionary class]]) newSt = [NSMutableDictionary dictionary];
+    newSt[@"ui"] = ui;
+    NWSaveState(newSt);
+}
+
+- (UIMenu *)sortMenu {
+    NSString *cur = [self currentSort];
+    __weak typeof(self) weakSelf = self;
+    NSArray *defs = @[
+        @[@"name_az", @"Name (A-Z)"],
+        @[@"name_za", @"Name (Z-A)"],
+        @[@"date_new", @"Date Newest"],
+        @[@"date_old", @"Date Oldest"],
+    ];
+    NSMutableArray *items = [NSMutableArray array];
+    for (NSArray *d in defs) {
+        BOOL on = [cur isEqualToString:d[0]];
+        [items addObject:[UIAction actionWithTitle:d[1]
+                                              image:(on ? NWSymbol(@"checkmark", 15) : nil)
+                                         identifier:nil
+                                            handler:^(UIAction *a){
+            [weakSelf setSort:d[0]];
+            [weakSelf rebuild];
+        }]];
+    }
+    return [UIMenu menuWithTitle:@"Sort by" image:nil identifier:nil options:0 children:items];
+}
+
+// --- Pied de page "New Container" (copy Blaze) ----------------------------
+- (void)buildContainersFooter {
+    __weak typeof(self) weakSelf = self;
+
+    UIButton *label = [UIButton buttonWithType:UIButtonTypeCustom];
+    [label setTitle:@"New Container" forState:UIControlStateNormal];
+    [label setTitleColor:NWDim() forState:UIControlStateNormal];
+    label.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
+    label.translatesAutoresizingMaskIntoConstraints = NO;
+    NWBind(label, ^(id s){
+        __strong typeof(weakSelf) self2 = weakSelf;
+        if (self2) [self2 presentNewContainerSheet:nil];
+    });
+    [self.footer addSubview:label];
+
+    UIButton *plus = [UIButton buttonWithType:UIButtonTypeSystem];
+    [plus setImage:NWSymbol(@"plus", 24) forState:UIControlStateNormal];
+    plus.tintColor = UIColor.whiteColor;
+    plus.backgroundColor = NWAccent();
+    plus.layer.cornerRadius = 27.5;
+    plus.layer.shadowColor = UIColor.blackColor.CGColor;
+    plus.layer.shadowOpacity = 0.45;
+    plus.layer.shadowRadius = 8;
+    plus.layer.shadowOffset = CGSizeMake(0, 3);
+    if (@available(iOS 13.0, *)) plus.layer.cornerCurve = kCACornerCurveContinuous;
+    plus.translatesAutoresizingMaskIntoConstraints = NO;
+    plus.accessibilityLabel = @"New Container";
+    NWBind(plus, ^(id s){
+        __strong typeof(weakSelf) self2 = weakSelf;
+        if (self2) [self2 presentNewContainerSheet:nil];
+    });
+    [self.footer addSubview:plus];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [plus.centerXAnchor constraintEqualToAnchor:self.footer.centerXAnchor],
+        [plus.bottomAnchor constraintEqualToAnchor:self.footer.bottomAnchor constant:-30],
+        [plus.widthAnchor constraintEqualToConstant:55],
+        [plus.heightAnchor constraintEqualToConstant:55],
+        [label.centerXAnchor constraintEqualToAnchor:self.footer.centerXAnchor],
+        [label.bottomAnchor constraintEqualToAnchor:plus.topAnchor constant:-4],
+        [label.heightAnchor constraintEqualToConstant:22],
+    ]];
+}
+
+// Menu d'actions d'un conteneur (Rename / Delete).
+- (void)containerActions:(NSString *)cid name:(NSString *)name {
+    __weak typeof(self) weakSelf = self;
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:name
+                                                               message:nil
+                                                        preferredStyle:UIAlertControllerStyleActionSheet];
+    [a addAction:[UIAlertAction actionWithTitle:@"Rename Container" style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
+        [weakSelf promptRename:cid current:name];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Delete Container" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *act) {
+        [weakSelf confirmDelete:cid name:name];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    a.popoverPresentationController.sourceView = self.view;
+    a.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds),
+                                                            self.view.bounds.size.height - 80, 1, 1);
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 // Cartes ---------------------------------------------------------------
@@ -3470,143 +3802,121 @@ static void NWInstallFloatingButton(void) {
 
 - (void)buildContainers {
     NSDictionary *st = NWState ?: @{};
-    NSDictionary *containers = st[@"containers"] ?: @{};
-    NSArray *ids = [containers.allKeys sortedArrayUsingSelector:@selector(compare:)];
-    __weak typeof(self) weakSelf = self;
+    NSDictionary *raw = st[@"containers"];
+    NSDictionary *containers = [raw isKindOfClass:[NSDictionary class]] ? raw : @{};
 
-    [self addSection:@"Containers"];
+    // Tri (copy Blaze : menu "Sort by")
+    NSString *sort = [self currentSort];
+    NSArray *ids = containers.allKeys;
+    ids = [ids sortedArrayUsingComparator:^NSComparisonResult(id objA, id objB) {
+        NSString *a = objA, *b = objB;
+        NSDictionary *ca = [containers[a] isKindOfClass:[NSDictionary class]] ? containers[a] : @{};
+        NSDictionary *cb = [containers[b] isKindOfClass:[NSDictionary class]] ? containers[b] : @{};
+        if ([sort isEqualToString:@"name_az"] || [sort isEqualToString:@"name_za"]) {
+            NSString *na = [ca[@"name"] isKindOfClass:[NSString class]] ? ca[@"name"] : @"";
+            NSString *nb = [cb[@"name"] isKindOfClass:[NSString class]] ? cb[@"name"] : @"";
+            NSComparisonResult r = [na localizedCaseInsensitiveCompare:nb];
+            if ([sort isEqualToString:@"name_za"]) return (NSComparisonResult)(-((NSInteger)r));
+            return r;
+        }
+        double da = [ca[@"createdAt"] doubleValue];
+        double db = [cb[@"createdAt"] doubleValue];
+        if (da == db) return NSOrderedSame;
+        BOOL newestFirst = ![sort isEqualToString:@"date_old"];
+        BOOL aFirst = newestFirst ? (da > db) : (da < db);
+        return aFirst ? NSOrderedAscending : NSOrderedDescending;
+    }];
+    __weak typeof(self) weakSelf = self;
 
     if (!ids.count) {
         UIStackView *empty = [self addPaddedCard];
-        UILabel *l = NWLabelMake(@"No container yet. Create your first container.", 13, NWDim(), UIFontWeightRegular);
+        UILabel *l = NWLabelMake(@"No container yet. Tap New Container to create your first one.",
+                                 13, NWDim(), UIFontWeightRegular);
         [empty addArrangedSubview:l];
     }
+
+    NSDictionary *px = NWActiveProxy();
+    BOOL proxyOn = [px isKindOfClass:[NSDictionary class]] && [px[@"on"] boolValue];
 
     for (NSString *cid in ids) {
         NSDictionary *c = containers[cid];
         if (![c isKindOfClass:[NSDictionary class]]) continue;
-        NSDictionary *fp = c[@"fp"] ?: @{};
-        NSDictionary *loc = c[@"loc"] ?: @{};
+        NSDictionary *fp = [c[@"fp"] isKindOfClass:[NSDictionary class]] ? c[@"fp"] : @{};
+        NSDictionary *loc = [c[@"loc"] isKindOfClass:[NSDictionary class]] ? c[@"loc"] : @{};
         BOOL active = [cid isEqualToString:NWActiveID];
         BOOL gpsOn = [loc[@"on"] boolValue];
+        BOOL ghostOn = c[@"ghostOn"] ? [c[@"ghostOn"] boolValue] : YES;
+        NSString *cname = ([c[@"name"] isKindOfClass:[NSString class]] && [c[@"name"] length])
+            ? c[@"name"] : cid;
+        NSString *locLabel = [loc[@"label"] isKindOfClass:[NSString class]] ? loc[@"label"] : @"";
 
-        UIStackView *card = [self addPaddedCard];
-
-        UIStackView *top = [[UIStackView alloc] init];
-        top.axis = UILayoutConstraintAxisHorizontal;
-        top.spacing = 8;
-        top.alignment = UIStackViewAlignmentCenter;
-        UIImageView *folder = [[UIImageView alloc] initWithImage:NWSymbol(@"folder.fill", 15)];
-        folder.tintColor = active ? NWGreen() : NWDim();
-        UILabel *name = NWLabelMake(c[@"name"] ?: cid, 16, UIColor.whiteColor, UIFontWeightSemibold);
-        [top addArrangedSubview:folder];
-        [top addArrangedSubview:name];
-        [top addArrangedSubview:NWSpacer()];
-        if (active) [top addArrangedSubview:NWBadge(@"ACTIVE", NWGreen())];
-        [card addArrangedSubview:top];
-
-        NSString *detail = [NSString stringWithFormat:@"%@ · iOS %@ · %@",
-                            NWModelName(fp[@"model"]), fp[@"sysVer"] ?: @"—",
-                            gpsOn ? (loc[@"label"] ?: @"Spoofed") : @"Location off"];
-        UILabel *sub = NWLabelMake(detail, 11.5, NWDim(), UIFontWeightRegular);
-        [card addArrangedSubview:sub];
-
-        // --- Raccourcis (copy Blaze : Ghost / Orbit / Proxy) ---
-        UIStackView *quick = [[UIStackView alloc] init];
-        quick.axis = UILayoutConstraintAxisHorizontal;
-        quick.spacing = 8;
-        quick.distribution = UIStackViewDistributionFillEqually;
-
+        // --- Cellule (copy Blaze : 70 pt, dossier + nom + 4 iconees) --------
+        NWContainerCellView *cell = [[NWContainerCellView alloc] initWithFrame:CGRectZero];
+        cell.translatesAutoresizingMaskIntoConstraints = NO;
+        cell.folderView.tintColor = active ? NWGreen() : NWDim();
+        cell.titleLabel.text = cname;
+        cell.subLabel.text = [NSString stringWithFormat:@"%@ · iOS %@ · %@%@",
+                              NWModelName(fp[@"model"]), fp[@"sysVer"] ?: @"—",
+                              gpsOn ? (locLabel.length ? locLabel : @"Spoofed") : @"Location off",
+                              active ? @" · ACTIVE" : @""];
         if (active) {
-            [quick addArrangedSubview:NWPill(@"Ghost", NWGreen(), ^(id s){
-                [weakSelf openModule:@"ghost"];
-            })];
-            [quick addArrangedSubview:NWPill(@"Orbit", NWBlue(), ^(id s){
-                [weakSelf openModule:@"location"];
-            })];
-            [quick addArrangedSubview:NWPill(@"Proxy", NWAccent(), ^(id s){
-                [weakSelf openModule:@"proxy"];
-            })];
-        } else {
-            [quick addArrangedSubview:NWPill(@"Use", NWBlue(), ^(id s){
-                [weakSelf confirmSwitch:cid name:(c[@"name"] ?: cid)];
-            })];
+            cell.layer.borderWidth = 1.3;
+            cell.layer.borderColor = [NWAccent() colorWithAlphaComponent:0.9].CGColor;
         }
-        [card addArrangedSubview:quick];
+        cell.ghostBtn.tintColor = ghostOn ? [UIColor colorWithWhite:1 alpha:0.9]
+                                          : [UIColor colorWithWhite:1 alpha:0.25];
+        cell.locBtn.tintColor = gpsOn ? NWBlue() : [UIColor colorWithWhite:1 alpha:0.25];
+        cell.proxyBtn.tintColor = proxyOn ? NWAccent() : [UIColor colorWithWhite:1 alpha:0.25];
 
-        // --- Rename Container / Delete Container (copy Blaze) ---
-        UIStackView *actions = [[UIStackView alloc] init];
-        actions.axis = UILayoutConstraintAxisHorizontal;
-        actions.spacing = 8;
-        actions.distribution = UIStackViewDistributionFillEqually;
+        NSString *cidS = cid;
+        NSString *nameS = cname;
+        BOOL activeB = active;
+        NSDictionary *locS = loc;
 
-        [actions addArrangedSubview:NWPill(@"Rename Container", NWDim(), ^(id s){
-            [weakSelf promptRename:cid current:(c[@"name"] ?: @"")];
-        })];
-        [actions addArrangedSubview:NWPill(@"Delete Container", NWRed(), ^(id s){
-            [weakSelf confirmDelete:cid name:(c[@"name"] ?: cid)];
-        })];
-        [card addArrangedSubview:actions];
+        NWBind(cell, ^(id s){
+            __strong typeof(weakSelf) self2 = weakSelf;
+            if (!self2 || activeB) return;          // Blaze : tap = basculer
+            [self2 confirmSwitch:cidS name:nameS];
+        });
+        cell.onGhost = ^{
+            __strong typeof(weakSelf) self2 = weakSelf;
+            if (self2) [self2 openModule:@"ghost"];   // menu Ghost complet
+        };
+        cell.onLocation = ^{
+            __strong typeof(weakSelf) self2 = weakSelf;
+            if (!self2) return;
+            CLLocationCoordinate2D initial = CLLocationCoordinate2DMake(48.8566, 2.3522);
+            if ([locS[@"on"] boolValue]) {
+                initial = CLLocationCoordinate2DMake([locS[@"lat"] doubleValue],
+                                                     [locS[@"lon"] doubleValue]);
+            }
+            NWOpenMapPicker(self2, initial, ^(double lat, double lon, NSString *label) {
+                __strong typeof(weakSelf) s3 = weakSelf;
+                if (!s3) return;
+                NSDictionary *newLoc = @{@"on": @YES, @"lat": @(lat), @"lon": @(lon),
+                                         @"label": label.length ? label : @"Current Location"};
+                NWUpdateContainerField(cidS, @"loc", newLoc);
+                if ([cidS isEqualToString:NWActiveID]) {
+                    NWActiveLoc = newLoc;
+                    NWReloadAfterStateChange();
+                }
+                [s3 rebuild];
+            });
+        };
+        cell.onProxy = ^{
+            __strong typeof(weakSelf) self2 = weakSelf;
+            if (self2) [self2 openModule:@"proxy"];
+        };
+        cell.onMore = ^{
+            __strong typeof(weakSelf) self2 = weakSelf;
+            if (self2) [self2 containerActions:cidS name:nameS];
+        };
+
+        [self.content addArrangedSubview:cell];
+        [cell.heightAnchor constraintEqualToConstant:70].active = YES;
     }
 
-    // --- "New Container" (copy Blaze) : ligne + icone carte (fake GPS) -----
-    [self addSection:@"New Container"];
-
-    UIStackView *newRow = [[UIStackView alloc] init];
-    newRow.axis = UILayoutConstraintAxisHorizontal;
-    newRow.spacing = 8;
-    newRow.alignment = UIStackViewAlignmentCenter;
-
-    UIStackView *newCard = [self addPaddedCard];
-    __strong typeof(weakSelf) self2 = weakSelf;
-
-    UIStackView *ntop = [[UIStackView alloc] init];
-    ntop.axis = UILayoutConstraintAxisHorizontal;
-    ntop.spacing = 8;
-    ntop.alignment = UIStackViewAlignmentCenter;
-    UIImageView *nicon = [[UIImageView alloc] initWithImage:NWSymbol(@"folder.fill", 15)];
-    nicon.tintColor = NWAccent();
-    UILabel *ntitle = NWLabelMake(@"New Container", 15, UIColor.whiteColor, UIFontWeightSemibold);
-    [ntop addArrangedSubview:nicon];
-    [ntop addArrangedSubview:ntitle];
-    [newCard addArrangedSubview:ntop];
-    UILabel *nsub = NWLabelMake(@"Enter container name...", 11.5, NWDim(), UIFontWeightRegular);
-    [newCard addArrangedSubview:nsub];
-
-    UIButton *createPill = NWPill(@"Create", NWAccent(), ^(id s){
-        if (!self2) return;
-        [self2 presentNewContainerSheet:nil];
-    });
-    createPill.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
-    [newCard addArrangedSubview:createPill];
-
-    // Petite icone carte : choix de la position AVANT la creation.
-    UIButton *mapBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [mapBtn setImage:NWSymbol(@"map.fill", 22) forState:UIControlStateNormal];
-    mapBtn.tintColor = NWBlue();
-    mapBtn.backgroundColor = [NWBlue() colorWithAlphaComponent:0.16];
-    mapBtn.layer.cornerRadius = 12;
-    mapBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    [mapBtn.widthAnchor constraintEqualToConstant:44].active = YES;
-    [mapBtn.heightAnchor constraintEqualToConstant:44].active = YES;
-    mapBtn.accessibilityLabel = @"Spoof Location";
-    NWBind(mapBtn, ^(id s){
-        if (!self2) return;
-        CLLocationCoordinate2D initial = CLLocationCoordinate2DMake(48.8566, 2.3522);
-        NWOpenMapPicker(self2, initial, ^(double lat, double lon, NSString *label) {
-            __strong typeof(weakSelf) s3 = weakSelf;
-            if (!s3) return;
-            NSDictionary *loc = @{@"on": @YES, @"lat": @(lat), @"lon": @(lon),
-                                  @"label": label.length ? label : @"Current Location"};
-            [s3 presentNewContainerSheet:loc];
-        });
-    });
-
-    [newRow addArrangedSubview:newCard];
-    [newRow addArrangedSubview:mapBtn];
-    [self.content addArrangedSubview:newRow];
-
-    UILabel *note = NWLabelMake(@"Every container keeps its own prefs, cookies, keychain, fingerprint and location. Instagram will ask for its internal permissions again on creation.",
+    UILabel *note = NWLabelMake(@"Each container keeps its own prefs, cookies, keychain, fingerprint and location. Tap a container to switch to it.",
                                 11, NWDim(), UIFontWeightRegular);
     [self.content addArrangedSubview:note];
 }
@@ -4002,6 +4312,9 @@ static void NWOpenMenu(void) {
     if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
     NWInstallFloatingButton();
     NWDashboardViewController *d = [[NWDashboardViewController alloc] init];
+    // Copy Blaze : le bouton flottant ouvre directement la liste Containers
+    // (grille Dashboard accessible via le chevron en haut a gauche).
+    d.module = @"containers";
     d.modalPresentationStyle = UIModalPresentationOverFullScreen;
     d.modalTransitionStyle = UIModalTransitionStyleCoverVertical;
     NWDashInstance = d;
