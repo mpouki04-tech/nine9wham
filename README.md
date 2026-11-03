@@ -10,8 +10,8 @@
 
 | Fonction | Détail |
 |---|---|
-| **Menu flottant `@nine9wham`** | Bouton « **99** » draggable (aimanté aux bords), **toujours visible**. L'app s'ouvre directement sur **Containers** (chevron → Dashboard). Panneau `PanModal` sombre **copié du design Blaze** (cellules `HeaderView` / `GridCell` / `ListCell` / `SwitchListCell`, sections à en-tête 45 pt, grille 2 colonnes) — **sans** la licence Blaze/Bumble. |
-| **Accueil** | Grille d'accueil (Ghost, Orbit, Proxy, Containers, App & Device, Changelog) + sections `App & Device`, `nine9wham` (Version / Changelog), `Support`, `Reset` — exactement comme Blaze. |
+| **Menu flottant `@nine9wham`** | Bouton **carré translucide** (flou `SystemMaterialDark`, bordure blanche douce) avec **4 petits carrés** au centre — l'icône du menu Blaze, **sans badge**. Draggable (aimanté aux bords, snap animé), feedback tactile 120–180 ms, **toujours visible**. L'app s'ouvre directement sur **Containers** (chevron → Dashboard). Panneau sombre **translucide** (flou derrière) **copié du design Blaze** (heroes unifiés tuile + kicker + titre + badges, cellules `GridCell` / `ListCell` / `SwitchListCell`, sections à en-tête 45 pt, grille 2 colonnes, cartes en verre `NWCardGlass`) — **sans** la licence Blaze/Bumble. |
+| **Accueil** | Grille d'accueil (Ghost, Orbit, Proxy, Containers, App & Device, Changelog) avec **une couleur propre à chaque module** (Ghost vert, Orbit bleu, Proxy/Containers accent, Changelog discret) + sections `App & Device`, `nine9wham` (Version / Changelog), `Support`, `Reset` — exactement comme Blaze. |
 | **Ghost** | Switch « Enable » (« Ghost for *conteneur* ») + « Preferred Country » + « Formulate » (data aléatoire) + modules Device / Locale / TimeZone / Other, `Identifiers` (Vendor / Advertising / Generate New Identifier). Le switch **coupe réellement** les hooks d'empreinte : OFF = valeurs réelles du téléphone. |
 | **Conteneurs** (landing) | Chaque conteneur = un **nouveau téléphone** aux yeux d'Instagram : prefs + cookies + keychain + empreinte isolés. **Écran recopié de Blaze** : cellules 70 pt (dossier + nom + sous-titre + icônes *Ghost / Location / Proxy / …*), bordure accent si **ACTIVE**, tap = basculer, menu **… → Sort by** (Name A-Z / Z-A, Date Newest / Oldest), bouton **＋ New Container** flottant en bas. Copy Blaze exacte des alertes (switch / rename / delete). |
 | **Feuille « New Container »** | Nom + switch « Enable Spoof » (« Random data with Ghost? ») + ligne « Spoof Location » ouvrant la **carte du monde**, bouton `Create` (inactif tant que le nom est vide) — **le clavier remonte la carte** (evitement clavier copy Blaze), 1er tap sur le fond ferme le clavier, 2e tap ferme la feuille. |
@@ -30,9 +30,9 @@ Les autorisations **système** (Fichiers, Appareil photo…) ne peuvent pas êtr
 ## Installer
 
 1. Télécharger l'IPA : **[Release `nine9wham`](https://github.com/mpouki04-tech/nine9wham/releases/download/nine9wham/nine9wham_instagram_453.ipa)**
-   sha256 : `e3e703a9acf76712da8e594bce739c2024a88518072d9c6a8e1c267ab3a6260f` (338 648 673 octets)
+   sha256 : `33b2cb657d07b3249d3584d21f509ab041775ad6939449917b6edde892d5e17f` (338 652 879 octets)
 2. Ouvrir **Sideloadly** → sélectionner l'IPA → Install (certificat 7 jours, même Apple ID). Sideloadly est ici **uniquement** l'outil d'installation : aucune licence Blaze/Bumble n'est incluse.
-3. Lancer Instagram → le bouton **99** apparaît à droite.
+3. Lancer Instagram → le bouton **carré translucide (4 carrés)** apparaît à droite.
 
 > Après 7 jours : relancer Sideloadly avec la **même Apple ID** → les conteneurs reviennent (vault keychain).
 
@@ -44,7 +44,7 @@ Les autorisations **système** (Fichiers, Appareil photo…) ne peuvent pas êtr
 - **Switch de conteneur** (tap sur la cellule) → alerte *« Are you sure you want to switch to the %@ container? Restarting the app is required! »* → *Yes, I'm sure!* → relance.
 - **Icônes de cellule** : 🛡 Ghost (menu Ghost complet) · 📍 Location (carte du monde directement) · 🌐 Proxy · **…** → *Rename / Delete Container*.
 - **Tri** : bouton **…** en haut à droite → **Sort by** → Name (A-Z) / Name (Z-A) / Date Newest / Date Oldest.
-- **Orbit / Maps** → carte du monde : recherche de lieu (barre de recherche stylée *Search a place...*), sélection manuelle, *Current Location*, Standard/Hybrid/Satellite.
+- **Orbit / Maps** → carte du monde : recherche de lieu (barre de recherche sombre solide *Search a place...*), sélection manuelle, *Current Location*. **Maintien (long-press) sur la carte → flèche posée à l'endroit exact** de la localisation ; l'adresse s'affiche en bas dans la carte de verre. La barre Standard/Hybrid/Satellite a été retirée.
 - **Ghost** → switch *Enable* (coupe les hooks d'empreinte → valeurs réelles), pays préféré, *Formulate*, choix iPhone / Version / Storage / Device Name / Identifiers / Locale / TimeZone.
 
 ---
@@ -70,7 +70,7 @@ nine9wham/
 
 **UI** : fenêtre overlay `NWOverlayUIWindow` (bouton flottant + dashboard + alertes), `hitTest` limité au bouton flottant → **Instagram reste cliquable partout ailleurs** ; `canBecomeKeyWindow = NO` (clavier/first responder préservés).
 
-**Carte** : `NWMapPicker` (`MKMapView`, Standard/Hybrid/Satellite, recherche Nominatim, géocodage inverse, *Current Location*) — accessible à la création de chaque conteneur et depuis Orbit/Maps.
+**Carte** : `NWMapPicker` (`MKMapView`, **flèche au long-press** sur le point exact, recherche Nominatim, géocodage inverse annulé au `dealloc`, nav bar opaque sombre pour des boutons toujours lisibles, carte du bas = adresse seule) — accessible à la création de chaque conteneur et depuis Orbit/Maps.
 
 **État** : `Library/Application Support/nine9wham/state.plist` + vault keychain (`com.nine9wham.vault`) ; snapshots par conteneur (`prefs.plist`, `cookies.plist`). Les champs `loc` (position) et `ghostOn` sont stockés **par conteneur**.
 
