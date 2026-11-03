@@ -3347,7 +3347,8 @@ static void NWInstallFloatingButton(void) {
     ];
     NSMutableArray *opts = [NSMutableArray array];
     for (NSArray *p in pairs) {
-        NSString *iso = [p[0] substringFromIndex:p[0].length - 2];
+        NSString *locale = p[0];
+        NSString *iso = [locale substringFromIndex:locale.length - 2];
         [opts addObject:@{@"title": [NSString stringWithFormat:@"%@ %@", NWFlagEmoji(iso), iso],
                           @"subtitle": [NSString stringWithFormat:@"%@ · %@", p[0], p[1]],
                           @"value": p[0], @"tz": p[1]}];
