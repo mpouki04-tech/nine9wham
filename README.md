@@ -10,11 +10,11 @@
 
 | Fonction | Détail |
 |---|---|
-| **Menu flottant `@nine9wham`** | Bouton « 99 » draggable (aimanté aux bords), **toujours visible**. Panneau `PanModal` sombre **copié du design Blaze** (cellules `HeaderView` / `GridCell` / `ListCell` / `SwitchListCell`, sections à en-tête 45 pt, grille 2 colonnes) — **sans** la licence Blaze/Bumble. |
+| **Menu flottant `@nine9wham`** | Bouton « **99** » draggable (aimanté aux bords), **toujours visible**. L'app s'ouvre directement sur **Containers** (chevron → Dashboard). Panneau `PanModal` sombre **copié du design Blaze** (cellules `HeaderView` / `GridCell` / `ListCell` / `SwitchListCell`, sections à en-tête 45 pt, grille 2 colonnes) — **sans** la licence Blaze/Bumble. |
 | **Accueil** | Grille d'accueil (Ghost, Orbit, Proxy, Containers, App & Device, Changelog) + sections `App & Device`, `nine9wham` (Version / Changelog), `Support`, `Reset` — exactement comme Blaze. |
 | **Ghost** | Switch « Enable » (« Ghost for *conteneur* ») + « Preferred Country » + « Formulate » (data aléatoire) + modules Device / Locale / TimeZone / Other, `Identifiers` (Vendor / Advertising / Generate New Identifier). Le switch **coupe réellement** les hooks d'empreinte : OFF = valeurs réelles du téléphone. |
-| **Conteneurs** | Chaque conteneur = un **nouveau téléphone** aux yeux d'Instagram : prefs + cookies + keychain + empreinte isolés. Autant que voulu (illimité). Copy Blaze exacte des alertes (switch / rename / delete). |
-| **Feuille « New Container »** | Nom + switch « Enable Spoof » (« Random data with Ghost? ») + ligne « Spoof Location » ouvrant la **carte du monde**, bouton `Create`. |
+| **Conteneurs** (landing) | Chaque conteneur = un **nouveau téléphone** aux yeux d'Instagram : prefs + cookies + keychain + empreinte isolés. **Écran recopié de Blaze** : cellules 70 pt (dossier + nom + sous-titre + icônes *Ghost / Location / Proxy / …*), bordure accent si **ACTIVE**, tap = basculer, menu **… → Sort by** (Name A-Z / Z-A, Date Newest / Oldest), bouton **＋ New Container** flottant en bas. Copy Blaze exacte des alertes (switch / rename / delete). |
+| **Feuille « New Container »** | Nom + switch « Enable Spoof » (« Random data with Ghost? ») + ligne « Spoof Location » ouvrant la **carte du monde**, bouton `Create` (inactif tant que le nom est vide) — **le clavier remonte la carte** (evitement clavier copy Blaze), 1er tap sur le fond ferme le clavier, 2e tap ferme la feuille. |
 | **Empreinte unique** | IDFV/IDFA aléatoires, nom d'appareil, locale et fuseau cohérents, mémoire/CPU — et **modèle fictif cohérent avec la puce réelle** (iPhone 13 → 17, iOS 26.0 → 27.0.1 ; `iPhone18,1`→`iPhone18,4` pour l'iPhone 17). Le téléphone réel est détecté via `utsname`. |
 | **Fake GPS (Orbit / Maps)** | **Carte du monde** (`MKMapView`) avec recherche (Nominatim) + sélection manuelle + « Current Location » + villes, **par conteneur**. Hooks `CLLocationManager` + injection des positions au delegate, plus d'appel réel quand le fake est actif. |
 | **Proxy (BETA)** | `Stay Invisible` — HTTPS/SOCKS5 par conteneur : Host/I.P, Port, authentification, I.P Checker. |
@@ -30,7 +30,7 @@ Les autorisations **système** (Fichiers, Appareil photo…) ne peuvent pas êtr
 ## Installer
 
 1. Télécharger l'IPA : **[Release `nine9wham`](https://github.com/mpouki04-tech/nine9wham/releases/download/nine9wham/nine9wham_instagram_453.ipa)**
-   sha256 : `2f73b31371f2e0bb9da7c8002c8f119448ecec76646fa5ad5083c1666ce8eaac` (338 640 288 octets)
+   sha256 : `e3e703a9acf76712da8e594bce739c2024a88518072d9c6a8e1c267ab3a6260f` (338 648 673 octets)
 2. Ouvrir **Sideloadly** → sélectionner l'IPA → Install (certificat 7 jours, même Apple ID). Sideloadly est ici **uniquement** l'outil d'installation : aucune licence Blaze/Bumble n'est incluse.
 3. Lancer Instagram → le bouton **99** apparaît à droite.
 
@@ -40,11 +40,11 @@ Les autorisations **système** (Fichiers, Appareil photo…) ne peuvent pas êtr
 
 ## Conteneurs : mode d'emploi
 
-- **Containers → ＋** → feuille **New Container** : nom, switch *Enable Spoof*, ligne **Spoof Location** (carte du monde) → **Create** → l'app redémarre → Instagram redemande tout (compte neuf, empreinte neuve).
-- **Switch de conteneur** (carte) → alerte *« Are you sure you want to switch to the %@ container? Restarting the app is required! »* → *Yes, I'm sure!* → relance.
-- **Renommer** / **Supprimer** → alertes copy Blaze (suppression autorisée même pour le conteneur actif).
-- **Raccourcis carte** : Ghost / Orbit / Proxy s'appliquent au conteneur actif.
-- **Orbit / Maps** → carte du monde : recherche de lieu, sélection manuelle, *Current Location*, Standard/Hybrid/Satellite.
+- **Containers → ＋** (bouton flottant « New Container ») → feuille **New Container** : nom (bouton *Create* inactif tant que vide), switch *Enable Spoof*, ligne *Spoof Location* (petite icône carte) → **Create** → l'app redémarre → Instagram redemande tout (compte neuf, empreinte neuve).
+- **Switch de conteneur** (tap sur la cellule) → alerte *« Are you sure you want to switch to the %@ container? Restarting the app is required! »* → *Yes, I'm sure!* → relance.
+- **Icônes de cellule** : 🛡 Ghost (menu Ghost complet) · 📍 Location (carte du monde directement) · 🌐 Proxy · **…** → *Rename / Delete Container*.
+- **Tri** : bouton **…** en haut à droite → **Sort by** → Name (A-Z) / Name (Z-A) / Date Newest / Date Oldest.
+- **Orbit / Maps** → carte du monde : recherche de lieu (barre de recherche stylée *Search a place...*), sélection manuelle, *Current Location*, Standard/Hybrid/Satellite.
 - **Ghost** → switch *Enable* (coupe les hooks d'empreinte → valeurs réelles), pays préféré, *Formulate*, choix iPhone / Version / Storage / Device Name / Identifiers / Locale / TimeZone.
 
 ---
