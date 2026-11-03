@@ -1069,11 +1069,13 @@ static void NWBootstrapState(void) {
 // Theme (sombre, accent violet/bleu, cartes arrondies)
 // ---------------------------------------------------------------------------
 static UIColor *NWBg(void)        { return [UIColor colorWithRed:0.043 green:0.043 blue:0.058 alpha:1.0]; }
-static UIColor *NWCardColor(void) { return [UIColor colorWithRed:0.078 green:0.078 blue:0.102 alpha:1.0]; }
+__attribute__((unused)) static UIColor *NWCardColor(void) { return [UIColor colorWithRed:0.078 green:0.078 blue:0.102 alpha:1.0]; }
+// Carte translucide (effet verre) : laisse deviner le contenu derriere.
+static UIColor *NWCardGlass(void) { return [UIColor colorWithRed:0.078 green:0.078 blue:0.102 alpha:0.72]; }
 static UIColor *NWAccent(void)    { return [UIColor colorWithRed:0.49 green:0.36 blue:1.00 alpha:1.0]; }
 static UIColor *NWBlue(void)      { return [UIColor colorWithRed:0.30 green:0.64 blue:1.00 alpha:1.0]; }
 static UIColor *NWGreen(void)     { return [UIColor colorWithRed:0.30 green:0.85 blue:0.55 alpha:1.0]; }
-static UIColor *NWRed(void)       { return [UIColor colorWithRed:1.00 green:0.36 blue:0.42 alpha:1.0]; }
+__attribute__((unused)) static UIColor *NWRed(void)       { return [UIColor colorWithRed:1.00 green:0.36 blue:0.42 alpha:1.0]; }
 static UIColor *NWDim(void)       { return [UIColor colorWithWhite:1.0 alpha:0.55]; }
 static UIColor *NWLine(void)      { return [UIColor colorWithWhite:1.0 alpha:0.08]; }
 
@@ -1101,6 +1103,30 @@ static UILabel *NWLabelMake(NSString *text, CGFloat size, UIColor *color, UIFont
     l.textColor = color;
     l.numberOfLines = 0;
     return l;
+}
+
+// Icone "4 petits carres" (menu Blaze) : dessinee pour rester nette a toute taille.
+static UIImage *NWGridIcon(CGFloat side, UIColor *color) {
+    CGFloat sq = side * 0.40;          // carre de la grille
+    CGFloat gap = side * 0.20;         // espacement au centre
+    UIGraphicsImageRenderer *r =
+        [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(side, side)];
+    UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        CGRect bounds = CGRectMake(0, 0, side, side);
+        CGFloat originX = (side - (sq * 2 + gap)) / 2.0;
+        CGFloat originY = originX;
+        [color setFill];
+        for (int row = 0; row < 2; row++) {
+            for (int col = 0; col < 2; col++) {
+                CGRect cell = CGRectMake(originX + col * (sq + gap),
+                                         originY + row * (sq + gap), sq, sq);
+                UIBezierPath *p = [UIBezierPath bezierPathWithRoundedRect:cell cornerRadius:sq * 0.28];
+                [p fill];
+            }
+        }
+        (void)bounds;
+    }];
+    return img;
 }
 
 static UIView *NWSpacer(void) {
@@ -1366,6 +1392,8 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
     UILabel *_addr;
     NSArray<NSDictionary *> *_hits;
     CLGeocoder *_geo;
+    MKPointAnnotation *_arrow;
+    BOOL _followCenter;
 }
 
 + (void)presentFrom:(UIViewController *)host
@@ -1379,6 +1407,18 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
     nav.modalPresentationStyle = UIModalPresentationFullScreen;
     nav.navigationBar.barStyle = UIBarStyleBlack;
     nav.navigationBar.tintColor = NWAccent();
+    // Barre du haut SOLIDE sombre : titre et boutons blancs toujours lisibles
+    // (sinon iOS 15+ met un fond clair et le texte blanc devient invisible).
+    if (@available(iOS 13.0, *)) {
+        UINavigationBarAppearance *ap = [[UINavigationBarAppearance alloc] init];
+        [ap configureWithOpaqueBackground];
+        ap.backgroundColor = NWBg();
+        ap.titleTextAttributes = @{NSForegroundColorAttributeName: UIColor.whiteColor};
+        ap.largeTitleTextAttributes = @{NSForegroundColorAttributeName: UIColor.whiteColor};
+        nav.navigationBar.standardAppearance = ap;
+        nav.navigationBar.scrollEdgeAppearance = ap;
+        nav.navigationBar.compactAppearance = ap;
+    }
     [host presentViewController:nav animated:YES completion:nil];
 }
 
@@ -1405,14 +1445,20 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
     _map.showsScale = NO;
     [self.view addSubview:_map];
 
-    // Pin fixe : son extrémité pointe vers le centre exact de la carte.
-    UIImageView *pin = [[UIImageView alloc] initWithImage:NWSymbol(@"mappin.fill", 34)];
-    pin.tintColor = NWRed();
-    pin.translatesAutoresizingMaskIntoConstraints = NO;
-    pin.userInteractionEnabled = NO;
-    [self.view addSubview:pin];
+    // Fleche de selection : elle suit le centre tant qu'on n'a pas appui long,
+    // puis se fixe exactement sur l'endroit choisi.
+    _arrow = [[MKPointAnnotation alloc] init];
+    _followCenter = YES;
+    [_map addAnnotation:_arrow];
 
-    // Barre de recherche (design Blaze : champ arrondi sombre, texte blanc)
+    // Appui long = pointer l'endroit exact ou localisation sera faite.
+    UILongPressGestureRecognizer *lp =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(mapLongPress:)];
+    lp.minimumPressDuration = 0.35;
+    [_map addGestureRecognizer:lp];
+
+    // Barre de recherche : champ SOLIDE sombre (sinon texte blanc invisible
+    // au-dessus d'une carte claire).
     _search = [[UISearchBar alloc] initWithFrame:CGRectZero];
     _search.translatesAutoresizingMaskIntoConstraints = NO;
     _search.delegate = self;
@@ -1421,14 +1467,16 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
     _search.tintColor = NWAccent();
     if (@available(iOS 13.0, *)) {
         UITextField *tf = _search.searchTextField;
-        tf.backgroundColor = [UIColor colorWithWhite:1 alpha:0.10];
+        tf.backgroundColor = [UIColor colorWithRed:0.05 green:0.05 blue:0.07 alpha:0.92];
         tf.textColor = UIColor.whiteColor;
         tf.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
         tf.layer.cornerRadius = 14;
         tf.layer.masksToBounds = YES;
+        tf.layer.borderWidth = 1;
+        tf.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.14].CGColor;
         tf.attributedPlaceholder = [[NSAttributedString alloc]
             initWithString:@"Search a place..."
-                attributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.45]}];
+                attributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.50]}];
     } else {
         _search.placeholder = @"Search a place...";
     }
@@ -1439,7 +1487,7 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
     _results.translatesAutoresizingMaskIntoConstraints = NO;
     _results.dataSource = self;
     _results.delegate = self;
-    _results.backgroundColor = NWCardColor();
+    _results.backgroundColor = NWCardGlass();
     _results.layer.cornerRadius = 12;
     _results.clipsToBounds = YES;
     _results.rowHeight = 52;
@@ -1447,10 +1495,10 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
     _results.separatorColor = NWLine();
     [self.view addSubview:_results];
 
-    // Carte du bas : adresse + type de carte
+    // Carte du bas : adresse uniquement (la barre de type de carte a ete retiree).
     UIView *card = [[UIView alloc] init];
     card.translatesAutoresizingMaskIntoConstraints = NO;
-    card.backgroundColor = [NWCardColor() colorWithAlphaComponent:0.94];
+    card.backgroundColor = NWCardGlass();
     card.layer.cornerRadius = 16;
     card.layer.borderWidth = 1;
     card.layer.borderColor = NWLine().CGColor;
@@ -1462,14 +1510,10 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
     _addr.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:_addr];
 
-    UISegmentedControl *seg =
-        [[UISegmentedControl alloc] initWithItems:@[@"Standard", @"Hybrid", @"Satellite"]];
-    seg.selectedSegmentIndex = 0;
-    seg.translatesAutoresizingMaskIntoConstraints = NO;
-    seg.tintColor = NWAccent();
-    [seg addTarget:self action:@selector(mapTypeChanged:)
- forControlEvents:UIControlEventValueChanged];
-    [card addSubview:seg];
+    UILabel *hint = NWLabelMake(@"Long-press the map to pin the exact spot", 11,
+                                NWDim(), UIFontWeightRegular);
+    hint.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:hint];
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
@@ -1477,9 +1521,6 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
         [_map.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [_map.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
         [_map.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
-
-        [pin.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [pin.bottomAnchor constraintEqualToAnchor:self.view.centerYAnchor],
 
         [_search.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8],
         [_search.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
@@ -1499,10 +1540,10 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
         [_addr.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
         [_addr.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
 
-        [seg.topAnchor constraintEqualToAnchor:_addr.bottomAnchor constant:10],
-        [seg.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
-        [seg.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
-        [seg.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-12],
+        [hint.topAnchor constraintEqualToAnchor:_addr.bottomAnchor constant:4],
+        [hint.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
+        [hint.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
+        [hint.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-12],
     ]];
 
     CLLocationCoordinate2D c = self.initial;
@@ -1510,30 +1551,110 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
         c = CLLocationCoordinate2DMake(48.8566, 2.3522);   // Paris
     MKCoordinateRegion region = MKCoordinateRegionMakeWithDistance(c, 3000, 3000);
     [_map setRegion:region animated:NO];
+    _arrow.coordinate = _map.centerCoordinate;
+    [self reverseGeocode:_arrow.coordinate];
+}
+
+// L'appui long depose la fleche exactement sous le doigt.
+- (void)mapLongPress:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    CGPoint p = [g locationInView:_map];
+    CLLocationCoordinate2D c = [_map convertPoint:p toCoordinateFromView:_map];
+    if (!CLLocationCoordinate2DIsValid(c)) return;
+    _followCenter = NO;
+    _arrow.coordinate = c;
+    [self dropArrowAnimated];
     [self reverseGeocode:c];
+}
+
+// Tombee de la fleche (entree : ease-out, court).
+- (void)dropArrowAnimated {
+    MKAnnotationView *v = [_map viewForAnnotation:_arrow];
+    if (!v) return;
+    v.transform = CGAffineTransformMakeScale(0.5, 0.5);
+    v.alpha = 0;
+    [UIView animateWithDuration:0.28 delay:0
+                        options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{
+        v.transform = CGAffineTransformIdentity;
+        v.alpha = 1;
+    } completion:nil];
+}
+
+- (MKAnnotationView *)mapView:(MKMapView *)mv viewForAnnotation:(id<MKAnnotation>)annotation {
+    if (annotation != _arrow) return nil;              // localisation reelle ignoree
+    static NSString *rid = @"nw.arrow";
+    MKAnnotationView *v = [mv dequeueReusableAnnotationViewWithIdentifier:rid];
+    if (!v) {
+        v = [[MKAnnotationView alloc] initWithAnnotation:annotation reuseIdentifier:rid];
+        v.canShowCallout = NO;
+        v.bounds = CGRectMake(0, 0, 32, 32);
+
+        UIView *badge = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 32, 32)];
+        badge.backgroundColor = NWAccent();
+        badge.layer.cornerRadius = 16;
+        badge.layer.shadowColor = UIColor.blackColor.CGColor;
+        badge.layer.shadowOpacity = 0.55;
+        badge.layer.shadowRadius = 5;
+        badge.layer.shadowOffset = CGSizeMake(0, 2);
+        [v addSubview:badge];
+
+        UIImageView *iv = [[UIImageView alloc] initWithImage:NWSymbol(@"arrow.down", 17)];
+        iv.contentMode = UIViewContentModeScaleAspectFit;
+        iv.tintColor = UIColor.whiteColor;
+        iv.frame = CGRectMake(8, 7, 16, 16);
+        [badge addSubview:iv];
+
+        // La pointe de la fleche touche la coordonnee.
+        v.centerOffset = CGPointMake(0, -16);
+    }
+    v.annotation = annotation;
+    return v;
+}
+
+- (void)mapView:(MKMapView *)mv didAddAnnotationViews:(NSArray<MKAnnotationView *> *)views {
+    for (MKAnnotationView *v in views) {
+        if (![v.reuseIdentifier isEqualToString:@"nw.arrow"]) continue;
+        v.alpha = 0;
+        v.transform = CGAffineTransformMakeScale(0.6, 0.6);
+        [UIView animateWithDuration:0.28 delay:0
+                            options:UIViewAnimationOptionCurveEaseOut
+                         animations:^{
+            v.alpha = 1;
+            v.transform = CGAffineTransformIdentity;
+        } completion:nil];
+    }
+}
+
+- (void)dealloc {
+    [_geo cancelGeocode];
+    _map.delegate = nil;
 }
 
 - (void)cancelPick { [self dismissViewControllerAnimated:YES completion:nil]; }
 
 - (void)confirmPick {
-    CLLocationCoordinate2D c = _map.centerCoordinate;
+    // La fleche indique l'endroit retenu (elle suit le centre tant qu'on n'a
+    // pas appuye longtemps sur la carte).
+    CLLocationCoordinate2D c = _arrow ? _arrow.coordinate : _map.centerCoordinate;
     NSString *label = _addr.text.length ? _addr.text : @"Current Location";
+    if ([label isEqualToString:@"Loading location..."] ||
+        [label isEqualToString:@"Move the map to choose a location"]) {
+        label = @"Current Location";
+    }
     void (^cb)(double, double, NSString *) = self.onPick;
     [self dismissViewControllerAnimated:YES completion:^{
         if (cb) cb(c.latitude, c.longitude, label);
     }];
 }
 
-- (void)mapTypeChanged:(UISegmentedControl *)seg {
-    switch (seg.selectedSegmentIndex) {
-        case 1: _map.mapType = MKMapTypeHybrid; break;
-        case 2: _map.mapType = MKMapTypeSatellite; break;
-        default: _map.mapType = MKMapTypeStandard; break;
-    }
-}
-
 - (void)mapView:(MKMapView *)mapView regionDidChangeAnimated:(BOOL)animated {
-    [self reverseGeocode:mapView.centerCoordinate];
+    if (_followCenter) {
+        _arrow.coordinate = mapView.centerCoordinate;
+        [self reverseGeocode:mapView.centerCoordinate];
+    }
+    // Sinon la fleche est fixee : l'adresse affichee reste celle du lieu choisi
+    // (pas de geocodage inutile a chaque pan = pas de fuite de requetes).
 }
 
 - (void)reverseGeocode:(CLLocationCoordinate2D)c {
@@ -1614,7 +1735,7 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
     UITableViewCell *cell = [t dequeueReusableCellWithIdentifier:rid];
     if (!cell) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:rid];
-        cell.backgroundColor = NWCardColor();
+        cell.backgroundColor = UIColor.clearColor;
         cell.textLabel.textColor = UIColor.whiteColor;
         cell.textLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
         cell.textLabel.numberOfLines = 2;
@@ -1635,8 +1756,12 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
     _results.hidden = YES;
     _search.text = h[@"title"];
     [_search resignFirstResponder];
+    // La fleche se fixe sur le lieu recherche.
+    _followCenter = NO;
+    _arrow.coordinate = c;
     MKCoordinateRegion region = MKCoordinateRegionMakeWithDistance(c, 2500, 2500);
     [_map setRegion:region animated:YES];
+    [self dropArrowAnimated];
     [self reverseGeocode:c];
 }
 
@@ -1817,9 +1942,22 @@ static void NWTogglePanel(void);   // declare avant NWFloatingButton
 
 @implementation NWFloatingButton
 
+// Feedback tactile (emil-design-eng : petites states en 120-180ms, ease-out).
+- (void)pressIn {
+    [UIView animateWithDuration:0.12 delay:0 options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{ self.transform = CGAffineTransformMakeScale(0.94, 0.94); }
+                     completion:nil];
+}
+- (void)pressOut {
+    [UIView animateWithDuration:0.18 delay:0 options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{ self.transform = CGAffineTransformIdentity; }
+                     completion:nil];
+}
+
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     self.touchStart = [touches.anyObject locationInView:self.superview];
     self.dragging = NO;
+    [self pressIn];
     [super touchesBegan:touches withEvent:event];
 }
 
@@ -1839,19 +1977,30 @@ static void NWTogglePanel(void);   // declare avant NWFloatingButton
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     [super touchesEnded:touches withEvent:event];
     if (!self.dragging) {
+        [self pressOut];
         NWTogglePanel();
         return;
     }
+    // bounds/center sont stables meme avec un transform non nulle :
+    // ne jamais ecrire frame pendant que l'echelle animee tourne.
     UIView *v = self.superview;
-    CGRect f = self.frame;
+    CGSize sz = self.bounds.size;
     CGFloat mid = v.bounds.size.width / 2;
-    f.origin.x = (self.center.x < mid) ? 8 : v.bounds.size.width - f.size.width - 8;
-    f.origin.y = MIN(MAX(f.origin.y, 60), v.bounds.size.height - f.size.height - 34);
-    [UIView animateWithDuration:0.15 animations:^{ self.frame = f; }];
+    CGFloat tx = (self.center.x < mid) ? 8 + sz.width / 2
+                                       : v.bounds.size.width - sz.width - 8 - sz.width / 2;
+    CGFloat ty = MIN(MAX(self.center.y, 60 + sz.height / 2),
+                     v.bounds.size.height - sz.height - 34 + sz.height / 2);
+    CGPoint target = CGPointMake(tx, ty);
+    // ease-in-out (mouvement dans la vue) + retour a l'echelle 1.
+    [UIView animateWithDuration:0.2 delay:0 options:UIViewAnimationOptionCurveEaseInOut
+                     animations:^{
+        self.transform = CGAffineTransformIdentity;
+        self.center = target;
+    } completion:nil];
     NSDictionary *st = NWState ?: @{};
     NSMutableDictionary *ui = [st[@"ui"] mutableCopy] ?: [NSMutableDictionary dictionary];
-    ui[@"x"] = @(f.origin.x);
-    ui[@"y"] = @(f.origin.y);
+    ui[@"x"] = @(target.x - sz.width / 2);
+    ui[@"y"] = @(target.y - sz.height / 2);
     NSMutableDictionary *newSt = [st mutableCopy] ?: [NSMutableDictionary dictionary];
     newSt[@"ui"] = ui;
     NWSaveState(newSt);
@@ -1861,6 +2010,7 @@ static void NWTogglePanel(void);   // declare avant NWFloatingButton
 - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     [super touchesCancelled:touches withEvent:event];
     self.dragging = NO;
+    [self pressOut];
 }
 
 @end
@@ -1876,17 +2026,30 @@ static void NWInstallFloatingButton(void) {
 
     if (!NWMenuButton) {
         NWFloatingButton *b = [NWFloatingButton buttonWithType:UIButtonTypeCustom];
-        b.backgroundColor = [UIColor colorWithRed:0.05 green:0.05 blue:0.08 alpha:0.96];
-        b.layer.cornerRadius = 27;
-        b.layer.borderWidth = 1.5;
-        b.layer.borderColor = [NWAccent() colorWithAlphaComponent:0.9].CGColor;
+        // Bouton TRANSLUCIDE carre (copy Blaze) : 4 petits carres au centre.
+        b.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.10];
+        b.layer.cornerRadius = 16;
+        if (@available(iOS 13.0, *)) b.layer.cornerCurve = kCACornerCurveContinuous;
+        b.layer.borderWidth = 1.2;
+        b.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.22].CGColor;
         b.layer.shadowColor = UIColor.blackColor.CGColor;
-        b.layer.shadowOpacity = 0.55;
+        b.layer.shadowOpacity = 0.45;
         b.layer.shadowRadius = 10;
         b.layer.shadowOffset = CGSizeMake(0, 4);
-        [b setTitle:@"99" forState:UIControlStateNormal];
-        [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-        b.titleLabel.font = [UIFont systemFontOfSize:21 weight:UIFontWeightHeavy];
+        [b setImage:NWGridIcon(24, [UIColor colorWithWhite:1 alpha:0.92]) forState:UIControlStateNormal];
+        b.imageView.contentMode = UIViewContentModeScaleAspectFit;
+        // Flou derriere l'icone (toujours au fond du bouton).
+        if (@available(iOS 13.0, *)) {
+            UIVisualEffectView *blur = [[UIVisualEffectView alloc]
+                initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterialDark]];
+            blur.frame = CGRectMake(0, 0, 54, 54);
+            blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            blur.layer.cornerRadius = 16;
+            blur.clipsToBounds = YES;
+            blur.userInteractionEnabled = NO;
+            [b addSubview:blur];
+            [b sendSubviewToBack:blur];
+        }
         b.accessibilityLabel = @"Menu nine9wham";
         NWMenuButton = b;
     }
@@ -1928,7 +2091,7 @@ static void NWInstallFloatingButton(void) {
                         tint:(UIColor *)tint {
     self = [super initWithFrame:CGRectMake(0, 0, 0, 0)];
     if (!self) return nil;
-    self.backgroundColor = NWCardColor();
+    self.backgroundColor = NWCardGlass();
     self.layer.cornerRadius = 16;
     self.layer.borderWidth = 1;
     self.layer.borderColor = NWLine().CGColor;
@@ -1982,12 +2145,12 @@ static void NWInstallFloatingButton(void) {
 
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     [super touchesEnded:touches withEvent:event];
-    self.backgroundColor = NWCardColor();
+    self.backgroundColor = NWCardGlass();
 }
 
 - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     [super touchesCancelled:touches withEvent:event];
-    self.backgroundColor = NWCardColor();
+    self.backgroundColor = NWCardGlass();
 }
 
 @end
@@ -2551,7 +2714,7 @@ static void NWInstallFloatingButton(void) {
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (!self) return nil;
-    self.backgroundColor = NWCardColor();
+    self.backgroundColor = NWCardGlass();
     self.layer.cornerRadius = 16;
     self.layer.borderWidth = 1;
     self.layer.borderColor = NWLine().CGColor;
@@ -2643,7 +2806,14 @@ static void NWInstallFloatingButton(void) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = NWBg();
+    // Fond TRANSLUCIDE : flou sombre sur le contenu d'Instagram derriere.
+    self.view.backgroundColor = UIColor.clearColor;
+    UIVisualEffectView *backdrop = [[UIVisualEffectView alloc]
+        initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterialDark]];
+    backdrop.frame = self.view.bounds;
+    backdrop.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    backdrop.userInteractionEnabled = NO;
+    [self.view addSubview:backdrop];
 
     _bar = [[UIStackView alloc] init];
     _bar.axis = UILayoutConstraintAxisHorizontal;
@@ -2766,13 +2936,15 @@ static void NWInstallFloatingButton(void) {
         logo.translatesAutoresizingMaskIntoConstraints = NO;
         [logo.widthAnchor constraintEqualToConstant:34].active = YES;
         [logo.heightAnchor constraintEqualToConstant:34].active = YES;
-        UILabel *nine = NWLabelMake(@"9", 17, UIColor.whiteColor, UIFontWeightHeavy);
-        nine.textAlignment = NSTextAlignmentCenter;
-        nine.translatesAutoresizingMaskIntoConstraints = NO;
-        [logo addSubview:nine];
+        UIImageView *grid = [[UIImageView alloc] initWithImage:NWGridIcon(18, NWAccent())];
+        grid.contentMode = UIViewContentModeScaleAspectFit;
+        grid.translatesAutoresizingMaskIntoConstraints = NO;
+        [logo addSubview:grid];
         [NSLayoutConstraint activateConstraints:@[
-            [nine.centerXAnchor constraintEqualToAnchor:logo.centerXAnchor],
-            [nine.centerYAnchor constraintEqualToAnchor:logo.centerYAnchor],
+            [grid.centerXAnchor constraintEqualToAnchor:logo.centerXAnchor],
+            [grid.centerYAnchor constraintEqualToAnchor:logo.centerYAnchor],
+            [grid.widthAnchor constraintEqualToConstant:18],
+            [grid.heightAnchor constraintEqualToConstant:18],
         ]];
         [self.bar addArrangedSubview:logo];
 
@@ -2938,7 +3110,7 @@ static void NWInstallFloatingButton(void) {
 // Carte avec marges internes (titres, textes).
 - (UIStackView *)addPaddedCard {
     UIView *card = [[UIView alloc] init];
-    card.backgroundColor = NWCardColor();
+    card.backgroundColor = NWCardGlass();
     card.layer.cornerRadius = 16;
     card.layer.borderWidth = 1;
     card.layer.borderColor = NWLine().CGColor;
@@ -2963,7 +3135,7 @@ static void NWInstallFloatingButton(void) {
 // Carte de lignes (les lignes ont leur propre marge de 14).
 - (UIStackView *)addRowsCard {
     UIView *card = [[UIView alloc] init];
-    card.backgroundColor = NWCardColor();
+    card.backgroundColor = NWCardGlass();
     card.layer.cornerRadius = 16;
     card.layer.borderWidth = 1;
     card.layer.borderColor = NWLine().CGColor;
@@ -3002,6 +3174,89 @@ static void NWInstallFloatingButton(void) {
     [self.content setCustomSpacing:6 afterView:l];
 }
 
+// --- Hero unifie (copy Blaze) : tuile icone + kicker + titre + sous-titre
+// + badges. Utilise par Dashboard / App & Device / Ghost / Proxy / Orbit pour
+// que tous les modules aient exactement le meme bandeau.
+- (UIView *)addHeroIcon:(NSString *)icon
+                  tint:(UIColor *)tint
+                kicker:(NSString *)kicker
+                 title:(NSString *)title
+              subtitle:(NSString *)subtitle
+                badges:(NSArray *)badges {   // @[ @[text, color], ... ]
+    UIView *hero = [[UIView alloc] init];
+    hero.backgroundColor = NWCardGlass();
+    hero.layer.cornerRadius = 18;
+    hero.layer.borderWidth = 1;
+    hero.layer.borderColor = [tint colorWithAlphaComponent:0.35].CGColor;
+
+    UIStackView *v = [[UIStackView alloc] init];
+    v.axis = UILayoutConstraintAxisVertical;
+    v.spacing = 8;
+    v.layoutMargins = UIEdgeInsetsMake(16, 16, 16, 16);
+    v.layoutMarginsRelativeArrangement = YES;
+    v.translatesAutoresizingMaskIntoConstraints = NO;
+    [hero addSubview:v];
+    [NSLayoutConstraint activateConstraints:@[
+        [v.topAnchor constraintEqualToAnchor:hero.topAnchor],
+        [v.leadingAnchor constraintEqualToAnchor:hero.leadingAnchor],
+        [v.trailingAnchor constraintEqualToAnchor:hero.trailingAnchor],
+        [v.bottomAnchor constraintEqualToAnchor:hero.bottomAnchor],
+    ]];
+
+    UIStackView *head = [[UIStackView alloc] init];
+    head.axis = UILayoutConstraintAxisHorizontal;
+    head.spacing = 12;
+    head.alignment = UIStackViewAlignmentCenter;
+
+    UIView *tile = [[UIView alloc] init];
+    tile.backgroundColor = [tint colorWithAlphaComponent:0.16];
+    tile.layer.cornerRadius = 14;
+    tile.translatesAutoresizingMaskIntoConstraints = NO;
+    [tile.widthAnchor constraintEqualToConstant:48].active = YES;
+    [tile.heightAnchor constraintEqualToConstant:48].active = YES;
+    UIImageView *ic = [[UIImageView alloc] initWithImage:NWSymbol(icon, 22)];
+    if (!ic.image) ic.image = NWSymbol(@"shield.lefthalf.filled", 22);
+    ic.tintColor = tint;
+    ic.contentMode = UIViewContentModeScaleAspectFit;
+    ic.translatesAutoresizingMaskIntoConstraints = NO;
+    [tile addSubview:ic];
+    [NSLayoutConstraint activateConstraints:@[
+        [ic.centerXAnchor constraintEqualToAnchor:tile.centerXAnchor],
+        [ic.centerYAnchor constraintEqualToAnchor:tile.centerYAnchor],
+    ]];
+
+    UIStackView *tv = [[UIStackView alloc] init];
+    tv.axis = UILayoutConstraintAxisVertical;
+    tv.spacing = 2;
+    if (kicker.length) {
+        UILabel *k = NWLabelMake(kicker, 11, tint, UIFontWeightBold);
+        [tv addArrangedSubview:k];
+    }
+    UILabel *t1 = NWLabelMake(title, 21, UIColor.whiteColor, UIFontWeightBold);
+    UILabel *t2 = NWLabelMake(subtitle, 12.5, NWDim(), UIFontWeightRegular);
+    [tv addArrangedSubview:t1];
+    [tv addArrangedSubview:t2];
+    [head addArrangedSubview:tile];
+    [head addArrangedSubview:tv];
+    [v addArrangedSubview:head];
+
+    if (badges.count) {
+        UIStackView *row = [[UIStackView alloc] init];
+        row.axis = UILayoutConstraintAxisHorizontal;
+        row.spacing = 6;
+        row.distribution = UIStackViewDistributionFill;
+        row.alignment = UIStackViewAlignmentCenter;
+        for (NSArray *b in badges) {
+            if (![b isKindOfClass:[NSArray class]] || b.count < 2) continue;
+            [row addArrangedSubview:NWBadge([b[0] description], b[1])];
+        }
+        [v addArrangedSubview:row];
+    }
+
+    [self.content addArrangedSubview:hero];
+    return hero;
+}
+
 - (void)buildHome {
     NSDictionary *c = NWActiveContainerDict();
     NSDictionary *fp = c[@"fp"] ?: @{};
@@ -3012,53 +3267,27 @@ static void NWInstallFloatingButton(void) {
     BOOL gpsOn = [loc[@"on"] boolValue];
     __weak typeof(self) weakSelf = self;
 
-    // --- HeaderView (copy Blaze : titre + sous-titre) ---
-    UIView *header = [[UIView alloc] init];
-    header.backgroundColor = NWCardColor();
-    header.layer.cornerRadius = 18;
-    header.layer.borderWidth = 1;
-    header.layer.borderColor = [NWAccent() colorWithAlphaComponent:0.35].CGColor;
-
-    UIStackView *v = [[UIStackView alloc] init];
-    v.axis = UILayoutConstraintAxisVertical;
-    v.spacing = 8;
-    v.layoutMargins = UIEdgeInsetsMake(16, 16, 16, 16);
-    v.layoutMarginsRelativeArrangement = YES;
-    v.translatesAutoresizingMaskIntoConstraints = NO;
-    [header addSubview:v];
-    [NSLayoutConstraint activateConstraints:@[
-        [v.topAnchor constraintEqualToAnchor:header.topAnchor],
-        [v.leadingAnchor constraintEqualToAnchor:header.leadingAnchor],
-        [v.trailingAnchor constraintEqualToAnchor:header.trailingAnchor],
-        [v.bottomAnchor constraintEqualToAnchor:header.bottomAnchor],
-    ]];
-
-    UILabel *kicker = NWLabelMake(@"Dashboard", 11, NWAccent(), UIFontWeightBold);
-    UILabel *title = NWLabelMake(name, 22, UIColor.whiteColor, UIFontWeightBold);
-    UILabel *sub = NWLabelMake(@"nine9wham Your Way", 12.5, NWDim(), UIFontWeightRegular);
-    [v addArrangedSubview:kicker];
-    [v addArrangedSubview:title];
-    [v addArrangedSubview:sub];
-
-    UIStackView *badges = [[UIStackView alloc] init];
-    badges.axis = UILayoutConstraintAxisHorizontal;
-    badges.spacing = 6;
-    [badges addArrangedSubview:NWBadge(model, NWBlue())];
-    [badges addArrangedSubview:NWBadge([NSString stringWithFormat:@"iOS %@", ios], NWAccent())];
-    [badges addArrangedSubview:NWBadge(gpsOn ? @"GPS ON" : @"GPS OFF", gpsOn ? NWGreen() : NWDim())];
-    [badges addArrangedSubview:NWBadge(name, NWDim())];
-    [v addArrangedSubview:badges];
-
-    [self.content addArrangedSubview:header];
+    // --- HeaderView (copy Blaze : tuile + kicker + titre + badges) ---------
+    [self addHeroIcon:@"private:emoji.ghost"
+                tint:NWAccent()
+              kicker:@"Dashboard"
+               title:name
+            subtitle:@"nine9wham Your Way"
+              badges:@[
+                  @[model ?: @"iPhone", NWBlue()],
+                  @[[NSString stringWithFormat:@"iOS %@", ios], NWAccent()],
+                  @[gpsOn ? @"GPS ON" : @"GPS OFF", gpsOn ? NWGreen() : NWDim()],
+              ]];
 
     // --- Grille de modules (GridCell Blaze : 2 colonnes, icone + titre) ---
+    // Couleur propre a chaque module (comme Blaze).
     NSArray *mods = @[
-        @[@"Ghost", @"private:emoji.ghost", @"ghost"],
-        @[@"Orbit", @"location.fill", @"location"],
-        @[@"Proxy", @"shield.lefthalf.filled", @"proxy"],
-        @[@"Containers", @"square.stack.3d.up.fill", @"containers"],
-        @[@"App & Device", @"iphone", @"device"],
-        @[@"Changelog", @"note.text", @"changelog"],
+        @[@"Ghost", @"private:emoji.ghost", @"ghost", NWGreen()],
+        @[@"Orbit", @"location.fill", @"location", NWBlue()],
+        @[@"Proxy", @"shield.lefthalf.filled", @"proxy", NWAccent()],
+        @[@"Containers", @"square.stack.3d.up.fill", @"containers", NWAccent()],
+        @[@"App & Device", @"iphone", @"device", NWBlue()],
+        @[@"Changelog", @"note.text", @"changelog", NWDim()],
     ];
 
     for (NSUInteger i = 0; i < mods.count; i += 2) {
@@ -3068,7 +3297,8 @@ static void NWInstallFloatingButton(void) {
         row.distribution = UIStackViewDistributionFillEqually;
         for (NSUInteger k = i; k < MIN(i + 2, mods.count); k++) {
             NSArray *m = mods[k];
-            NWGridCell *cell = [[NWGridCell alloc] initWithIcon:m[1] title:m[0] subtitle:nil tint:NWAccent()];
+            UIColor *tint = [m[3] isKindOfClass:[UIColor class]] ? m[3] : NWAccent();
+            NWGridCell *cell = [[NWGridCell alloc] initWithIcon:m[1] title:m[0] subtitle:nil tint:tint];
             NWBind(cell, ^(id s){ [weakSelf openModule:m[2]]; });
             [row addArrangedSubview:cell];
         }
@@ -3137,40 +3367,17 @@ static void NWInstallFloatingButton(void) {
     NSDictionary *c = NWActiveContainerDict();
     __weak typeof(self) weakSelf = self;
 
-    // --- Hero (copy Blaze : "App & Device" / "General info about ...") -----
-    UIView *hero = [[UIView alloc] init];
-    hero.backgroundColor = NWCardColor();
-    hero.layer.cornerRadius = 18;
-    hero.layer.borderWidth = 1;
-    hero.layer.borderColor = [NWBlue() colorWithAlphaComponent:0.35].CGColor;
-
-    UIStackView *v = [[UIStackView alloc] init];
-    v.axis = UILayoutConstraintAxisVertical;
-    v.spacing = 8;
-    v.layoutMargins = UIEdgeInsetsMake(16, 16, 16, 16);
-    v.layoutMarginsRelativeArrangement = YES;
-    v.translatesAutoresizingMaskIntoConstraints = NO;
-    [hero addSubview:v];
-    [NSLayoutConstraint activateConstraints:@[
-        [v.topAnchor constraintEqualToAnchor:hero.topAnchor],
-        [v.leadingAnchor constraintEqualToAnchor:hero.leadingAnchor],
-        [v.trailingAnchor constraintEqualToAnchor:hero.trailingAnchor],
-        [v.bottomAnchor constraintEqualToAnchor:hero.bottomAnchor],
-    ]];
-    UILabel *kicker = NWLabelMake(@"About", 11, NWBlue(), UIFontWeightBold);
-    UILabel *title = NWLabelMake(@"App & Device", 21, UIColor.whiteColor, UIFontWeightBold);
-    UILabel *sub = NWLabelMake(@"General info about @nine9wham", 12.5, NWDim(), UIFontWeightRegular);
-    [v addArrangedSubview:kicker];
-    [v addArrangedSubview:title];
-    [v addArrangedSubview:sub];
-    UIStackView *badges = [[UIStackView alloc] init];
-    badges.axis = UILayoutConstraintAxisHorizontal;
-    badges.spacing = 6;
-    [badges addArrangedSubview:NWBadge(c[@"name"] ?: @"default", NWAccent())];
-    [badges addArrangedSubview:NWBadge(NWGhostEnabled() ? @"Ghost ON" : @"Ghost OFF",
-                                       NWGhostEnabled() ? NWGreen() : NWDim())];
-    [v addArrangedSubview:badges];
-    [self.content addArrangedSubview:hero];
+    // --- Hero unifie "App & Device" --------------------------------------
+    [self addHeroIcon:@"iphone"
+                tint:NWBlue()
+              kicker:@"About"
+               title:@"App & Device"
+            subtitle:@"General info about @nine9wham"
+              badges:@[
+                  @[c[@"name"] ?: @"default", NWAccent()],
+                  @[NWGhostEnabled() ? @"Ghost ON" : @"Ghost OFF",
+                    NWGhostEnabled() ? NWGreen() : NWDim()],
+              ]];
 
     // --- Section "About" (copy Blaze) --------------------------------------
     [self addSection:@"About"];
@@ -3227,8 +3434,19 @@ static void NWInstallFloatingButton(void) {
     NSString *label = loc[@"label"];
     if (!label.length) label = on ? @"Current Location" : @"No Address Available";
 
-    // --- Section "Orbit" (copy Blaze) -------------------------------------
+    // --- Hero unifie "Location Spoofer" -----------------------------------
     NSString *cname = c[@"name"] ?: @"default";
+    [self addHeroIcon:@"location.fill"
+                tint:NWBlue()
+              kicker:@"Orbit"
+               title:@"Location Spoofer"
+            subtitle:@"Fake GPS per container, applied through the hooks"
+              badges:@[
+                  @[on ? @"GPS ON" : @"GPS OFF", on ? NWGreen() : NWDim()],
+                  @[(cname), NWAccent()],
+              ]];
+
+    // --- Section "Orbit" (copy Blaze) -------------------------------------
     [self addSection:@"Orbit"];
     NWSwitchRow *sw = [[NWSwitchRow alloc] initWithIcon:@"location.fill"
                                                    title:@"Enable"
@@ -3486,65 +3704,17 @@ static void NWInstallFloatingButton(void) {
     BOOL ghostOn = NWGhostEnabled();
     __weak typeof(self) weakSelf = self;
 
-    // --- Hero (copy Blaze : emoji.ghost + "Ghost" + "Device Fingerprint Spoofer") ---
-    UIView *hero = [[UIView alloc] init];
-    hero.backgroundColor = NWCardColor();
-    hero.layer.cornerRadius = 18;
-    hero.layer.borderWidth = 1;
-    hero.layer.borderColor = [NWGreen() colorWithAlphaComponent:0.35].CGColor;
-
-    UIStackView *v = [[UIStackView alloc] init];
-    v.axis = UILayoutConstraintAxisVertical;
-    v.spacing = 8;
-    v.layoutMargins = UIEdgeInsetsMake(16, 16, 16, 16);
-    v.layoutMarginsRelativeArrangement = YES;
-    v.translatesAutoresizingMaskIntoConstraints = NO;
-    [hero addSubview:v];
-    [NSLayoutConstraint activateConstraints:@[
-        [v.topAnchor constraintEqualToAnchor:hero.topAnchor],
-        [v.leadingAnchor constraintEqualToAnchor:hero.leadingAnchor],
-        [v.trailingAnchor constraintEqualToAnchor:hero.trailingAnchor],
-        [v.bottomAnchor constraintEqualToAnchor:hero.bottomAnchor],
-    ]];
-
-    UIStackView *head = [[UIStackView alloc] init];
-    head.axis = UILayoutConstraintAxisHorizontal;
-    head.spacing = 12;
-    head.alignment = UIStackViewAlignmentCenter;
-    UIView *tile = [[UIView alloc] init];
-    tile.backgroundColor = [NWGreen() colorWithAlphaComponent:0.16];
-    tile.layer.cornerRadius = 14;
-    tile.translatesAutoresizingMaskIntoConstraints = NO;
-    [tile.widthAnchor constraintEqualToConstant:48].active = YES;
-    [tile.heightAnchor constraintEqualToConstant:48].active = YES;
-    UIImageView *icon = [[UIImageView alloc] initWithImage:NWSymbol(@"private:emoji.ghost", 22)];
-    if (!icon.image) icon.image = NWSymbol(@"shield.lefthalf.filled", 22);
-    icon.tintColor = NWGreen();
-    icon.translatesAutoresizingMaskIntoConstraints = NO;
-    [tile addSubview:icon];
-    [NSLayoutConstraint activateConstraints:@[
-        [icon.centerXAnchor constraintEqualToAnchor:tile.centerXAnchor],
-        [icon.centerYAnchor constraintEqualToAnchor:tile.centerYAnchor],
-    ]];
-    UIStackView *tv = [[UIStackView alloc] init];
-    tv.axis = UILayoutConstraintAxisVertical;
-    tv.spacing = 2;
-    UILabel *h1 = NWLabelMake(@"Ghost", 20, UIColor.whiteColor, UIFontWeightBold);
-    UILabel *h2 = NWLabelMake(@"Device Fingerprint Spoofer", 12, [UIColor colorWithWhite:1 alpha:0.6], UIFontWeightRegular);
-    [tv addArrangedSubview:h1];
-    [tv addArrangedSubview:h2];
-    [head addArrangedSubview:tile];
-    [head addArrangedSubview:tv];
-    [v addArrangedSubview:head];
-
-    UIStackView *badges = [[UIStackView alloc] init];
-    badges.axis = UILayoutConstraintAxisHorizontal;
-    badges.spacing = 6;
-    [badges addArrangedSubview:NWBadge(NWModelName(model), NWBlue())];
-    [badges addArrangedSubview:NWBadge([NSString stringWithFormat:@"iOS %@", fp[@"sysVer"] ?: @"—"], NWAccent())];
-    [badges addArrangedSubview:NWBadge(ghostOn ? @"Spoof ON" : @"Spoof OFF", ghostOn ? NWGreen() : NWDim())];
-    [v addArrangedSubview:badges];
-    [self.content addArrangedSubview:hero];
+    // --- Hero unifie "Ghost" ----------------------------------------------
+    [self addHeroIcon:@"private:emoji.ghost"
+                tint:NWGreen()
+              kicker:nil
+               title:@"Ghost"
+            subtitle:@"Device Fingerprint Spoofer"
+              badges:@[
+                  @[NWModelName(model), NWBlue()],
+                  @[[NSString stringWithFormat:@"iOS %@", fp[@"sysVer"] ?: @"—"], NWAccent()],
+                  @[ghostOn ? @"Spoof ON" : @"Spoof OFF", ghostOn ? NWGreen() : NWDim()],
+              ]];
 
     // --- Section "Ghost" (copy Blaze : Enable · Ghost for %@ container) -----
     [self addSection:@"Ghost"];
@@ -3828,6 +3998,22 @@ static void NWInstallFloatingButton(void) {
     }];
     __weak typeof(self) weakSelf = self;
 
+    // --- Hero unifie "Containers" -----------------------------------------
+    NSDictionary *activeC = NWActiveID ? containers[NWActiveID] : nil;
+    NSString *activeName = ([activeC isKindOfClass:[NSDictionary class]] &&
+                            [activeC[@"name"] isKindOfClass:[NSString class]])
+        ? activeC[@"name"] : @"none";
+    [self addHeroIcon:@"square.stack.3d.up.fill"
+                tint:NWAccent()
+              kicker:@"Containers"
+               title:[NSString stringWithFormat:@"%lu container%@",
+                      (unsigned long)ids.count, ids.count == 1 ? @"" : @"s"]
+            subtitle:@"Isolated phone: prefs, cookies, keychain and fingerprint"
+              badges:@[
+                  @[[NSString stringWithFormat:@"Active: %@", activeName], NWGreen()],
+                  @[@"Tap to switch", NWBlue()],
+              ]];
+
     if (!ids.count) {
         UIStackView *empty = [self addPaddedCard];
         UILabel *l = NWLabelMake(@"No container yet. Tap New Container to create your first one.",
@@ -4004,32 +4190,16 @@ static void NWInstallFloatingButton(void) {
     NSString *pass = [p[@"pass"] isKindOfClass:[NSString class]] ? p[@"pass"] : @"";
     __weak typeof(self) weakSelf = self;
 
-    // --- Hero (copy Blaze : "Stay Invisible") ------------------------------
-    UIView *hero = [[UIView alloc] init];
-    hero.backgroundColor = NWCardColor();
-    hero.layer.cornerRadius = 18;
-    hero.layer.borderWidth = 1;
-    hero.layer.borderColor = [NWAccent() colorWithAlphaComponent:0.35].CGColor;
-
-    UIStackView *v = [[UIStackView alloc] init];
-    v.axis = UILayoutConstraintAxisVertical;
-    v.spacing = 8;
-    v.layoutMargins = UIEdgeInsetsMake(16, 16, 16, 16);
-    v.layoutMarginsRelativeArrangement = YES;
-    v.translatesAutoresizingMaskIntoConstraints = NO;
-    [hero addSubview:v];
-    [NSLayoutConstraint activateConstraints:@[
-        [v.topAnchor constraintEqualToAnchor:hero.topAnchor],
-        [v.leadingAnchor constraintEqualToAnchor:hero.leadingAnchor],
-        [v.trailingAnchor constraintEqualToAnchor:hero.trailingAnchor],
-        [v.bottomAnchor constraintEqualToAnchor:hero.bottomAnchor],
-    ]];
-    UILabel *ptitle = NWLabelMake(@"Stay Invisible", 19, UIColor.whiteColor, UIFontWeightBold);
-    UILabel *psub = NWLabelMake(@"Only compatible with HTTPS proxy, not SOCKS5 proxy! Currently under BETA, you might not receive any SMS code.",
-                                11.5, NWDim(), UIFontWeightRegular);
-    [v addArrangedSubview:ptitle];
-    [v addArrangedSubview:psub];
-    [self.content addArrangedSubview:hero];
+    // --- Hero unifie "Proxy" ----------------------------------------------
+    [self addHeroIcon:@"shield.lefthalf.filled"
+                tint:NWAccent()
+              kicker:@"BETA"
+               title:@"Stay Invisible"
+            subtitle:@"Only compatible with HTTPS proxy, not SOCKS5 proxy! Currently under BETA, you might not receive any SMS code."
+              badges:@[
+                  @[on ? @"Proxy ON" : @"Proxy OFF", on ? NWGreen() : NWDim()],
+                  @[(cname ?: @"default"), NWBlue()],
+              ]];
 
     // --- Section "Proxy (BETA)" (switch copy Blaze) ------------------------
     [self addSection:@"Proxy (BETA)"];
@@ -4143,6 +4313,16 @@ static void NWInstallFloatingButton(void) {
 // --- Changelog / Support / Reset -----------------------------------------
 
 - (void)buildChangelog {
+    [self addSection:@"Version 1.2.1 · 03/11/2026"];
+    UIStackView *v3 = [self addPaddedCard];
+    UILabel *b3 = NWLabelMake(
+        @"• Translucent square floating button with the 4-square icon (no badge)\n"
+         "• Frosted-glass cards and container cells, unified module heroes\n"
+         "• Map: long-press drops an arrow on the exact spot, type bar removed\n"
+         "• Readable dark navigation bar, solid search field, no dead ends",
+        12.5, [UIColor colorWithWhite:0.85 alpha:1], UIFontWeightRegular);
+    [v3 addArrangedSubview:b3];
+
     [self addSection:@"Version 1.2.0 · 03/11/2026"];
     UIStackView *v2 = [self addPaddedCard];
     UILabel *b2 = NWLabelMake(
