@@ -18,6 +18,8 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <CoreLocation/CoreLocation.h>
+#import <MapKit/MapKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -95,6 +97,15 @@ static NSDictionary *NWActiveContainer(NSDictionary *st) {
     NSString *aid = st[@"activeContainer"];
     NSDictionary *cs = st[@"containers"];
     return (aid && cs[aid]) ? cs[aid] : nil;
+}
+
+// Ghost actif ou non (copy Blaze : "Enable · Ghost for %@ container").
+// Cle par conteneur "ghostOn" ; absente = actif (retrocompatible).
+static BOOL NWGhostEnabled(void) {
+    NSDictionary *c = NWActiveContainer(NWState ?: @{});
+    id v = c[@"ghostOn"];
+    if ([v isKindOfClass:[NSNumber class]]) return [v boolValue];
+    return YES;
 }
 
 #pragma mark - Empreinte device (fingerprint)
@@ -274,6 +285,7 @@ static NSDictionary *NWGenerateFingerprint(void) {
 #pragma mark - Hooks d'empreinte (ObjC)
 
 static NSString *NWFPStr(NSString *key) {
+    if (!NWGhostEnabled()) return nil;   // switch Ghost OFF -> valeurs reelles
     NSString *v = NWActiveFP[key];
     return ([v isKindOfClass:[NSString class]] && v.length) ? v : nil;
 }
@@ -350,27 +362,33 @@ static NSUUID *NWHook_idfv(id self, SEL _cmd) {
 // NSProcessInfo -----------------------------------------------------------
 static unsigned long long (*NWOrig_physMem)(id, SEL);
 static unsigned long long NWHook_physMem(id self, SEL _cmd) {
-    NSNumber *gb = NWActiveFP[@"memGB"];
-    if ([gb isKindOfClass:[NSNumber class]] && gb.unsignedLongLongValue > 0) {
-        return gb.unsignedLongLongValue * 1024ULL * 1024ULL * 1024ULL;
+    if (NWGhostEnabled()) {
+        NSNumber *gb = NWActiveFP[@"memGB"];
+        if ([gb isKindOfClass:[NSNumber class]] && gb.unsignedLongLongValue > 0) {
+            return gb.unsignedLongLongValue * 1024ULL * 1024ULL * 1024ULL;
+        }
     }
     return NWOrig_physMem(self, _cmd);
 }
 
 static NSUInteger (*NWOrig_cpuCount)(id, SEL);
 static NSUInteger NWHook_cpuCount(id self, SEL _cmd) {
-    NSNumber *c = NWActiveFP[@"cpu"];
-    if ([c isKindOfClass:[NSNumber class]] && c.unsignedIntegerValue > 0) {
-        return c.unsignedIntegerValue;
+    if (NWGhostEnabled()) {
+        NSNumber *c = NWActiveFP[@"cpu"];
+        if ([c isKindOfClass:[NSNumber class]] && c.unsignedIntegerValue > 0) {
+            return c.unsignedIntegerValue;
+        }
     }
     return NWOrig_cpuCount ? NWOrig_cpuCount(self, _cmd) : 6;
 }
 
 static NSUInteger (*NWOrig_activeCpuCount)(id, SEL);
 static NSUInteger NWHook_activeCpuCount(id self, SEL _cmd) {
-    NSNumber *c = NWActiveFP[@"cpu"];
-    if ([c isKindOfClass:[NSNumber class]] && c.unsignedIntegerValue > 0) {
-        return c.unsignedIntegerValue;
+    if (NWGhostEnabled()) {
+        NSNumber *c = NWActiveFP[@"cpu"];
+        if ([c isKindOfClass:[NSNumber class]] && c.unsignedIntegerValue > 0) {
+            return c.unsignedIntegerValue;
+        }
     }
     return NWOrig_activeCpuCount ? NWOrig_activeCpuCount(self, _cmd) : 6;
 }
@@ -615,34 +633,44 @@ static CLLocation *NWHook_location(id self, SEL _cmd) {
     return fake ?: NWOrig_location(self, _cmd);
 }
 
+// Dernier manager utilise (pour re-injecter la position periodiquement).
+static __weak CLLocationManager *NWLastMgr = nil;
+
 static void (*NWOrig_startUpdating)(id, SEL);
 static void NWHook_startUpdating(id self, SEL _cmd) {
-    NWOrig_startUpdating(self, _cmd);
+    CLLocationManager *mgr = (CLLocationManager *)self;
     if (NWFakeLocation()) {
-        // Delegation asynchrone : le delegate attend la premiere position.
-        CLLocationManager *mgr = (CLLocationManager *)self;
+        // PAS de vrai GPS : sinon les updates reelles ecrasent la position fake.
+        NWLastMgr = mgr;
         dispatch_async(dispatch_get_main_queue(), ^{ NWDeliverFake(mgr); });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ NWDeliverFake(mgr); });
+        return;
     }
+    NWLastMgr = mgr;
+    NWOrig_startUpdating(self, _cmd);
 }
 
 static void (*NWOrig_requestLocation)(id, SEL);
 static void NWHook_requestLocation(id self, SEL _cmd) {
-    NWOrig_requestLocation(self, _cmd);
+    CLLocationManager *mgr = (CLLocationManager *)self;
     if (NWFakeLocation()) {
-        CLLocationManager *mgr = (CLLocationManager *)self;
+        NWLastMgr = mgr;
         dispatch_async(dispatch_get_main_queue(), ^{ NWDeliverFake(mgr); });
+        return;
     }
+    NWLastMgr = mgr;
+    NWOrig_requestLocation(self, _cmd);
 }
 
 static void (*NWOrig_startSignificant)(id, SEL);
 static void NWHook_startSignificant(id self, SEL _cmd) {
-    NWOrig_startSignificant(self, _cmd);
+    CLLocationManager *mgr = (CLLocationManager *)self;
     if (NWFakeLocation()) {
-        CLLocationManager *mgr = (CLLocationManager *)self;
+        NWLastMgr = mgr;
         dispatch_async(dispatch_get_main_queue(), ^{ NWDeliverFake(mgr); });
+        return;
     }
+    NWLastMgr = mgr;
+    NWOrig_startSignificant(self, _cmd);
 }
 
 // Les erreurs "localisation indisponible" sont ignorees quand le fake est actif :
@@ -654,30 +682,114 @@ static NSMutableDictionary *NWFailMap(void) {
     return m;
 }
 
+// Retourne l'IMP d'origine pour (classe, selecteur).
+// 1) entree stockee au hook pour cette classe ; 2) sinon entree de la classe
+// parente (cas d'une sous-classe qui herite d'une methode deja hookee :
+// sans ca, les updates reelles seraient avalees) ; 3) sinon implementation
+// non hookee trouvee dans la hierarchie.
+static IMP NWOriginalIMP(Class cls, SEL sel, IMP mine, NSString *suffix) {
+    for (Class c = cls; c; c = class_getSuperclass(c)) {
+        id v = [NWFailMap() objectForKey:[NSStringFromClass(c) stringByAppendingString:suffix]];
+        if ([v isKindOfClass:[NSValue class]]) {
+            IMP o = [v pointerValue];
+            if (o && o != mine) return o;
+        }
+    }
+    for (Class c = class_getSuperclass(cls); c; c = class_getSuperclass(c)) {
+        Method m = class_getInstanceMethod(c, sel);
+        if (!m) continue;
+        IMP imp = class_getMethodImplementation(c, sel);
+        if (imp && imp != mine) return imp;
+    }
+    return NULL;
+}
+
 static void NWHook_fail(id self, SEL _cmd, id mgr, id error) {
-    if (NWFakeLocation()) return;
-    id v = [NWFailMap() objectForKey:NSStringFromClass(object_getClass(self))];
-    IMP orig = ([v isKindOfClass:[NSValue class]]) ? [v pointerValue] : NULL;
-    if (orig && orig != (IMP)NWHook_fail) ((void (*)(id, SEL, id, id))orig)(self, _cmd, mgr, error);
+    if (NWFakeLocation()) return;   // pas d'erreur quand le fake est actif
+    Class cls = object_getClass(self);
+    IMP orig = NWOriginalIMP(cls, @selector(locationManager:didFailWithError:),
+                             (IMP)NWHook_fail, @"|fail");
+    if (orig) ((void (*)(id, SEL, id, id))orig)(self, _cmd, mgr, error);
+}
+
+// Les updates REelles arrivent ici : on remplace toutes les positions par la
+// position fake, sinon Instagram recoit la vraie position en parallele.
+static void NWHook_locations(id self, SEL _cmd, id mgr, NSArray *locs) {
+    CLLocation *fake = NWFakeLocation();
+    NSArray *out = locs;
+    if (fake) {
+        NSMutableArray *a = [NSMutableArray arrayWithCapacity:locs.count];
+        for (NSUInteger i = 0; i < locs.count; i++) [a addObject:fake];
+        out = a;
+    }
+    Class cls = object_getClass(self);
+    IMP orig = NWOriginalIMP(cls, @selector(locationManager:didUpdateLocations:),
+                             (IMP)NWHook_locations, @"|loc");
+    if (orig) ((void (*)(id, SEL, id, NSArray *))orig)(self, _cmd, mgr, out);
+}
+
+// Signature legacy : (CLLocation *newLoc, CLLocation *oldLoc) — pas un tableau.
+static void NWHook_locationsLegacy(id self, SEL _cmd, id mgr, CLLocation *newLoc, CLLocation *oldLoc) {
+    CLLocation *fake = NWFakeLocation();
+    CLLocation *out = fake ?: newLoc;
+    Class cls = object_getClass(self);
+    IMP orig = NWOriginalIMP(cls, @selector(locationManager:didUpdateToLocation:fromLocation:),
+                             (IMP)NWHook_locationsLegacy, @"|leg");
+    if (orig) ((void (*)(id, SEL, id, CLLocation *, CLLocation *))orig)(self, _cmd, mgr, out, oldLoc);
 }
 
 static void NWHookDelegateClass(Class cls) {
     if (!cls || cls == [NSObject class]) return;
     NSString *key = NSStringFromClass(cls);
     @synchronized (NWFailMap()) {
-        if ([NWFailMap() objectForKey:key]) return;
-        SEL sel = @selector(locationManager:didFailWithError:);
-        Method m = class_getInstanceMethod(cls, sel);
-        if (!m) { [NWFailMap() setObject:[NSNull null] forKey:key]; return; }
-        IMP cur = class_getMethodImplementation(cls, sel);
-        if (cur == (IMP)NWHook_fail) {   // deja hooke (super) : pas de recursion
-            [NWFailMap() setObject:[NSNull null] forKey:key];
-            return;
+        // --- locationManager:didFailWithError: ---
+        if (![NWFailMap() objectForKey:[key stringByAppendingString:@"|fail"]]) {
+            SEL sel = @selector(locationManager:didFailWithError:);
+            Method m = class_getInstanceMethod(cls, sel);
+            if (m) {
+                IMP cur = class_getMethodImplementation(cls, sel);
+                if (cur != (IMP)NWHook_fail) {
+                    const char *types = method_getTypeEncoding(m);
+                    IMP old = class_replaceMethod(cls, sel, (IMP)NWHook_fail, types);
+                    if (!old) old = cur;
+                    [NWFailMap() setObject:[NSValue valueWithPointer:old] forKey:[key stringByAppendingString:@"|fail"]];
+                } else {
+                    [NWFailMap() setObject:[NSNull null] forKey:[key stringByAppendingString:@"|fail"]];
+                }
+            }
         }
-        const char *types = method_getTypeEncoding(m);
-        IMP old = class_replaceMethod(cls, sel, (IMP)NWHook_fail, types);
-        if (!old) old = cur;   // venait du super -> l'IMP super reste l'original
-        [NWFailMap() setObject:[NSValue valueWithPointer:old] forKey:key];
+        // --- locationManager:didUpdateLocations: ---
+        if (![NWFailMap() objectForKey:[key stringByAppendingString:@"|loc"]]) {
+            SEL sel = @selector(locationManager:didUpdateLocations:);
+            Method m = class_getInstanceMethod(cls, sel);
+            if (m) {
+                IMP cur = class_getMethodImplementation(cls, sel);
+                if (cur != (IMP)NWHook_locations) {
+                    const char *types = method_getTypeEncoding(m);
+                    IMP old = class_replaceMethod(cls, sel, (IMP)NWHook_locations, types);
+                    if (!old) old = cur;
+                    [NWFailMap() setObject:[NSValue valueWithPointer:old] forKey:[key stringByAppendingString:@"|loc"]];
+                } else {
+                    [NWFailMap() setObject:[NSNull null] forKey:[key stringByAppendingString:@"|loc"]];
+                }
+            }
+        }
+        // --- locationManager:didUpdateToLocation:fromLocation: (legacy) ---
+        if (![NWFailMap() objectForKey:[key stringByAppendingString:@"|leg"]]) {
+            SEL sel = @selector(locationManager:didUpdateToLocation:fromLocation:);
+            Method m = class_getInstanceMethod(cls, sel);
+            if (m) {
+                IMP cur = class_getMethodImplementation(cls, sel);
+                if (cur != (IMP)NWHook_locationsLegacy) {
+                    const char *types = method_getTypeEncoding(m);
+                    IMP old = class_replaceMethod(cls, sel, (IMP)NWHook_locationsLegacy, types);
+                    if (!old) old = cur;
+                    [NWFailMap() setObject:[NSValue valueWithPointer:old] forKey:[key stringByAppendingString:@"|leg"]];
+                } else {
+                    [NWFailMap() setObject:[NSNull null] forKey:[key stringByAppendingString:@"|leg"]];
+                }
+            }
+        }
         NWLog("delegate hook: %@", key);
     }
 }
@@ -689,14 +801,28 @@ static void NWHook_setDelegate(id self, SEL _cmd, id delegate) {
 }
 
 static void NWInstallLocationHooks(void) {
-    Class mgrCls = [CLLocationManager class];
-    NWSwizzle(mgrCls, @selector(location), (IMP)NWHook_location, &NWOrig_location);
-    NWSwizzle(mgrCls, @selector(startUpdatingLocation), (IMP)NWHook_startUpdating, &NWOrig_startUpdating);
-    NWSwizzle(mgrCls, @selector(requestLocation), (IMP)NWHook_requestLocation, &NWOrig_requestLocation);
-    NWSwizzle(mgrCls, @selector(startMonitoringSignificantLocationChanges), (IMP)NWHook_startSignificant, &NWOrig_startSignificant);
-    // Le delegate n'est connu qu'a setDelegate: -> on swizzle sa classe a ce moment-la
-    // (plutot que NSObject qui n'implante pas la methode).
-    NWSwizzle(mgrCls, @selector(setDelegate:), (IMP)NWHook_setDelegate, &NWOrig_setDelegate);
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class mgrCls = [CLLocationManager class];
+        NWSwizzle(mgrCls, @selector(location), (IMP)NWHook_location, &NWOrig_location);
+        NWSwizzle(mgrCls, @selector(startUpdatingLocation), (IMP)NWHook_startUpdating, &NWOrig_startUpdating);
+        NWSwizzle(mgrCls, @selector(requestLocation), (IMP)NWHook_requestLocation, &NWOrig_requestLocation);
+        NWSwizzle(mgrCls, @selector(startMonitoringSignificantLocationChanges), (IMP)NWHook_startSignificant, &NWOrig_startSignificant);
+        // Le delegate n'est connu qu'a setDelegate: -> on swizzle sa classe a ce moment-la
+        // (plutot que NSObject qui n'implante pas la methode).
+        NWSwizzle(mgrCls, @selector(setDelegate:), (IMP)NWHook_setDelegate, &NWOrig_setDelegate);
+
+        // Re-injection periodique : certaines apps n'attendent jamais le
+        // delegate et relancent un fetch. On re-livre la position fake
+        // toutes les 2 s tant qu'elle est active.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) {
+                if (!NWFakeLocation()) return;
+                CLLocationManager *m = NWLastMgr;
+                if (m) NWDeliverFake(m);
+            }];
+        });
+    });
     NWLog("hooks fake GPS installes (on=%d)", NWActiveLoc[@"on"] ? 1 : 0);
 }
 
@@ -799,7 +925,9 @@ static void NWPersistState(void) {
 
 // Cree un nouveau conteneur (nouveau "telephone") et le rend actif.
 // Retourne l'identifiant (ex: "c3").
-static NSString *NWCreateContainer(NSString *name) {
+// locOpt : position fake choisie sur la carte a la creation (ou nil).
+// ghostOn : "Random data with Ghost?" (copy Blaze) -> NO = valeurs reelles.
+static NSString *NWCreateContainerWithLocGhost(NSString *name, NSDictionary *locOpt, BOOL ghostOn) {
     // 1. Sauvegarde du conteneur courant (s'il existe)
     if (NWActiveID) NWSnapshotActive();
 
@@ -818,11 +946,23 @@ static NSString *NWCreateContainer(NSString *name) {
     [@{} writeToFile:[dir stringByAppendingPathComponent:@"prefs.plist"] atomically:YES];
     [@[] writeToFile:[dir stringByAppendingPathComponent:@"cookies.plist"] atomically:YES];
 
+    // 5. Localisation (choisie sur la carte a la creation, sinon off)
+    NSDictionary *loc;
+    if ([locOpt isKindOfClass:[NSDictionary class]] && [locOpt[@"on"] boolValue]) {
+        loc = @{@"on": @YES,
+                @"lat": locOpt[@"lat"] ?: @0,
+                @"lon": locOpt[@"lon"] ?: @0,
+                @"label": locOpt[@"label"] ?: @""};
+    } else {
+        loc = @{@"on": @NO, @"lat": @0, @"lon": @0, @"label": @""};
+    }
+
     containers[cid] = @{
         @"name": name.length ? name : [NSString stringWithFormat:@"Télo %lu", (unsigned long)containers.count + 1],
         @"createdAt": @([[NSDate date] timeIntervalSince1970]),
         @"fp": fp,
-        @"loc": @{@"on": @NO, @"lat": @0, @"lon": @0, @"label": @""},
+        @"loc": loc,
+        @"ghostOn": @(ghostOn),
     };
 
     NSMutableDictionary *newSt = [st mutableCopy] ?: [NSMutableDictionary dictionary];
@@ -838,6 +978,15 @@ static NSString *NWCreateContainer(NSString *name) {
 
     NWLog("conteneur cree: %@ (modele fictif=%@)", cid, fp[@"model"]);
     return cid;
+}
+
+// Variante sans localisation (conteneur standard).
+static NSString *NWCreateContainerWithLoc(NSString *name, NSDictionary *locOpt) {
+    return NWCreateContainerWithLocGhost(name, locOpt, YES);
+}
+
+static NSString *NWCreateContainer(NSString *name) {
+    return NWCreateContainerWithLoc(name, nil);
 }
 
 // Bascule vers un conteneur : snapshot du courant + restauration de la cible.
@@ -902,7 +1051,7 @@ static void NWBootstrapState(void) {
     if (!st[@"containers"]) {
         // Premier lancement : conteneur par defaut = telephone reel.
         NWSaveState(@{@"containers": @{}, @"activeContainer": [NSNull null]});
-        NSString *cid = NWCreateContainer(@"Mon iPhone");
+        NSString *cid = NWCreateContainer(@"Peter");
         NWLog("premier lancement, conteneur par defaut: %@", cid);
         return;
     }
@@ -932,7 +1081,15 @@ static UIImage *NWSymbol(NSString *name, CGFloat pt) {
     if (@available(iOS 13.0, *)) {
         UIImageConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:pt
                                                                                    weight:UIImageSymbolWeightSemibold];
-        return [UIImage systemImageNamed:name withConfiguration:cfg];
+        UIImage *img = [UIImage systemImageNamed:name withConfiguration:cfg];
+        // Replis : symboles prives Blaze ("private:emoji.ghost") ou inconnus.
+        if (!img && [name hasPrefix:@"private:"]) {
+            img = [UIImage systemImageNamed:[name substringFromIndex:8] withConfiguration:cfg];
+        }
+        if (!img && [name containsString:@"ghost"]) {
+            img = [UIImage systemImageNamed:@"shield.lefthalf.filled" withConfiguration:cfg];
+        }
+        return img;
     }
     return nil;
 }
@@ -1017,6 +1174,16 @@ static UILabel *NWBadge(NSString *text, UIColor *tint) {
     [l.heightAnchor constraintEqualToConstant:20].active = YES;
     [l.widthAnchor constraintGreaterThanOrEqualToConstant:44].active = YES;
     return l;
+}
+
+// Emoji drapeau depuis un code ISO a 2 lettres ("FR" -> 🇫🇷).
+static NSString *NWFlagEmoji(NSString *iso) {
+    NSString *u = [iso uppercaseString];
+    if (u.length != 2) return @"🌍";
+    unichar a = [u characterAtIndex:0], b = [u characterAtIndex:1];
+    if (a < 'A' || a > 'Z' || b < 'A' || b > 'Z') return @"🌍";
+    return [NSString stringWithFormat:@"%C%C\uFE0F",
+            (unichar)(0x1F1E6 + (a - 'A')), (unichar)(0x1F1E6 + (b - 'A'))];
 }
 
 static UILabel *NWSectionLabel(NSString *text) {
@@ -1126,46 +1293,46 @@ static NSArray<NSArray *> *NWCities(void) {
     dispatch_once(&once, ^{
         cities = @[
             @[@"Paris, France", @48.8566, @2.3522],
-            @[@"Londres, Royaume-Uni", @51.5074, @-0.1278],
+            @[@"London, United Kingdom", @51.5074, @-0.1278],
             @[@"New York, USA", @40.7128, @-74.0060],
             @[@"Los Angeles, USA", @34.0522, @-118.2437],
             @[@"Las Vegas, USA", @36.1699, @-115.1398],
             @[@"San Francisco, USA", @37.7749, @-122.4194],
             @[@"Washington D.C., USA", @38.9072, @-77.0369],
             @[@"Miami, USA", @25.7617, @-80.1918],
-            @[@"La Nouvelle-Orléans, USA", @29.9511, @-90.0715],
-            @[@"Mexico, Mexique", @19.4326, @-99.1332],
-            @[@"Panama, Panama", @8.9824, @-79.5199],
-            @[@"Bogota, Colombie", @4.7110, @-74.0721],
-            @[@"São Paulo, Brésil", @-23.5505, @-46.6333],
-            @[@"La Havane, Cuba", @23.1136, @-82.3666],
-            @[@"Montréal, Canada", @45.5019, @-73.5674],
-            @[@"Madrid, Espagne", @40.4168, @-3.7038],
-            @[@"Berlin, Allemagne", @52.5200, @13.4050],
-            @[@"Rome, Italie", @41.9028, @12.4964],
-            @[@"Lisbonne, Portugal", @38.7223, @-9.1393],
-            @[@"Bruxelles, Belgique", @50.8503, @4.3517],
-            @[@"Genève, Suisse", @46.2044, @6.1432],
-            @[@"Amsterdam, Pays-Bas", @52.3676, @4.9041],
-            @[@"Dublin, Irlande", @53.3498, @-6.2603],
-            @[@"Istanbul, Turquie", @41.0082, @28.9784],
-            @[@"Dubaï, EAU", @25.2048, @55.2708],
-            @[@"Le Caire, Égypte", @30.0444, @31.2357],
-            @[@"Casablanca, Maroc", @33.5731, @-7.5898],
-            @[@"Dakar, Sénégal", @14.7167, @-17.4677],
-            @[@"Abidjan, Côte d'Ivoire", @5.3600, @-4.0083],
-            @[@"Lagos, Nigéria", @6.5244, @3.3792],
-            @[@"Kinshasa, RDC", @-4.4419, @15.2663],
+            @[@"New Orleans, USA", @29.9511, @-90.0715],
+            @[@"Mexico City, Mexico", @19.4326, @-99.1332],
+            @[@"Panama City, Panama", @8.9824, @-79.5199],
+            @[@"Bogota, Colombia", @4.7110, @-74.0721],
+            @[@"Sao Paulo, Brazil", @-23.5505, @-46.6333],
+            @[@"Havana, Cuba", @23.1136, @-82.3666],
+            @[@"Montreal, Canada", @45.5019, @-73.5674],
+            @[@"Madrid, Spain", @40.4168, @-3.7038],
+            @[@"Berlin, Germany", @52.5200, @13.4050],
+            @[@"Rome, Italy", @41.9028, @12.4964],
+            @[@"Lisbon, Portugal", @38.7223, @-9.1393],
+            @[@"Brussels, Belgium", @50.8503, @4.3517],
+            @[@"Geneva, Switzerland", @46.2044, @6.1432],
+            @[@"Amsterdam, Netherlands", @52.3676, @4.9041],
+            @[@"Dublin, Ireland", @53.3498, @-6.2603],
+            @[@"Istanbul, Turkey", @41.0082, @28.9784],
+            @[@"Dubai, UAE", @25.2048, @55.2708],
+            @[@"Cairo, Egypt", @30.0444, @31.2357],
+            @[@"Casablanca, Morocco", @33.5731, @-7.5898],
+            @[@"Dakar, Senegal", @14.7167, @-17.4677],
+            @[@"Abidjan, Cote d'Ivoire", @5.3600, @-4.0083],
+            @[@"Lagos, Nigeria", @6.5244, @3.3792],
+            @[@"Kinshasa, DR Congo", @-4.4419, @15.2663],
             @[@"Nairobi, Kenya", @-1.2921, @36.8219],
-            @[@"Johannesburg, Afrique du Sud", @-26.2041, @28.0473],
-            @[@"Mumbai, Inde", @19.0760, @72.8777],
-            @[@"Bangkok, Thaïlande", @13.7563, @100.5018],
-            @[@"Singapour", @1.3521, @103.8198],
+            @[@"Johannesburg, South Africa", @-26.2041, @28.0473],
+            @[@"Mumbai, India", @19.0760, @72.8777],
+            @[@"Bangkok, Thailand", @13.7563, @100.5018],
+            @[@"Singapore", @1.3521, @103.8198],
             @[@"Hong Kong", @22.3193, @114.1694],
-            @[@"Tokyo, Japon", @35.6762, @139.6503],
-            @[@"Séoul, Corée du Sud", @37.5665, @126.9780],
-            @[@"Sydney, Australie", @-33.8688, @151.2093],
-            @[@"Melbourne, Australie", @-37.8136, @144.9631],
+            @[@"Tokyo, Japan", @35.6762, @139.6503],
+            @[@"Seoul, South Korea", @37.5665, @126.9780],
+            @[@"Sydney, Australia", @-33.8688, @151.2093],
+            @[@"Melbourne, Australia", @-37.8136, @144.9631],
         ];
     });
     return cities;
@@ -1176,6 +1343,298 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
     NWUpdateContainerField(cid, @"loc", @{@"on": @YES, @"lat": @(lat), @"lon": @(lon),
                                           @"label": label ?: @""});
     NWReloadAfterStateChange();
+}
+
+#pragma mark - Carte du monde (sélecteur de localisation)
+
+// Carte plein écran façon Blaze : pin fixe au centre, la carte bouge dessous,
+// recherche par barre (Nominatim), reverse geocoding, types de carte
+// Standard / Hybrid / Satellite et bouton "Set Location".
+@interface NWMapPicker : UIViewController <MKMapViewDelegate, UISearchBarDelegate,
+                                           UITableViewDataSource, UITableViewDelegate>
+@property (nonatomic, copy) void (^onPick)(double lat, double lon, NSString *label);
+@property (nonatomic, assign) CLLocationCoordinate2D initial;
++ (void)presentFrom:(UIViewController *)host
+           initial:(CLLocationCoordinate2D)coord
+             onPick:(void (^)(double lat, double lon, NSString *label))onPick;
+@end
+
+@implementation NWMapPicker {
+    MKMapView *_map;
+    UISearchBar *_search;
+    UITableView *_results;
+    UILabel *_addr;
+    NSArray<NSDictionary *> *_hits;
+    CLGeocoder *_geo;
+}
+
++ (void)presentFrom:(UIViewController *)host
+           initial:(CLLocationCoordinate2D)coord
+             onPick:(void (^)(double, double, NSString *))onPick {
+    if (!host) return;
+    NWMapPicker *p = [[NWMapPicker alloc] init];
+    p.onPick = onPick;
+    p.initial = coord;
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:p];
+    nav.modalPresentationStyle = UIModalPresentationFullScreen;
+    nav.navigationBar.barStyle = UIBarStyleBlack;
+    nav.navigationBar.tintColor = NWAccent();
+    [host presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = NWBg();
+    self.title = @"Spoof Location";
+    self.edgesForExtendedLayout = UIRectEdgeNone;
+
+    self.navigationItem.leftBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"Cancel"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self action:@selector(cancelPick)];
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"Set Location"
+                                         style:UIBarButtonItemStyleDone
+                                        target:self action:@selector(confirmPick)];
+    self.navigationItem.rightBarButtonItem.tintColor = NWAccent();
+
+    _map = [[MKMapView alloc] initWithFrame:CGRectZero];
+    _map.translatesAutoresizingMaskIntoConstraints = NO;
+    _map.delegate = self;
+    _map.showsCompass = NO;
+    _map.showsScale = NO;
+    [self.view addSubview:_map];
+
+    // Pin fixe : son extrémité pointe vers le centre exact de la carte.
+    UIImageView *pin = [[UIImageView alloc] initWithImage:NWSymbol(@"mappin.fill", 34)];
+    pin.tintColor = NWRed();
+    pin.translatesAutoresizingMaskIntoConstraints = NO;
+    pin.userInteractionEnabled = NO;
+    [self.view addSubview:pin];
+
+    // Barre de recherche
+    _search = [[UISearchBar alloc] initWithFrame:CGRectZero];
+    _search.translatesAutoresizingMaskIntoConstraints = NO;
+    _search.placeholder = @"Search...";
+    _search.delegate = self;
+    _search.searchBarStyle = UISearchBarStyleMinimal;
+    _search.backgroundColor = [UIColor colorWithWhite:0 alpha:0.35];
+    _search.layer.cornerRadius = 12;
+    _search.clipsToBounds = YES;
+    [self.view addSubview:_search];
+
+    // Résultats de recherche
+    _results = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
+    _results.translatesAutoresizingMaskIntoConstraints = NO;
+    _results.dataSource = self;
+    _results.delegate = self;
+    _results.backgroundColor = NWCardColor();
+    _results.layer.cornerRadius = 12;
+    _results.clipsToBounds = YES;
+    _results.rowHeight = 52;
+    _results.hidden = YES;
+    _results.separatorColor = NWLine();
+    [self.view addSubview:_results];
+
+    // Carte du bas : adresse + type de carte
+    UIView *card = [[UIView alloc] init];
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    card.backgroundColor = [NWCardColor() colorWithAlphaComponent:0.94];
+    card.layer.cornerRadius = 16;
+    card.layer.borderWidth = 1;
+    card.layer.borderColor = NWLine().CGColor;
+    [self.view addSubview:card];
+
+    _addr = NWLabelMake(@"Move the map to choose a location", 13,
+                        UIColor.whiteColor, UIFontWeightMedium);
+    _addr.numberOfLines = 2;
+    _addr.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:_addr];
+
+    UISegmentedControl *seg =
+        [[UISegmentedControl alloc] initWithItems:@[@"Standard", @"Hybrid", @"Satellite"]];
+    seg.selectedSegmentIndex = 0;
+    seg.translatesAutoresizingMaskIntoConstraints = NO;
+    seg.tintColor = NWAccent();
+    [seg addTarget:self action:@selector(mapTypeChanged:)
+ forControlEvents:UIControlEventValueChanged];
+    [card addSubview:seg];
+
+    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [_map.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [_map.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [_map.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [_map.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+
+        [pin.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+        [pin.bottomAnchor constraintEqualToAnchor:self.view.centerYAnchor],
+
+        [_search.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8],
+        [_search.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+        [_search.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+        [_search.heightAnchor constraintEqualToConstant:44],
+
+        [_results.topAnchor constraintEqualToAnchor:_search.bottomAnchor constant:6],
+        [_results.leadingAnchor constraintEqualToAnchor:_search.leadingAnchor],
+        [_results.trailingAnchor constraintEqualToAnchor:_search.trailingAnchor],
+        [_results.heightAnchor constraintEqualToConstant:210],
+
+        [card.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+        [card.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+        [card.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-12],
+
+        [_addr.topAnchor constraintEqualToAnchor:card.topAnchor constant:12],
+        [_addr.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
+        [_addr.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
+
+        [seg.topAnchor constraintEqualToAnchor:_addr.bottomAnchor constant:10],
+        [seg.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
+        [seg.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
+        [seg.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-12],
+    ]];
+
+    CLLocationCoordinate2D c = self.initial;
+    if (!CLLocationCoordinate2DIsValid(c) || (c.latitude == 0 && c.longitude == 0))
+        c = CLLocationCoordinate2DMake(48.8566, 2.3522);   // Paris
+    MKCoordinateRegion region = MKCoordinateRegionMakeWithDistance(c, 3000, 3000);
+    [_map setRegion:region animated:NO];
+    [self reverseGeocode:c];
+}
+
+- (void)cancelPick { [self dismissViewControllerAnimated:YES completion:nil]; }
+
+- (void)confirmPick {
+    CLLocationCoordinate2D c = _map.centerCoordinate;
+    NSString *label = _addr.text.length ? _addr.text : @"Current Location";
+    void (^cb)(double, double, NSString *) = self.onPick;
+    [self dismissViewControllerAnimated:YES completion:^{
+        if (cb) cb(c.latitude, c.longitude, label);
+    }];
+}
+
+- (void)mapTypeChanged:(UISegmentedControl *)seg {
+    switch (seg.selectedSegmentIndex) {
+        case 1: _map.mapType = MKMapTypeHybrid; break;
+        case 2: _map.mapType = MKMapTypeSatellite; break;
+        default: _map.mapType = MKMapTypeStandard; break;
+    }
+}
+
+- (void)mapView:(MKMapView *)mapView regionDidChangeAnimated:(BOOL)animated {
+    [self reverseGeocode:mapView.centerCoordinate];
+}
+
+- (void)reverseGeocode:(CLLocationCoordinate2D)c {
+    if (!_geo) _geo = [CLGeocoder new];
+    if (_geo.geocoding) [_geo cancelGeocode];
+    CLLocation *loc = [[CLLocation alloc] initWithLatitude:c.latitude longitude:c.longitude];
+    _addr.text = @"Loading location...";
+    __weak typeof(self) weakSelf = self;
+    [_geo reverseGeocodeLocation:loc completionHandler:^(NSArray<CLPlacemark *> *marks, NSError *err) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) self2 = weakSelf;
+            if (!self2) return;
+            CLPlacemark *m = marks.firstObject;
+            if (!m) { self2->_addr.text = @"No Address Available"; return; }
+            NSMutableArray *parts = [NSMutableArray array];
+            if (m.name.length) [parts addObject:m.name];
+            if (m.locality.length) [parts addObject:m.locality];
+            if (m.country.length) [parts addObject:m.country];
+            self2->_addr.text = parts.count ? [parts componentsJoinedByString:@", "]
+                                            : @"Current Location";
+        });
+    }];
+}
+
+// --- Recherche (Nominatim) -------------------------------------------------
+
+- (void)searchBarSearchButtonClicked:(UISearchBar *)sb {
+    [sb resignFirstResponder];
+    NSString *q = [sb.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    if (q.length < 2) return;
+    NSString *enc = [q stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLQueryAllowedCharacterSet];
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:
+        @"https://nominatim.openstreetmap.org/search?q=%@&format=json&limit=8", enc]];
+    if (!url) return;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    [req setValue:@"nine9wham/1.2 (iOS app)" forHTTPHeaderField:@"User-Agent"];
+    [req setTimeoutInterval:15];
+    __weak typeof(self) weakSelf = self;
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req
+                                     completionHandler:^(NSData *data, NSURLResponse *r, NSError *e) {
+        NSArray *arr = nil;
+        if (data) {
+            id j = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            if ([j isKindOfClass:[NSArray class]]) arr = j;
+        }
+        NSMutableArray *hits = [NSMutableArray array];
+        for (id o in arr) {
+            if (![o isKindOfClass:[NSDictionary class]]) continue;
+            NSString *dn = o[@"display_name"];
+            if (![dn isKindOfClass:[NSString class]]) continue;
+            [hits addObject:@{@"title": dn,
+                              @"lat": o[@"lat"] ?: @"0",
+                              @"lon": o[@"lon"] ?: @"0"}];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) self2 = weakSelf;
+            if (!self2) return;
+            self2->_hits = hits;
+            self2->_results.hidden = (hits.count == 0);
+            [self2->_results reloadData];
+        });
+    }] resume];
+}
+
+- (void)searchBarTextDidBeginEditing:(UISearchBar *)sb {
+    sb.showsCancelButton = YES;
+}
+- (void)searchBarCancelButtonClicked:(UISearchBar *)sb {
+    sb.showsCancelButton = NO;
+    [sb resignFirstResponder];
+    _results.hidden = YES;
+}
+
+- (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)n { return _hits.count; }
+
+- (UITableViewCell *)tableView:(UITableView *)t cellForRowAtIndexPath:(NSIndexPath *)ip {
+    static NSString *rid = @"nw.hit";
+    UITableViewCell *cell = [t dequeueReusableCellWithIdentifier:rid];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:rid];
+        cell.backgroundColor = NWCardColor();
+        cell.textLabel.textColor = UIColor.whiteColor;
+        cell.textLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
+        cell.textLabel.numberOfLines = 2;
+        cell.tintColor = NWAccent();
+    }
+    NSDictionary *h = _hits[ip.row];
+    cell.textLabel.text = h[@"title"];
+    return cell;
+}
+
+- (void)tableView:(UITableView *)t didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [t deselectRowAtIndexPath:ip animated:YES];
+    NSDictionary *h = _hits[ip.row];
+    double la = [h[@"lat"] doubleValue];
+    double lo = [h[@"lon"] doubleValue];
+    CLLocationCoordinate2D c = CLLocationCoordinate2DMake(la, lo);
+    if (!CLLocationCoordinate2DIsValid(c)) return;
+    _results.hidden = YES;
+    _search.text = h[@"title"];
+    [_search resignFirstResponder];
+    MKCoordinateRegion region = MKCoordinateRegionMakeWithDistance(c, 2500, 2500);
+    [_map setRegion:region animated:YES];
+    [self reverseGeocode:c];
+}
+
+@end
+
+// Ouvre la carte pour un nouveau conteneur : pin au centre, recherche, "Set Location".
+static void NWOpenMapPicker(UIViewController *host, CLLocationCoordinate2D initial,
+                            void (^onPick)(double lat, double lon, NSString *label)) {
+    [NWMapPicker presentFrom:host initial:initial onPick:onPick];
 }
 
 // --- Alertes / navigation ------------------------------------------------
@@ -1199,14 +1658,11 @@ static void NWAlert(NSString *title, NSString *msg) {
     [top presentViewController:a animated:YES completion:nil];
 }
 
-// Vue controller du dessus (overlay nine9wham en priorite).
+// Vue controller du dessus — TOUJOURS la fenetre d'Instagram, jamais l'overlay.
+// Presenter dans l'overlay (niveau Alert+10) laissait des vues opaques
+// au-dessus d'Instagram et rendait les boutons intouchables.
 static UIViewController *NWTopVC(void) {
     UIViewController *vc = nil;
-    if (NWOverlayWindow) {
-        vc = NWOverlayWindow.rootViewController;
-        while (vc.presentedViewController) vc = vc.presentedViewController;
-        if (vc.view.window) return vc;
-    }
     UIWindow *w = nil;
     if (@available(iOS 13.0, *)) {
         for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
@@ -1232,13 +1688,13 @@ static UIViewController *NWTopVC(void) {
 static void NWAskRelaunch(NSString *raison) {
     if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
     UIAlertController *a = [UIAlertController
-        alertControllerWithTitle:@"Redémarrage requis"
-        message:[NSString stringWithFormat:@"%@ doit redémarrer pour appliquer ce changement.", raison]
+        alertControllerWithTitle:@"Restart required"
+        message:[NSString stringWithFormat:@"%@ needs to restart to apply this change.", raison]
         preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"Relancer" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *act) {
+    [a addAction:[UIAlertAction actionWithTitle:@"Restart" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *act) {
         exit(0);
     }]];
-    [a addAction:[UIAlertAction actionWithTitle:@"Plus tard" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Later" style:UIAlertActionStyleCancel handler:nil]];
     UIViewController *top = NWTopVC();
     if (top.presentedViewController) return;
     [top presentViewController:a animated:YES completion:nil];
@@ -1263,7 +1719,25 @@ static void NWAskRelaunch(NSString *raison) {
 @end
 
 @interface NWOverlayUIWindow : UIWindow @end
-@implementation NWOverlayUIWindow @end
+@implementation NWOverlayUIWindow
+
+// La fenetre overlay ne doit JAMAIS intercepter un toucher qui ne vise pas
+// le bouton flottant. Sans ca, la moindre vue restante (alerte, dashboard)
+// bloquerait tous les boutons d'Instagram (login, inscription, etc.).
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *v = [super hitTest:point withEvent:event];
+    if (!v || v == self) return nil;
+    // Seul le bouton flottant (sous-vue de la racine) doit recevoir le toucher.
+    if (v == self.rootViewController.view) return nil;
+    return v;
+}
+
+// Jamais la fenetre principale : Instagram doit rester key window
+// (sinon clavier / first responder / animations casses).
+- (BOOL)canBecomeKeyWindow { return NO; }
+- (BOOL)canBecomeFirstResponder { return NO; }
+
+@end
 
 static UIWindowScene *NWForegroundScene(void) {
     if (@available(iOS 13.0, *)) {
@@ -1474,11 +1948,20 @@ static void NWInstallFloatingButton(void) {
 
 - (void)layoutSubviews {
     [super layoutSubviews];
-    CGFloat w = self.bounds.size.width;
+    CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
+    BOOL hasSub = (_subLabel.text.length > 0);
     _tile.frame = CGRectMake(12, 12, 34, 34);
     _iconView.frame = CGRectMake(8, 8, 18, 18);
-    _titleLabel.frame = CGRectMake(12, 52, w - 24, 36);
-    _subLabel.frame = CGRectMake(12, 88, w - 24, 28);
+    if (hasSub) {
+        _titleLabel.frame = CGRectMake(12, 52, w - 24, 36);
+        _subLabel.frame = CGRectMake(12, 88, w - 24, 28);
+        _subLabel.hidden = NO;
+    } else {
+        // GridCell Blaze : icone + titre seulement, titre centre sous l'icone.
+        _titleLabel.frame = CGRectMake(10, 54, w - 20, h - 62);
+        _titleLabel.textAlignment = NSTextAlignmentCenter;
+        _subLabel.hidden = YES;
+    }
 }
 
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
@@ -1570,14 +2053,20 @@ static void NWInstallFloatingButton(void) {
 @interface NWSwitchRow : UIView
 @property (nonatomic, strong) UIImageView *iconView;
 @property (nonatomic, strong) UILabel *titleLabel;
+@property (nonatomic, strong) UILabel *subLabel;
 @property (nonatomic, strong) UISwitch *toggle;
 @property (nonatomic, copy) void (^onChange)(BOOL on);
 - (instancetype)initWithIcon:(NSString *)icon title:(NSString *)title on:(BOOL)on;
+- (instancetype)initWithIcon:(NSString *)icon title:(NSString *)title subtitle:(NSString *)subtitle on:(BOOL)on;
 @end
 
 @implementation NWSwitchRow
 
 - (instancetype)initWithIcon:(NSString *)icon title:(NSString *)title on:(BOOL)on {
+    return [self initWithIcon:icon title:title subtitle:nil on:on];
+}
+
+- (instancetype)initWithIcon:(NSString *)icon title:(NSString *)title subtitle:(NSString *)subtitle on:(BOOL)on {
     self = [super initWithFrame:CGRectMake(0, 0, 0, 0)];
     if (!self) return nil;
 
@@ -1589,6 +2078,12 @@ static void NWInstallFloatingButton(void) {
     _titleLabel = NWLabelMake(title, 14.5, UIColor.whiteColor, UIFontWeightMedium);
     _titleLabel.numberOfLines = 1;
     [self addSubview:_titleLabel];
+
+    if (subtitle.length) {
+        _subLabel = NWLabelMake(subtitle, 11, NWDim(), UIFontWeightRegular);
+        _subLabel.numberOfLines = 1;
+        [self addSubview:_subLabel];
+    }
 
     _toggle = [[UISwitch alloc] init];
     _toggle.onTintColor = NWAccent();
@@ -1605,9 +2100,16 @@ static void NWInstallFloatingButton(void) {
 - (void)layoutSubviews {
     [super layoutSubviews];
     CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
+    CGFloat textW = w - 48 - 14 - 62;
     _iconView.frame = CGRectMake(14, (h - 20) / 2.0, 20, 20);
-    _titleLabel.frame = CGRectMake(48, 0, w - 48 - 14 - 62, h);
     _toggle.frame = CGRectMake(w - 14 - 51, (h - 31) / 2.0, 51, 31);
+    if (_subLabel) {
+        // SwitchListCell Blaze : titre + sous-titre empiles.
+        _titleLabel.frame = CGRectMake(48, (h - 36) / 2.0, textW, 19);
+        _subLabel.frame = CGRectMake(48, _titleLabel.frame.origin.y + 20, textW, 15);
+    } else {
+        _titleLabel.frame = CGRectMake(48, 0, textW, h);
+    }
 }
 
 @end
@@ -1716,6 +2218,230 @@ static void NWInstallFloatingButton(void) {
 @end
 
 // ---------------------------------------------------------------------------
+// Feuille "New Container" (copy Blaze : Container Name + Enable Spoof + Create)
+// ---------------------------------------------------------------------------
+@interface NWNewContainerSheet : UIViewController
+@property (nonatomic, copy) void (^onCreate)(NSString *name, NSDictionary *locOpt, BOOL ghostOn);
+@property (nonatomic, copy) NSDictionary *initialLoc;   // position deja choisie sur la carte
+@end
+
+@implementation NWNewContainerSheet {
+    UITextField *_field;
+    UISwitch *_ghostSwitch;
+    UILabel *_locValue;
+    NSDictionary *_loc;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = UIColor.clearColor;
+
+    UIControl *dim = [[UIControl alloc] initWithFrame:CGRectZero];
+    dim.translatesAutoresizingMaskIntoConstraints = NO;
+    dim.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
+    [dim addTarget:self action:@selector(closeSelf) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:dim];
+
+    UIView *card = [[UIView alloc] init];
+    card.backgroundColor = [UIColor colorWithRed:0.063 green:0.063 blue:0.082 alpha:1];
+    card.layer.cornerRadius = 22;
+    card.layer.borderWidth = 1;
+    card.layer.borderColor = NWLine().CGColor;
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:card];
+
+    UIStackView *stack = [[UIStackView alloc] init];
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.spacing = 12;
+    stack.layoutMargins = UIEdgeInsetsMake(18, 18, 18, 18);
+    stack.layoutMarginsRelativeArrangement = YES;
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:stack];
+
+    // --- Entete : "New Container" + fermeture ---
+    UIStackView *header = [[UIStackView alloc] init];
+    header.axis = UILayoutConstraintAxisHorizontal;
+    header.alignment = UIStackViewAlignmentCenter;
+    header.spacing = 8;
+    UILabel *title = NWLabelMake(@"New Container", 17, UIColor.whiteColor, UIFontWeightBold);
+    __weak typeof(self) weakSelf = self;
+    UIButton *close = NWIconButton(@"xmark", ^(id s){ [weakSelf closeSelf]; });
+    [header addArrangedSubview:title];
+    [header addArrangedSubview:NWSpacer()];
+    [header addArrangedSubview:close];
+    [stack addArrangedSubview:header];
+
+    // --- Container Name ---
+    [stack addArrangedSubview:NWLabelMake(@"Container Name", 12, NWDim(), UIFontWeightMedium)];
+
+    UIView *fieldBox = [[UIView alloc] init];
+    fieldBox.backgroundColor = [UIColor colorWithWhite:1 alpha:0.06];
+    fieldBox.layer.cornerRadius = 14;
+    fieldBox.translatesAutoresizingMaskIntoConstraints = NO;
+    [fieldBox.heightAnchor constraintEqualToConstant:52].active = YES;
+
+    UIImageView *folder = [[UIImageView alloc] initWithImage:NWSymbol(@"folder.fill", 16)];
+    folder.tintColor = NWAccent();
+    folder.contentMode = UIViewContentModeScaleAspectFit;
+    folder.translatesAutoresizingMaskIntoConstraints = NO;
+    [fieldBox addSubview:folder];
+
+    _field = [[UITextField alloc] init];
+    _field.textColor = UIColor.whiteColor;
+    _field.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    _field.attributedPlaceholder = [[NSAttributedString alloc]
+        initWithString:@"Enter container name..."
+            attributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.4]}];
+    _field.translatesAutoresizingMaskIntoConstraints = NO;
+    [fieldBox addSubview:_field];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [folder.leadingAnchor constraintEqualToAnchor:fieldBox.leadingAnchor constant:14],
+        [folder.centerYAnchor constraintEqualToAnchor:fieldBox.centerYAnchor],
+        [folder.widthAnchor constraintEqualToConstant:20],
+        [folder.heightAnchor constraintEqualToConstant:20],
+        [_field.leadingAnchor constraintEqualToAnchor:folder.trailingAnchor constant:10],
+        [_field.trailingAnchor constraintEqualToAnchor:fieldBox.trailingAnchor constant:-14],
+        [_field.centerYAnchor constraintEqualToAnchor:fieldBox.centerYAnchor],
+    ]];
+    [stack addArrangedSubview:fieldBox];
+
+    // --- Enable Spoof / Random data with Ghost? ---
+    NWSwitchRow *ghostRow = [[NWSwitchRow alloc] initWithIcon:@"shield.lefthalf.filled"
+                                                        title:@"Enable Spoof"
+                                                    subtitle:@"Random data with Ghost?"
+                                                          on:YES];
+    ghostRow.backgroundColor = [UIColor colorWithWhite:1 alpha:0.06];
+    ghostRow.layer.cornerRadius = 14;
+    ghostRow.translatesAutoresizingMaskIntoConstraints = NO;
+    [ghostRow.heightAnchor constraintEqualToConstant:60].active = YES;
+    [stack addArrangedSubview:ghostRow];
+    _ghostSwitch = ghostRow.toggle;
+
+    // --- Spoof Location (carte du monde) ---
+    UIControl *locRow = [[UIControl alloc] init];
+    locRow.backgroundColor = [UIColor colorWithWhite:1 alpha:0.06];
+    locRow.layer.cornerRadius = 14;
+    locRow.translatesAutoresizingMaskIntoConstraints = NO;
+    [locRow.heightAnchor constraintEqualToConstant:52].active = YES;
+
+    UIImageView *pin = [[UIImageView alloc] initWithImage:NWSymbol(@"location.fill", 16)];
+    pin.tintColor = NWBlue();
+    pin.contentMode = UIViewContentModeScaleAspectFit;
+    pin.translatesAutoresizingMaskIntoConstraints = NO;
+    [locRow addSubview:pin];
+
+    UILabel *locTitle = NWLabelMake(@"Spoof Location", 14.5, UIColor.whiteColor, UIFontWeightMedium);
+    locTitle.translatesAutoresizingMaskIntoConstraints = NO;
+    [locRow addSubview:locTitle];
+
+    _locValue = NWLabelMake(@"Set Location", 12.5, NWDim(), UIFontWeightRegular);
+    _locValue.textAlignment = NSTextAlignmentRight;
+    _locValue.translatesAutoresizingMaskIntoConstraints = NO;
+    [locRow addSubview:_locValue];
+    if ([self.initialLoc isKindOfClass:[NSDictionary class]]) {
+        _loc = self.initialLoc;
+        NSString *lb = _loc[@"label"];
+        _locValue.text = [lb isKindOfClass:[NSString class]] && lb.length ? lb : @"Set Location";
+    }
+
+    UIImageView *chev = [[UIImageView alloc] initWithImage:NWSymbol(@"chevron.right", 13)];
+    chev.tintColor = NWDim();
+    chev.contentMode = UIViewContentModeScaleAspectFit;
+    chev.translatesAutoresizingMaskIntoConstraints = NO;
+    [locRow addSubview:chev];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [pin.leadingAnchor constraintEqualToAnchor:locRow.leadingAnchor constant:14],
+        [pin.centerYAnchor constraintEqualToAnchor:locRow.centerYAnchor],
+        [pin.widthAnchor constraintEqualToConstant:20],
+        [pin.heightAnchor constraintEqualToConstant:20],
+        [locTitle.leadingAnchor constraintEqualToAnchor:pin.trailingAnchor constant:10],
+        [locTitle.centerYAnchor constraintEqualToAnchor:locRow.centerYAnchor],
+        [chev.trailingAnchor constraintEqualToAnchor:locRow.trailingAnchor constant:-14],
+        [chev.centerYAnchor constraintEqualToAnchor:locRow.centerYAnchor],
+        [chev.widthAnchor constraintEqualToConstant:14],
+        [chev.heightAnchor constraintEqualToConstant:16],
+        [_locValue.trailingAnchor constraintEqualToAnchor:chev.leadingAnchor constant:-8],
+        [_locValue.centerYAnchor constraintEqualToAnchor:locRow.centerYAnchor],
+        [locTitle.trailingAnchor constraintLessThanOrEqualToAnchor:_locValue.leadingAnchor constant:-8],
+    ]];
+
+    NWBind(locRow, ^(id s){
+        __strong typeof(weakSelf) sheet = weakSelf;
+        if (!sheet) return;
+        CLLocationCoordinate2D initial = CLLocationCoordinate2DMake(48.8566, 2.3522);
+        if (sheet->_loc) {
+            initial = CLLocationCoordinate2DMake([sheet->_loc[@"lat"] doubleValue],
+                                                 [sheet->_loc[@"lon"] doubleValue]);
+        }
+        NWOpenMapPicker(sheet, initial, ^(double lat, double lon, NSString *label) {
+            __strong typeof(weakSelf) s2 = weakSelf;
+            if (!s2) return;
+            s2->_loc = @{@"on": @YES, @"lat": @(lat), @"lon": @(lon),
+                         @"label": label.length ? label : @"Current Location"};
+            s2->_locValue.text = label.length ? label : @"Set Location";
+        });
+    });
+    [stack addArrangedSubview:locRow];
+
+    // --- Create (rayon 27.5 comme Blaze) ---
+    UIButton *create = [UIButton buttonWithType:UIButtonTypeSystem];
+    [create setTitle:@"Create" forState:UIControlStateNormal];
+    create.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+    create.backgroundColor = NWAccent();
+    create.layer.cornerRadius = 27.5;
+    if (@available(iOS 13.0, *)) create.layer.cornerCurve = kCACornerCurveContinuous;
+    create.translatesAutoresizingMaskIntoConstraints = NO;
+    [create.heightAnchor constraintEqualToConstant:55].active = YES;
+    NWBind(create, ^(id s){ [weakSelf doCreate]; });
+    [stack addArrangedSubview:create];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [dim.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [dim.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [dim.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [dim.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [card.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [card.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [card.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [stack.topAnchor constraintEqualToAnchor:card.topAnchor],
+        [stack.leadingAnchor constraintEqualToAnchor:card.leadingAnchor],
+        [stack.trailingAnchor constraintEqualToAnchor:card.trailingAnchor],
+        [stack.bottomAnchor constraintEqualToAnchor:card.bottomAnchor],
+    ]];
+}
+
+- (void)openMap {
+    __weak typeof(self) weakSelf = self;
+    CLLocationCoordinate2D initial = CLLocationCoordinate2DMake(48.8566, 2.3522);
+    if (_loc) initial = CLLocationCoordinate2DMake([_loc[@"lat"] doubleValue], [_loc[@"lon"] doubleValue]);
+    NWOpenMapPicker(self, initial, ^(double lat, double lon, NSString *label) {
+        __strong typeof(weakSelf) sheet = weakSelf;
+        if (!sheet) return;
+        sheet->_loc = @{@"on": @YES, @"lat": @(lat), @"lon": @(lon),
+                        @"label": label.length ? label : @"Current Location"};
+        sheet->_locValue.text = label.length ? label : @"Set Location";
+    });
+}
+
+- (void)doCreate {
+    NSString *name = [_field.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    BOOL ghost = _ghostSwitch.isOn;
+    NSDictionary *loc = _loc;
+    void (^cb)(NSString *, NSDictionary *, BOOL) = self.onCreate;
+    [self dismissViewControllerAnimated:YES completion:^{
+        if (cb) cb(name.length ? name : nil, loc, ghost);
+    }];
+}
+
+- (void)closeSelf {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+@end
+
+// ---------------------------------------------------------------------------
 // Dashboard principal
 // ---------------------------------------------------------------------------
 
@@ -1791,7 +2517,8 @@ static void NWInstallFloatingButton(void) {
 
     if (!self.module) {
         [self buildHome];
-    } else if ([self.module isEqualToString:@"device"]) {
+    } else if ([self.module isEqualToString:@"device"] ||
+               [self.module isEqualToString:@"about"]) {
         [self buildDevice];
     } else if ([self.module isEqualToString:@"location"]) {
         [self buildLocation];
@@ -1812,7 +2539,8 @@ static void NWInstallFloatingButton(void) {
 
 - (NSString *)moduleTitle {
     NSDictionary *titles = @{
-        @"device": @"App & Device", @"location": @"Location Spoofer",
+        @"device": @"App & Device", @"about": @"About",
+        @"location": @"Location Spoofer", @"orbit": @"Location Spoofer",
         @"ghost": @"Ghost", @"containers": @"Containers",
         @"proxy": @"Proxy", @"changelog": @"Changelog",
         @"support": @"Support", @"reset": @"Reset",
@@ -1946,34 +2674,36 @@ static void NWInstallFloatingButton(void) {
     NSDictionary *c = NWActiveContainerDict();
     NSDictionary *fp = c[@"fp"] ?: @{};
     NSDictionary *loc = c[@"loc"] ?: @{};
-    NSString *name = c[@"name"] ?: @"Aucun conteneur actif";
+    NSString *name = c[@"name"] ?: @"No active container";
     NSString *model = NWModelName(fp[@"model"]);
     NSString *ios = fp[@"sysVer"] ?: UIDevice.currentDevice.systemVersion;
     BOOL gpsOn = [loc[@"on"] boolValue];
+    __weak typeof(self) weakSelf = self;
 
-    UIView *hero = [[UIView alloc] init];
-    hero.backgroundColor = NWCardColor();
-    hero.layer.cornerRadius = 18;
-    hero.layer.borderWidth = 1;
-    hero.layer.borderColor = [NWAccent() colorWithAlphaComponent:0.35].CGColor;
+    // --- HeaderView (copy Blaze : titre + sous-titre) ---
+    UIView *header = [[UIView alloc] init];
+    header.backgroundColor = NWCardColor();
+    header.layer.cornerRadius = 18;
+    header.layer.borderWidth = 1;
+    header.layer.borderColor = [NWAccent() colorWithAlphaComponent:0.35].CGColor;
 
     UIStackView *v = [[UIStackView alloc] init];
     v.axis = UILayoutConstraintAxisVertical;
-    v.spacing = 10;
+    v.spacing = 8;
     v.layoutMargins = UIEdgeInsetsMake(16, 16, 16, 16);
     v.layoutMarginsRelativeArrangement = YES;
     v.translatesAutoresizingMaskIntoConstraints = NO;
-    [hero addSubview:v];
+    [header addSubview:v];
     [NSLayoutConstraint activateConstraints:@[
-        [v.topAnchor constraintEqualToAnchor:hero.topAnchor],
-        [v.leadingAnchor constraintEqualToAnchor:hero.leadingAnchor],
-        [v.trailingAnchor constraintEqualToAnchor:hero.trailingAnchor],
-        [v.bottomAnchor constraintEqualToAnchor:hero.bottomAnchor],
+        [v.topAnchor constraintEqualToAnchor:header.topAnchor],
+        [v.leadingAnchor constraintEqualToAnchor:header.leadingAnchor],
+        [v.trailingAnchor constraintEqualToAnchor:header.trailingAnchor],
+        [v.bottomAnchor constraintEqualToAnchor:header.bottomAnchor],
     ]];
 
-    UILabel *kicker = NWLabelMake(@"CONTENEUR ACTIF", 10, NWAccent(), UIFontWeightBold);
+    UILabel *kicker = NWLabelMake(@"Dashboard", 11, NWAccent(), UIFontWeightBold);
     UILabel *title = NWLabelMake(name, 22, UIColor.whiteColor, UIFontWeightBold);
-    UILabel *sub = NWLabelMake(@"Ton iPhone. Tes règles.", 12.5, NWDim(), UIFontWeightRegular);
+    UILabel *sub = NWLabelMake(@"nine9wham Your Way", 12.5, NWDim(), UIFontWeightRegular);
     [v addArrangedSubview:kicker];
     [v addArrangedSubview:title];
     [v addArrangedSubview:sub];
@@ -1984,25 +2714,19 @@ static void NWInstallFloatingButton(void) {
     [badges addArrangedSubview:NWBadge(model, NWBlue())];
     [badges addArrangedSubview:NWBadge([NSString stringWithFormat:@"iOS %@", ios], NWAccent())];
     [badges addArrangedSubview:NWBadge(gpsOn ? @"GPS ON" : @"GPS OFF", gpsOn ? NWGreen() : NWDim())];
+    [badges addArrangedSubview:NWBadge(name, NWDim())];
     [v addArrangedSubview:badges];
 
-    UIButton *manage = NWPill(@"Gérer les conteneurs", NWAccent(), ^(id s){
-        [self openModule:@"containers"];
-    });
-    [v addArrangedSubview:manage];
-    [self.content addArrangedSubview:hero];
+    [self.content addArrangedSubview:header];
 
-    [self addSection:@"Modules"];
-
+    // --- Grille de modules (GridCell Blaze : 2 colonnes, icone + titre) ---
     NSArray *mods = @[
-        @[@"App & Device", @"App, appareil et infos", @"iphone", NWBlue(), @"device"],
-        @[@"Location", @"Fake GPS par conteneur", @"location.fill", NWAccent(), @"location"],
-        @[@"Ghost", @"Empreinte et identifiants", @"shield.lefthalf.filled", NWGreen(), @"ghost"],
-        @[@"Containers", @"Téléphones virtuels", @"square.stack.3d.up.fill", NWBlue(), @"containers"],
-        @[@"Proxy", @"HTTPS · BETA", @"globe", NWAccent(), @"proxy"],
-        @[@"Changelog", @"Nouveautés et correctifs", @"note.text", NWDim(), @"changelog"],
-        @[@"Support", @"@nine9wham", @"paperplane.fill", NWBlue(), @"support"],
-        @[@"Reset", @"Effacer et recommencer", @"trash.fill", NWRed(), @"reset"],
+        @[@"Ghost", @"private:emoji.ghost", @"ghost"],
+        @[@"Orbit", @"location.fill", @"location"],
+        @[@"Proxy", @"shield.lefthalf.filled", @"proxy"],
+        @[@"Containers", @"square.stack.3d.up.fill", @"containers"],
+        @[@"App & Device", @"iphone", @"device"],
+        @[@"Changelog", @"note.text", @"changelog"],
     ];
 
     for (NSUInteger i = 0; i < mods.count; i += 2) {
@@ -2012,16 +2736,60 @@ static void NWInstallFloatingButton(void) {
         row.distribution = UIStackViewDistributionFillEqually;
         for (NSUInteger k = i; k < MIN(i + 2, mods.count); k++) {
             NSArray *m = mods[k];
-            NWGridCell *cell = [[NWGridCell alloc] initWithIcon:m[2] title:m[0] subtitle:m[1] tint:m[3]];
-            NWBind(cell, ^(id s){ [self openModule:m[4]]; });
+            NWGridCell *cell = [[NWGridCell alloc] initWithIcon:m[1] title:m[0] subtitle:nil tint:NWAccent()];
+            NWBind(cell, ^(id s){ [weakSelf openModule:m[2]]; });
             [row addArrangedSubview:cell];
         }
         if ((mods.count - i) == 1) [row addArrangedSubview:[[UIView alloc] init]];
-        [row.heightAnchor constraintEqualToConstant:126].active = YES;
+        [row.heightAnchor constraintEqualToConstant:110].active = YES;
         [self.content addArrangedSubview:row];
     }
 
-    UILabel *foot = NWLabelMake(@"nine9wham 1.1.0 · Instagram 453.0\nConteneurs isolés · Fake GPS · Ghost fingerprint",
+    // --- Section "App & Device" (ListCell Blaze : About + Device) ---
+    [self addSection:@"App & Device"];
+    UIStackView *ad = [self addRowsCard];
+    [self addRow:ad icon:@"info" title:@"About"
+           value:[NSString stringWithFormat:@"General info about %@", @"@nine9wham"] action:^{
+        [weakSelf openModule:@"about"];
+    }];
+    [self addRow:ad icon:@"iphone" title:@"Device"
+           value:@"View your device's info" action:^{
+        [weakSelf openModule:@"device"];
+    }];
+
+    // --- Section "nine9wham" (Version + Changelog) ---
+    [self addSection:@"nine9wham"];
+    UIStackView *ver = [self addRowsCard];
+    [self addRow:ver icon:@"number" title:@"Version"
+           value:[NSString stringWithFormat:@"Version: %@",
+                   NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"] ?: @"453.0"]
+          action:nil];
+    [self addRow:ver icon:@"note.text" title:@"Changelog"
+           value:@"A list of updates and bug fixes" action:^{
+        [weakSelf openModule:@"changelog"];
+    }];
+
+    // --- Section "Support" ---
+    [self addSection:@"Support"];
+    UIStackView *sup = [self addRowsCard];
+    [self addRow:sup icon:@"paperplane.fill" title:@"Contact us on Telegram"
+           value:@"@nine9wham" action:^{
+        [weakSelf openModule:@"support"];
+    }];
+    [self addRow:sup icon:@"quote.bubble.fill" title:@"Telegram - @nine9wham"
+           value:@"Join our channel" action:^{
+        [weakSelf openModule:@"support"];
+    }];
+
+    // --- Section "Reset" ---
+    [self addSection:@"Reset"];
+    UIStackView *rst = [self addRowsCard];
+    [self addRow:rst icon:@"trash.fill" title:@"Erase nine9wham's"
+           value:@"Containers & settings to default" action:^{
+        [weakSelf openModule:@"reset"];
+    }];
+
+    UILabel *foot = NWLabelMake(@"nine9wham 1.2.0 · Instagram 453.0\nIsolated containers · Fake GPS · Ghost fingerprint",
                                 10.5, NWDim(), UIFontWeightRegular);
     foot.textAlignment = NSTextAlignmentCenter;
     [self.content addArrangedSubview:foot];
@@ -2035,36 +2803,83 @@ static void NWInstallFloatingButton(void) {
     NSDictionary *info = b.infoDictionary ?: @{};
     NSDictionary *fp = NWActiveFP ?: @{};
     NSDictionary *c = NWActiveContainerDict();
+    __weak typeof(self) weakSelf = self;
 
-    [self addSection:@"Application"];
+    // --- Hero (copy Blaze : "App & Device" / "General info about ...") -----
+    UIView *hero = [[UIView alloc] init];
+    hero.backgroundColor = NWCardColor();
+    hero.layer.cornerRadius = 18;
+    hero.layer.borderWidth = 1;
+    hero.layer.borderColor = [NWBlue() colorWithAlphaComponent:0.35].CGColor;
+
+    UIStackView *v = [[UIStackView alloc] init];
+    v.axis = UILayoutConstraintAxisVertical;
+    v.spacing = 8;
+    v.layoutMargins = UIEdgeInsetsMake(16, 16, 16, 16);
+    v.layoutMarginsRelativeArrangement = YES;
+    v.translatesAutoresizingMaskIntoConstraints = NO;
+    [hero addSubview:v];
+    [NSLayoutConstraint activateConstraints:@[
+        [v.topAnchor constraintEqualToAnchor:hero.topAnchor],
+        [v.leadingAnchor constraintEqualToAnchor:hero.leadingAnchor],
+        [v.trailingAnchor constraintEqualToAnchor:hero.trailingAnchor],
+        [v.bottomAnchor constraintEqualToAnchor:hero.bottomAnchor],
+    ]];
+    UILabel *kicker = NWLabelMake(@"About", 11, NWBlue(), UIFontWeightBold);
+    UILabel *title = NWLabelMake(@"App & Device", 21, UIColor.whiteColor, UIFontWeightBold);
+    UILabel *sub = NWLabelMake(@"General info about @nine9wham", 12.5, NWDim(), UIFontWeightRegular);
+    [v addArrangedSubview:kicker];
+    [v addArrangedSubview:title];
+    [v addArrangedSubview:sub];
+    UIStackView *badges = [[UIStackView alloc] init];
+    badges.axis = UILayoutConstraintAxisHorizontal;
+    badges.spacing = 6;
+    [badges addArrangedSubview:NWBadge(c[@"name"] ?: @"default", NWAccent())];
+    [badges addArrangedSubview:NWBadge(NWGhostEnabled() ? @"Ghost ON" : @"Ghost OFF",
+                                       NWGhostEnabled() ? NWGreen() : NWDim())];
+    [v addArrangedSubview:badges];
+    [self.content addArrangedSubview:hero];
+
+    // --- Section "About" (copy Blaze) --------------------------------------
+    [self addSection:@"About"];
     UIStackView *app = [self addRowsCard];
-    [self addRow:app icon:@"info" title:@"Application"
-           value:(info[@"CFBundleDisplayName"] ?: @"Instagram") action:nil];
-    [self addRow:app icon:@"shippingbox" title:@"Bundle" value:(b.bundleIdentifier ?: @"—") action:nil];
+    [self addRow:app icon:@"info" title:@"About"
+           value:[NSString stringWithFormat:@"General info about %@", @"@nine9wham"] action:nil];
+    [self addRow:app icon:@"shippingbox" title:@"Bundle Identifier"
+           value:(b.bundleIdentifier ?: @"—") action:nil];
     [self addRow:app icon:@"number" title:@"Version"
-           value:[NSString stringWithFormat:@"%@ (%@)", info[@"CFBundleShortVersionString"] ?: @"453.0",
-                  info[@"CFBundleVersion"] ?: @"—"] action:nil];
+           value:[NSString stringWithFormat:@"Version: %@ (%@)",
+                   info[@"CFBundleShortVersionString"] ?: @"453.0",
+                   info[@"CFBundleVersion"] ?: @"—"] action:nil];
+    [self addRow:app icon:@"note.text" title:@"Changelog"
+           value:@"A list of updates and bug fixes" action:^{
+        [weakSelf openModule:@"changelog"];
+    }];
 
-    [self addSection:@"Appareil (spoofé)"];
+    // --- Section "Device" (valeurs spoofees) --------------------------------
+    [self addSection:@"Device"];
     UIStackView *dev = [self addRowsCard];
-    [self addRow:dev icon:@"iphone" title:@"Modèle"
+    [self addRow:dev icon:@"iphone" title:@"Model"
            value:[NSString stringWithFormat:@"%@ · %@", NWModelName(fp[@"model"]), fp[@"model"] ?: @"—"]
           action:nil];
-    [self addRow:dev icon:@"gear" title:@"Version iOS" value:(fp[@"sysVer"] ?: @"—") action:nil];
-    [self addRow:dev icon:@"memorychip" title:@"RAM"
-           value:[NSString stringWithFormat:@"%@ Go", fp[@"memGB"] ?: @6] action:nil];
-    [self addRow:dev icon:@"cpu" title:@"Cœurs" value:@"6" action:nil];
-    [self addRow:dev icon:@"tag" title:@"Nom" value:(fp[@"deviceName"] ?: @"—") action:nil];
+    [self addRow:dev icon:@"gear" title:@"System"
+           value:[NSString stringWithFormat:@"iOS %@", fp[@"sysVer"] ?: @"—"] action:nil];
+    [self addRow:dev icon:@"memorychip" title:@"Memory"
+           value:[NSString stringWithFormat:@"%@ GB RAM", fp[@"memGB"] ?: @6] action:nil];
+    [self addRow:dev icon:@"cpu" title:@"Cores" value:@"Cores: 6" action:nil];
+    [self addRow:dev icon:@"tag" title:@"Device Name" value:(fp[@"deviceName"] ?: @"—") action:nil];
     [self addRow:dev icon:@"globe" title:@"Locale" value:(fp[@"locale"] ?: @"—") action:nil];
-    [self addRow:dev icon:@"clock" title:@"Fuseau" value:(fp[@"tz"] ?: @"—") action:nil];
+    [self addRow:dev icon:@"clock" title:@"TimeZone" value:(fp[@"tz"] ?: @"—") action:nil];
 
-    [self addSection:@"Appareil réel"];
+    // --- Section "Real Device" --------------------------------------------
+    [self addSection:@"Real Device"];
     UIStackView *real = [self addRowsCard];
-    [self addRow:real icon:@"iphone" title:@"Modèle réel" value:NWRealMachine() action:nil];
-    [self addRow:real icon:@"gear" title:@"iOS réel" value:NWRealSystemVersion() action:nil];
-    [self addRow:real icon:@"square.stack.3d.up" title:@"Conteneur" value:(c[@"name"] ?: @"—") action:nil];
+    [self addRow:real icon:@"iphone" title:@"Model" value:NWRealMachine() action:nil];
+    [self addRow:real icon:@"gear" title:@"iOS" value:NWRealSystemVersion() action:nil];
+    [self addRow:real icon:@"square.stack.3d.up" title:@"Container"
+           value:(c[@"name"] ?: @"—") action:nil];
 
-    UILabel *note = NWLabelMake(@"Les hooks servent l'empreinte du conteneur actif. Aucune donnée n'est partagée entre les conteneurs.",
+    UILabel *note = NWLabelMake(@"The hooks serve the active container fingerprint. Nothing is shared between containers.",
                                 11, NWDim(), UIFontWeightRegular);
     [self.content addArrangedSubview:note];
 }
@@ -2073,13 +2888,81 @@ static void NWInstallFloatingButton(void) {
 
 - (void)buildLocation {
     NSDictionary *loc = NWActiveLoc ?: @{};
+    NSDictionary *c = NWActiveContainerDict();
     BOOL on = [loc[@"on"] boolValue];
     double lat = [loc[@"lat"] doubleValue];
     double lon = [loc[@"lon"] doubleValue];
     NSString *label = loc[@"label"];
-    if (!label.length) label = on ? @"Position personnalisée" : @"Aucun endroit sélectionné";
+    if (!label.length) label = on ? @"Current Location" : @"No Address Available";
 
-    [self addSection:@"Localisation"];
+    // --- Section "Orbit" (copy Blaze) -------------------------------------
+    NSString *cname = c[@"name"] ?: @"default";
+    [self addSection:@"Orbit"];
+    NWSwitchRow *sw = [[NWSwitchRow alloc] initWithIcon:@"location.fill"
+                                                   title:@"Enable"
+                                               subtitle:[NSString stringWithFormat:@"Orbit for %@ container", cname]
+                                                     on:on];
+    [sw.heightAnchor constraintEqualToConstant:60].active = YES;
+    __weak typeof(self) weakSelf = self;
+    sw.onChange = ^(BOOL value) {
+        NSString *cid = NWActiveID;
+        if (!cid) return;
+        if (value) {
+            NSDictionary *l = NWActiveLoc ?: @{};
+            double la = [l[@"lat"] doubleValue];
+            double lo = [l[@"lon"] doubleValue];
+            NSString *lb = l[@"label"];
+            if (la == 0 && lo == 0) { la = 48.8566; lo = 2.3522; lb = @"Paris"; }
+            NWApplyLocation(cid, la, lo, lb.length ? lb : @"Current Location");
+        } else {
+            NSDictionary *l = NWActiveLoc ?: @{};
+            NWUpdateContainerField(cid, @"loc", @{@"on": @NO,
+                                                  @"lat": l[@"lat"] ?: @0,
+                                                  @"lon": l[@"lon"] ?: @0,
+                                                  @"label": l[@"label"] ?: @""});
+            NWReloadAfterStateChange();
+        }
+        [weakSelf rebuild];
+    };
+    UIStackView *toggleCard = [self addRowsCard];
+    [toggleCard addArrangedSubview:sw];
+
+    // --- Section "Maps" (copy Blaze) --------------------------------------
+    [self addSection:@"Maps"];
+    UIStackView *actions = [self addRowsCard];
+    [self addRow:actions icon:@"map.fill" title:@"Choose"
+           value:@"Location from the Maps picker" action:^{
+        CLLocationCoordinate2D initial = CLLocationCoordinate2DMake(lat, lon);
+        if (!on || (lat == 0 && lon == 0)) initial = CLLocationCoordinate2DMake(48.8566, 2.3522);
+        NWOpenMapPicker(weakSelf, initial, ^(double la, double lo, NSString *label) {
+            NWApplyLocation(NWActiveID, la, lo, label.length ? label : @"Current Location");
+            [weakSelf rebuild];
+        });
+    }];
+    [self addRow:actions icon:@"antenna.radiowaves.left.and.right" title:@"Load"
+           value:@"Location from your proxy I.P" action:^{
+        NSDictionary *p = NWActiveProxy() ?: @{};
+        if (![p[@"on"] boolValue] || ![p[@"host"] length]) {
+            NWAlert(@"Load", @"Unable to load coordinates from the proxy");
+            return;
+        }
+        [weakSelf lookupProxyIP:p[@"host"]];
+    }];
+    [self addRow:actions icon:@"magnifyingglass" title:@"Search..."
+           value:@"Country, place, restaurant..." action:^{
+        [weakSelf promptSearchPlace];
+    }];
+    [self addRow:actions icon:@"location.north.fill" title:@"Latitude"
+           value:[NSString stringWithFormat:@"%.6f", lat] action:^{
+        [weakSelf promptCoordinates];
+    }];
+    [self addRow:actions icon:@"location.fill" title:@"Longitude"
+           value:[NSString stringWithFormat:@"%.6f", lon] action:^{
+        [weakSelf promptCoordinates];
+    }];
+
+    // --- Section "Current Location" (copy Blaze) --------------------------
+    [self addSection:@"Current Location"];
     UIStackView *hero = [self addPaddedCard];
     UIStackView *head = [[UIStackView alloc] init];
     head.axis = UILayoutConstraintAxisHorizontal;
@@ -2103,7 +2986,7 @@ static void NWInstallFloatingButton(void) {
     tv.axis = UILayoutConstraintAxisVertical;
     tv.spacing = 2;
     UILabel *t1 = NWLabelMake(label, 15, UIColor.whiteColor, UIFontWeightSemibold);
-    UILabel *t2 = NWLabelMake(on ? [NSString stringWithFormat:@"%.5f, %.5f", lat, lon] : @"Fake GPS désactivé",
+    UILabel *t2 = NWLabelMake(on ? [NSString stringWithFormat:@"%f, %f", lat, lon] : @"No Address Available",
                               11.5, NWDim(), UIFontWeightRegular);
     [tv addArrangedSubview:t1];
     [tv addArrangedSubview:t2];
@@ -2111,47 +2994,16 @@ static void NWInstallFloatingButton(void) {
     [head addArrangedSubview:tv];
     [hero addArrangedSubview:head];
 
-    NWSwitchRow *sw = [[NWSwitchRow alloc] initWithIcon:@"location.fill" title:@"Enable" on:on];
-    [sw.heightAnchor constraintEqualToConstant:54].active = YES;
-    __weak typeof(self) weakSelf = self;
-    sw.onChange = ^(BOOL value) {
-        NSString *cid = NWActiveID;
-        if (!cid) return;
-        if (value) {
-            NSDictionary *l = NWActiveLoc ?: @{};
-            double la = [l[@"lat"] doubleValue];
-            double lo = [l[@"lon"] doubleValue];
-            NSString *lb = l[@"label"];
-            if (la == 0 && lo == 0) { la = 48.8566; lo = 2.3522; lb = @"Paris, France"; }
-            NWApplyLocation(cid, la, lo, lb.length ? lb : @"Position personnalisée");
-        } else {
-            NSDictionary *l = NWActiveLoc ?: @{};
-            NWUpdateContainerField(cid, @"loc", @{@"on": @NO,
-                                                  @"lat": l[@"lat"] ?: @0,
-                                                  @"lon": l[@"lon"] ?: @0,
-                                                  @"label": l[@"label"] ?: @""});
-            NWReloadAfterStateChange();
-        }
-        [weakSelf rebuild];
-    };
-    UIStackView *toggleCard = [self addRowsCard];
-    [toggleCard addArrangedSubview:sw];
-
-    [self addSection:@"Actions"];
-    UIStackView *actions = [self addRowsCard];
-    [self addRow:actions icon:@"magnifyingglass" title:@"Rechercher un lieu" value:@"Monde entier" action:^{
-        [weakSelf promptSearchPlace];
-    }];
-    [self addRow:actions icon:@"map" title:@"Coordonnées manuelles" value:@"Lat / Lon" action:^{
-        [weakSelf promptCoordinates];
-    }];
-    [self addRow:actions icon:@"shuffle" title:@"Position aléatoire" value:nil action:^{
+    UIStackView *tools = [self addRowsCard];
+    [self addRow:tools icon:@"mappin.and.ellipse" title:@"Generate"
+           value:@"Random location" action:^{
         double la = -55.0 + (double)arc4random_uniform(11500) / 100.0;
         double lo = -180.0 + (double)arc4random_uniform(36000) / 100.0;
-        NWApplyLocation(NWActiveID, la, lo, [NSString stringWithFormat:@"Aléatoire %.2f, %.2f", la, lo]);
+        NWApplyLocation(NWActiveID, la, lo, [NSString stringWithFormat:@"Random %f, %f", la, lo]);
         [weakSelf rebuild];
     }];
-    [self addRow:actions icon:@"xmark.circle" title:@"Désactiver le fake GPS" value:nil action:^{
+    [self addRow:tools icon:@"xmark.circle" title:@"Disable"
+           value:@"Turn off the location spoofer" action:^{
         NSDictionary *l = NWActiveLoc ?: @{};
         NWUpdateContainerField(NWActiveID, @"loc", @{@"on": @NO,
                                                      @"lat": l[@"lat"] ?: @0,
@@ -2161,29 +3013,30 @@ static void NWInstallFloatingButton(void) {
         [weakSelf rebuild];
     }];
 
-    [self addSection:@"Villes"];
+    // --- Section "Cities" --------------------------------------------------
+    [self addSection:@"Cities"];
     UIStackView *cities = [self addRowsCard];
     for (NSArray *city in NWCities()) {
         NSString *cityName = city[0];
         NSNumber *la = city[1];
         NSNumber *lo = city[2];
         [self addRow:cities icon:@"mappin.and.ellipse" title:cityName
-               value:[NSString stringWithFormat:@"%.2f, %.2f", la.doubleValue, lo.doubleValue]
+               value:[NSString stringWithFormat:@"%f, %f", la.doubleValue, lo.doubleValue]
               action:^{
             NWApplyLocation(NWActiveID, la.doubleValue, lo.doubleValue, cityName);
             [weakSelf rebuild];
         }];
     }
 
-    UILabel *note = NWLabelMake(@"Le fake GPS est appliqué immédiatement par conteneur. La position réelle n'est jamais utilisée quand l'option est active.",
+    UILabel *note = NWLabelMake(@"Spoofed the location with coordinates is applied per container. The real location is never used while this is enabled.",
                                 11, NWDim(), UIFontWeightRegular);
     [self.content addArrangedSubview:note];
 }
 
 - (void)promptSearchPlace {
     __weak typeof(self) weakSelf = self;
-    [self promptTextWithTitle:@"Rechercher un lieu"
-                  placeholder:@"Ville, pays, restaurant…"
+    [self promptTextWithTitle:@"Search..."
+                  placeholder:@"Country, place, restaurant..."
                         value:nil
                        secure:NO
                    completion:^(NSString *text) {
@@ -2206,7 +3059,7 @@ static void NWInstallFloatingButton(void) {
         if (data) json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
         dispatch_async(dispatch_get_main_queue(), ^{
             if (![json isKindOfClass:[NSArray class]] || json.count == 0) {
-                NWAlert(@"Aucun résultat", err ? @"Connexion impossible. Vérifie ta connexion internet." : @"Essaie un autre nom de lieu.");
+                NWAlert(@"Search...", @"There's no result found...");
                 return;
             }
             NSMutableArray *opts = [NSMutableArray array];
@@ -2223,7 +3076,7 @@ static void NWInstallFloatingButton(void) {
                     @"lon": @(lon.doubleValue),
                 }];
             }
-            [weakSelf presentOptions:opts selected:nil heading:@"Résultats OpenStreetMap" pick:^(NSDictionary *opt) {
+            [weakSelf presentOptions:opts selected:nil heading:@"Search..." pick:^(NSDictionary *opt) {
                 NWApplyLocation(NWActiveID, [opt[@"lat"] doubleValue], [opt[@"lon"] doubleValue], opt[@"title"]);
                 [weakSelf rebuild];
             }];
@@ -2231,30 +3084,63 @@ static void NWInstallFloatingButton(void) {
     }] resume];
 }
 
+// Geolocalise l'I.P du proxy (host) et applique la position correspondante.
+- (void)lookupProxyIP:(NSString *)host {
+    NSString *enc = [host stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLQueryAllowedCharacterSet];
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:
+        @"https://ipapi.co/%@/json/", enc ?: @""]];
+    if (!url) { NWAlert(@"Load", @"Unable to load coordinates from the proxy"); return; }
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    [req setValue:@"nine9wham/1.2 (iOS app)" forHTTPHeaderField:@"User-Agent"];
+    [req setTimeoutInterval:15];
+    __weak typeof(self) weakSelf = self;
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req
+                                    completionHandler:^(NSData *data, NSURLResponse *r, NSError *e) {
+        NSDictionary *j = nil;
+        if (data) {
+            id o = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            if ([o isKindOfClass:[NSDictionary class]]) j = o;
+        }
+        NSNumber *la = j[@"latitude"], *lo = j[@"longitude"];
+        NSString *city = [j[@"city"] isKindOfClass:[NSString class]] ? j[@"city"] : nil;
+        NSString *cc = [j[@"country_name"] isKindOfClass:[NSString class]] ? j[@"country_name"] : nil;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!la || !lo || ![la isKindOfClass:[NSNumber class]] || ![lo isKindOfClass:[NSNumber class]]) {
+                NWAlert(@"Load", @"Unable to load coordinates from the proxy");
+                return;
+            }
+            NSString *lb = cc.length ? (city.length ? [NSString stringWithFormat:@"%@, %@", city, cc] : cc)
+                                     : [NSString stringWithFormat:@"%f, %f", la.doubleValue, lo.doubleValue];
+            NWApplyLocation(NWActiveID, la.doubleValue, lo.doubleValue, lb);
+            [weakSelf rebuild];
+        });
+    }] resume];
+}
+
 - (void)promptCoordinates {
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Coordonnées GPS"
-                                                               message:@"Latitude et longitude au format décimal."
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Set Location"
+                                                               message:@"Latitude and longitude in decimal format."
                                                         preferredStyle:UIAlertControllerStyleAlert];
     [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = @"Latitude (ex: 48.8566)";
+        tf.placeholder = @"Latitude...";
         tf.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
     }];
     [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = @"Longitude (ex: 2.3522)";
+        tf.placeholder = @"Longitude...";
         tf.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
     }];
     __weak typeof(self) weakSelf = self;
-    [a addAction:[UIAlertAction actionWithTitle:@"Appliquer" style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
+    [a addAction:[UIAlertAction actionWithTitle:@"Set Location" style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
         double la = a.textFields[0].text.doubleValue;
         double lo = a.textFields[1].text.doubleValue;
         if (la < -90 || la > 90 || lo < -180 || lo > 180) {
-            NWAlert(@"Coordonnées invalides", @"Latitude entre -90 et 90, longitude entre -180 et 180.");
+            NWAlert(@"Set Location", @"Latitude must be between -90 and 90, longitude between -180 and 180.");
             return;
         }
-        NWApplyLocation(NWActiveID, la, lo, [NSString stringWithFormat:@"%.5f, %.5f", la, lo]);
+        NWApplyLocation(NWActiveID, la, lo, [NSString stringWithFormat:@"%f, %f", la, lo]);
         [weakSelf rebuild];
     }]];
-    [a addAction:[UIAlertAction actionWithTitle:@"Annuler" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
 }
 
@@ -2262,10 +3148,33 @@ static void NWInstallFloatingButton(void) {
 
 - (void)buildGhost {
     NSDictionary *fp = NWActiveFP ?: @{};
+    NSDictionary *c = NWActiveContainerDict();
+    NSString *cname = c[@"name"] ?: @"default";
     NSString *model = fp[@"model"] ?: @"";
+    BOOL ghostOn = NWGhostEnabled();
+    __weak typeof(self) weakSelf = self;
 
-    [self addSection:@"Empreinte"];
-    UIStackView *hero = [self addPaddedCard];
+    // --- Hero (copy Blaze : emoji.ghost + "Ghost" + "Device Fingerprint Spoofer") ---
+    UIView *hero = [[UIView alloc] init];
+    hero.backgroundColor = NWCardColor();
+    hero.layer.cornerRadius = 18;
+    hero.layer.borderWidth = 1;
+    hero.layer.borderColor = [NWGreen() colorWithAlphaComponent:0.35].CGColor;
+
+    UIStackView *v = [[UIStackView alloc] init];
+    v.axis = UILayoutConstraintAxisVertical;
+    v.spacing = 8;
+    v.layoutMargins = UIEdgeInsetsMake(16, 16, 16, 16);
+    v.layoutMarginsRelativeArrangement = YES;
+    v.translatesAutoresizingMaskIntoConstraints = NO;
+    [hero addSubview:v];
+    [NSLayoutConstraint activateConstraints:@[
+        [v.topAnchor constraintEqualToAnchor:hero.topAnchor],
+        [v.leadingAnchor constraintEqualToAnchor:hero.leadingAnchor],
+        [v.trailingAnchor constraintEqualToAnchor:hero.trailingAnchor],
+        [v.bottomAnchor constraintEqualToAnchor:hero.bottomAnchor],
+    ]];
+
     UIStackView *head = [[UIStackView alloc] init];
     head.axis = UILayoutConstraintAxisHorizontal;
     head.spacing = 12;
@@ -2276,7 +3185,8 @@ static void NWInstallFloatingButton(void) {
     tile.translatesAutoresizingMaskIntoConstraints = NO;
     [tile.widthAnchor constraintEqualToConstant:48].active = YES;
     [tile.heightAnchor constraintEqualToConstant:48].active = YES;
-    UIImageView *icon = [[UIImageView alloc] initWithImage:NWSymbol(@"shield.lefthalf.filled", 22)];
+    UIImageView *icon = [[UIImageView alloc] initWithImage:NWSymbol(@"private:emoji.ghost", 22)];
+    if (!icon.image) icon.image = NWSymbol(@"shield.lefthalf.filled", 22);
     icon.tintColor = NWGreen();
     icon.translatesAutoresizingMaskIntoConstraints = NO;
     [tile addSubview:icon];
@@ -2287,59 +3197,190 @@ static void NWInstallFloatingButton(void) {
     UIStackView *tv = [[UIStackView alloc] init];
     tv.axis = UILayoutConstraintAxisVertical;
     tv.spacing = 2;
-    UILabel *t1 = NWLabelMake(NWModelName(model), 15, UIColor.whiteColor, UIFontWeightSemibold);
-    UILabel *t2 = NWLabelMake([NSString stringWithFormat:@"Cohérent avec la puce réelle : %@", NWRealMachine()],
-                              11, NWDim(), UIFontWeightRegular);
-    [tv addArrangedSubview:t1];
-    [tv addArrangedSubview:t2];
+    UILabel *h1 = NWLabelMake(@"Ghost", 20, UIColor.whiteColor, UIFontWeightBold);
+    UILabel *h2 = NWLabelMake(@"Device Fingerprint Spoofer", 12, [UIColor colorWithWhite:1 alpha:0.6], UIFontWeightRegular);
+    [tv addArrangedSubview:h1];
+    [tv addArrangedSubview:h2];
     [head addArrangedSubview:tile];
     [head addArrangedSubview:tv];
-    [hero addArrangedSubview:head];
+    [v addArrangedSubview:head];
 
-    __weak typeof(self) weakSelf = self;
+    UIStackView *badges = [[UIStackView alloc] init];
+    badges.axis = UILayoutConstraintAxisHorizontal;
+    badges.spacing = 6;
+    [badges addArrangedSubview:NWBadge(NWModelName(model), NWBlue())];
+    [badges addArrangedSubview:NWBadge([NSString stringWithFormat:@"iOS %@", fp[@"sysVer"] ?: @"—"], NWAccent())];
+    [badges addArrangedSubview:NWBadge(ghostOn ? @"Spoof ON" : @"Spoof OFF", ghostOn ? NWGreen() : NWDim())];
+    [v addArrangedSubview:badges];
+    [self.content addArrangedSubview:hero];
 
-    UIStackView *rows = [self addRowsCard];
-    [self addRow:rows icon:@"iphone" title:@"Modèle"
-           value:[NSString stringWithFormat:@"%@", NWModelName(model)] action:^{
-        [weakSelf pickModel];
-    }];
-    [self addRow:rows icon:@"gear" title:@"Version iOS" value:(fp[@"sysVer"] ?: @"—") action:^{
-        [weakSelf pickIOS];
-    }];
-    [self addRow:rows icon:@"memorychip" title:@"RAM"
-           value:[NSString stringWithFormat:@"%@ Go", fp[@"memGB"] ?: @6] action:nil];
-    [self addRow:rows icon:@"cpu" title:@"Cœurs" value:@"6" action:nil];
-    [self addRow:rows icon:@"tag" title:@"Nom de l'appareil" value:(fp[@"deviceName"] ?: @"—") action:^{
-        [weakSelf promptDeviceName];
-    }];
-    [self addRow:rows icon:@"globe" title:@"Locale" value:(fp[@"locale"] ?: @"—") action:^{
-        [weakSelf pickLocale];
-    }];
-    [self addRow:rows icon:@"clock" title:@"Fuseau" value:(fp[@"tz"] ?: @"—") action:^{
-        [weakSelf pickTimezone];
-    }];
-
-    [self addSection:@"Identifiants"];
-    UIStackView *ids = [self addRowsCard];
-    NSString *idfv = fp[@"idfv"] ?: @"—";
-    NSString *idfa = fp[@"idfa"] ?: @"—";
-    [self addRow:ids icon:@"key.fill" title:@"IDFV" value:[idfv substringToIndex:MIN(8, idfv.length)] action:nil];
-    [self addRow:ids icon:@"key.fill" title:@"IDFA" value:[idfa substringToIndex:MIN(8, idfa.length)] action:nil];
-    [self addRow:ids icon:@"arrow.clockwise" title:@"Régénérer IDFV / IDFA" value:nil action:^{
-        NWUpdateActiveFPKey(@"idfv", [[NSUUID UUID] UUIDString]);
-        NWUpdateActiveFPKey(@"idfa", [[NSUUID UUID] UUIDString]);
+    // --- Section "Ghost" (copy Blaze : Enable · Ghost for %@ container) -----
+    [self addSection:@"Ghost"];
+    NWSwitchRow *sw = [[NWSwitchRow alloc] initWithIcon:@"globe"
+                                                   title:@"Enable"
+                                               subtitle:[NSString stringWithFormat:@"Ghost for %@ container", cname]
+                                                     on:ghostOn];
+    [sw.heightAnchor constraintEqualToConstant:60].active = YES;
+    sw.onChange = ^(BOOL value) {
+        NWUpdateContainerField(NWActiveID, @"ghostOn", @(value));
+        NWReloadAfterStateChange();
         [weakSelf rebuild];
+    };
+    UIStackView *ghostCard = [self addRowsCard];
+    [ghostCard addArrangedSubview:sw];
+
+    // --- Section "Preferred Country (global)" ------------------------------
+    [self addSection:@"Preferred Country (global)"];
+    UIStackView *country = [self addRowsCard];
+    NSString *locId = fp[@"locale"] ?: @"en_US";
+    NSString *iso = locId.length >= 3 ? [locId substringFromIndex:locId.length - 2] : @"US";
+    [self addRow:country icon:@"flag.fill" title:@"Choose your preferred country"
+           value:[NSString stringWithFormat:@"%@ %@", NWFlagEmoji(iso), iso] action:^{
+        [weakSelf pickPreferredCountry];
     }];
-    [self addRow:ids icon:@"dice" title:@"Empreinte aléatoire cohérente" value:nil action:^{
+
+    // --- Section "Generate" (copy Blaze : Formulate) -----------------------
+    [self addSection:@"Generate"];
+    UIStackView *gen = [self addRowsCard];
+    [self addRow:gen icon:@"plus.forwardslash.minus" title:@"Formulate"
+           value:@"Random data for all modules" action:^{
         NSMutableDictionary *nfp = [NWGenerateFingerprint() mutableCopy];
         if (fp[@"sysVer"]) nfp[@"sysVer"] = fp[@"sysVer"];
         NWUpdateActiveFP(nfp);
+        NWReloadAfterStateChange();
         [weakSelf rebuild];
+        NWAlert(@"Generate", @"Successfully generated new random data");
     }];
 
-    UILabel *note = NWLabelMake(@"Les changements s'appliquent aux hooks immédiatement. Redémarre Instagram pour que l'app relise tous les identifiants.",
+    // --- Section "Modules" (copy Blaze) ------------------------------------
+    [self addSection:@"Modules"];
+
+    UIStackView *mods = [self addRowsCard];
+    [self addRow:mods icon:@"iphone" title:@"Device"
+           value:@"Random data for the Device module only" action:^{
+        NSMutableDictionary *nfp = [NWGenerateFingerprint() mutableCopy];
+        if (fp[@"sysVer"]) nfp[@"sysVer"] = fp[@"sysVer"];
+        NWUpdateActiveFP(nfp);
+        NWReloadAfterStateChange();
+        [weakSelf rebuild];
+        NWAlert(@"Generate", @"Successfully generated new random data");
+    }];
+    [self addRow:mods icon:@"textformat.size" title:@"Locale"
+           value:@"Random data for the Locale module only" action:^{
+        [weakSelf pickLocale];
+    }];
+    [self addRow:mods icon:@"clock" title:@"TimeZone"
+           value:@"Random data for the TimeZone module only" action:^{
+        [weakSelf pickTimezone];
+    }];
+    [self addRow:mods icon:@"folder.fill.badge.gearshape" title:@"Other"
+           value:@"Random data for the Other module only" action:^{
+        [weakSelf promptDeviceName];
+    }];
+
+    // --- Section "Device" (copy Blaze : Enable Spoof / Choose an iPhone) ----
+    [self addSection:@"Device"];
+    UIStackView *dev = [self addRowsCard];
+    [self addRow:dev icon:@"apps.iphone.badge.plus" title:@"Choose an iPhone"
+           value:NWModelName(model) action:^{
+        [weakSelf pickModel];
+    }];
+    [self addRow:dev icon:@"ios-version" title:@"Choose Version"
+           value:[NSString stringWithFormat:@"iOS %@", fp[@"sysVer"] ?: @"—"] action:^{
+        [weakSelf pickIOS];
+    }];
+    [self addRow:dev icon:@"externaldrive.fill" title:@"Choose Storage"
+           value:[NSString stringWithFormat:@"%@ GB RAM", fp[@"memGB"] ?: @6] action:^{
+        [weakSelf pickRAM];
+    }];
+    [self addRow:dev icon:@"n.circle.fill" title:@"Set Device Name"
+           value:(fp[@"deviceName"] ?: @"No name available") action:^{
+        [weakSelf promptDeviceName];
+    }];
+
+    // --- Section "Identifiers" (copy Blaze) --------------------------------
+    [self addSection:@"Identifiers"];
+    UIStackView *ids = [self addRowsCard];
+    NSString *idfv = fp[@"idfv"] ?: @"—";
+    NSString *idfa = fp[@"idfa"] ?: @"—";
+    [self addRow:ids icon:@"key.fill" title:@"Vendor"
+           value:[idfv substringToIndex:MIN(8, idfv.length)] action:nil];
+    [self addRow:ids icon:@"a.circle.fill" title:@"Advertising"
+           value:[idfa substringToIndex:MIN(8, idfa.length)] action:nil];
+    [self addRow:ids icon:@"arrow.clockwise" title:@"Generate New Identifier"
+           value:@"Generate Identifier" action:^{
+        NWUpdateActiveFPKey(@"idfv", [[NSUUID UUID] UUIDString]);
+        NWUpdateActiveFPKey(@"idfa", [[NSUUID UUID] UUIDString]);
+        [weakSelf rebuild];
+        NWAlert(@"Generate", @"Successfully generated new random data");
+    }];
+
+    // --- Section "Locale" / "TimeZone" (copy Blaze) ------------------------
+    [self addSection:@"Locale"];
+    UIStackView *lc = [self addRowsCard];
+    [self addRow:lc icon:@"textformat.size" title:@"Choose Locale & Language"
+           value:(fp[@"locale"] ?: @"—") action:^{
+        [weakSelf pickLocale];
+    }];
+
+    [self addSection:@"TimeZone"];
+    UIStackView *tz = [self addRowsCard];
+    [self addRow:tz icon:@"clock" title:@"Choose TimeZone"
+           value:(fp[@"tz"] ?: @"—") action:^{
+        [weakSelf pickTimezone];
+    }];
+
+    UILabel *note = NWLabelMake(@"Spoofed values are applied per container through the hooks. Restart Instagram so the app reads the new fingerprint.",
                                 11, NWDim(), UIFontWeightRegular);
     [self.content addArrangedSubview:note];
+}
+
+// Pays preferentiel global (copy Blaze) : ouvre la liste des locales/pays.
+- (void)pickPreferredCountry {
+    NSArray *pairs = @[
+        @[@"fr_FR", @"Europe/Paris"], @[@"en_US", @"America/New_York"],
+        @[@"en_GB", @"Europe/London"], @[@"es_ES", @"Europe/Madrid"],
+        @[@"de_DE", @"Europe/Berlin"], @[@"it_IT", @"Europe/Rome"],
+        @[@"ar_SA", @"Asia/Riyadh"], @[@"pt_BR", @"America/Sao_Paulo"],
+        @[@"ja_JP", @"Asia/Tokyo"], @[@"nl_NL", @"Europe/Amsterdam"],
+        @[@"fr_CA", @"America/Montreal"], @[@"en_AU", @"Australia/Sydney"],
+    ];
+    NSMutableArray *opts = [NSMutableArray array];
+    for (NSArray *p in pairs) {
+        NSString *iso = [p[0] substringFromIndex:p[0].length - 2];
+        [opts addObject:@{@"title": [NSString stringWithFormat:@"%@ %@", NWFlagEmoji(iso), iso],
+                          @"subtitle": [NSString stringWithFormat:@"%@ · %@", p[0], p[1]],
+                          @"value": p[0], @"tz": p[1]}];
+    }
+    __weak typeof(self) weakSelf = self;
+    [self presentOptions:opts selected:(NWActiveFP[@"locale"] ?: @"")
+                 heading:@"Preferred Country (global)"
+                    pick:^(NSDictionary *opt) {
+        NWUpdateActiveFPKey(@"locale", opt[@"value"]);
+        if (opt[@"tz"]) NWUpdateActiveFPKey(@"tz", opt[@"tz"]);
+        NWReloadAfterStateChange();
+        [weakSelf rebuild];
+    }];
+}
+
+// RAM (copy Blaze : "Choose Storage" / "8 GB RAM" ... "2 GB RAM").
+- (void)pickRAM {
+    NSMutableArray *opts = [NSMutableArray array];
+    for (int gb = 8; gb >= 2; gb--) {
+        [opts addObject:@{@"title": [NSString stringWithFormat:@"%d GB RAM", gb],
+                          @"subtitle": @"Memory capacity",
+                          @"value": [NSString stringWithFormat:@"%d", gb]}];
+    }
+    __weak typeof(self) weakSelf = self;
+    NSNumber *cur = NWActiveFP[@"memGB"] ?: @6;
+    [self presentOptions:opts
+                selected:[NSString stringWithFormat:@"%d", cur.intValue]
+                 heading:@"Choose Storage"
+                    pick:^(NSDictionary *opt) {
+        NWUpdateActiveFPKey(@"memGB", @([opt[@"value"] intValue]));
+        NWReloadAfterStateChange();
+        [weakSelf rebuild];
+    }];
 }
 
 - (void)pickModel {
@@ -2352,7 +3393,7 @@ static void NWInstallFloatingButton(void) {
         }];
     }
     __weak typeof(self) weakSelf = self;
-    [self presentOptions:opts selected:(NWActiveFP[@"model"] ?: @"") heading:@"Modèle d'iPhone" pick:^(NSDictionary *opt) {
+    [self presentOptions:opts selected:(NWActiveFP[@"model"] ?: @"") heading:@"Choose an iPhone" pick:^(NSDictionary *opt) {
         NSString *mid = opt[@"value"];
         NSDictionary *info = NWModelInfo(mid);
         if (!info) return;
@@ -2367,11 +3408,11 @@ static void NWInstallFloatingButton(void) {
     NSMutableArray *opts = [NSMutableArray array];
     for (NSString *v in NWIOSVersions()) {
         [opts addObject:@{@"title": [NSString stringWithFormat:@"iOS %@", v],
-                          @"subtitle": @"Version spoofée du système",
+                          @"subtitle": @"Spoofed system version",
                           @"value": v}];
     }
     __weak typeof(self) weakSelf = self;
-    [self presentOptions:opts selected:(NWActiveFP[@"sysVer"] ?: @"") heading:@"Version iOS" pick:^(NSDictionary *opt) {
+    [self presentOptions:opts selected:(NWActiveFP[@"sysVer"] ?: @"") heading:@"Choose Version" pick:^(NSDictionary *opt) {
         NWUpdateActiveFPKey(@"sysVer", opt[@"value"]);
         [weakSelf rebuild];
     }];
@@ -2391,7 +3432,7 @@ static void NWInstallFloatingButton(void) {
         [opts addObject:@{@"title": p[0], @"subtitle": p[1], @"value": p[0], @"tz": p[1]}];
     }
     __weak typeof(self) weakSelf = self;
-    [self presentOptions:opts selected:(NWActiveFP[@"locale"] ?: @"") heading:@"Locale" pick:^(NSDictionary *opt) {
+    [self presentOptions:opts selected:(NWActiveFP[@"locale"] ?: @"") heading:@"Choose Locale & Language" pick:^(NSDictionary *opt) {
         NWUpdateActiveFPKey(@"locale", opt[@"value"]);
         if (opt[@"tz"]) NWUpdateActiveFPKey(@"tz", opt[@"tz"]);
         [weakSelf rebuild];
@@ -2405,7 +3446,7 @@ static void NWInstallFloatingButton(void) {
         [opts addObject:@{@"title": tz, @"subtitle": @"", @"value": tz}];
     }
     __weak typeof(self) weakSelf = self;
-    [self presentOptions:opts selected:current heading:@"Fuseau horaire" pick:^(NSDictionary *opt) {
+    [self presentOptions:opts selected:current heading:@"Choose TimeZone" pick:^(NSDictionary *opt) {
         NWUpdateActiveFPKey(@"tz", opt[@"value"]);
         [weakSelf rebuild];
     }];
@@ -2413,8 +3454,8 @@ static void NWInstallFloatingButton(void) {
 
 - (void)promptDeviceName {
     __weak typeof(self) weakSelf = self;
-    [self promptTextWithTitle:@"Nom de l'appareil"
-                  placeholder:@"iPhone de Peter"
+    [self promptTextWithTitle:@"Set Device Name"
+                  placeholder:@"Device name..."
                         value:(NWActiveFP[@"deviceName"] ?: @"")
                        secure:NO
                    completion:^(NSString *text) {
@@ -2432,11 +3473,11 @@ static void NWInstallFloatingButton(void) {
     NSArray *ids = [containers.allKeys sortedArrayUsingSelector:@selector(compare:)];
     __weak typeof(self) weakSelf = self;
 
-    [self addSection:[NSString stringWithFormat:@"%lu conteneur(s)", (unsigned long)ids.count]];
+    [self addSection:@"Containers"];
 
     if (!ids.count) {
         UIStackView *empty = [self addPaddedCard];
-        UILabel *l = NWLabelMake(@"Aucun conteneur. Crée ton premier téléphone virtuel.", 13, NWDim(), UIFontWeightRegular);
+        UILabel *l = NWLabelMake(@"No container yet. Create your first container.", 13, NWDim(), UIFontWeightRegular);
         [empty addArrangedSubview:l];
     }
 
@@ -2454,80 +3495,190 @@ static void NWInstallFloatingButton(void) {
         top.axis = UILayoutConstraintAxisHorizontal;
         top.spacing = 8;
         top.alignment = UIStackViewAlignmentCenter;
+        UIImageView *folder = [[UIImageView alloc] initWithImage:NWSymbol(@"folder.fill", 15)];
+        folder.tintColor = active ? NWGreen() : NWDim();
         UILabel *name = NWLabelMake(c[@"name"] ?: cid, 16, UIColor.whiteColor, UIFontWeightSemibold);
+        [top addArrangedSubview:folder];
         [top addArrangedSubview:name];
         [top addArrangedSubview:NWSpacer()];
-        if (active) [top addArrangedSubview:NWBadge(@"ACTIF", NWGreen())];
+        if (active) [top addArrangedSubview:NWBadge(@"ACTIVE", NWGreen())];
         [card addArrangedSubview:top];
 
         NSString *detail = [NSString stringWithFormat:@"%@ · iOS %@ · %@",
                             NWModelName(fp[@"model"]), fp[@"sysVer"] ?: @"—",
-                            gpsOn ? (loc[@"label"] ?: @"GPS ON") : @"GPS off"];
+                            gpsOn ? (loc[@"label"] ?: @"Spoofed") : @"Location off"];
         UILabel *sub = NWLabelMake(detail, 11.5, NWDim(), UIFontWeightRegular);
         [card addArrangedSubview:sub];
 
-        UIStackView *buttons = [[UIStackView alloc] init];
-        buttons.axis = UILayoutConstraintAxisHorizontal;
-        buttons.spacing = 8;
-        buttons.alignment = UIStackViewAlignmentLeading;
+        // --- Raccourcis (copy Blaze : Ghost / Orbit / Proxy) ---
+        UIStackView *quick = [[UIStackView alloc] init];
+        quick.axis = UILayoutConstraintAxisHorizontal;
+        quick.spacing = 8;
+        quick.distribution = UIStackViewDistributionFillEqually;
 
-        if (!active) {
-            [buttons addArrangedSubview:NWPill(@"Utiliser", NWBlue(), ^(id s){
-                NWSwitchContainer(cid);
-                [weakSelf rebuild];
-                NWAskRelaunch(@"Le conteneur sélectionné");
+        if (active) {
+            [quick addArrangedSubview:NWPill(@"Ghost", NWGreen(), ^(id s){
+                [weakSelf openModule:@"ghost"];
             })];
-        } else {
-            [buttons addArrangedSubview:NWPill(@"GPS", NWAccent(), ^(id s){
+            [quick addArrangedSubview:NWPill(@"Orbit", NWBlue(), ^(id s){
                 [weakSelf openModule:@"location"];
             })];
+            [quick addArrangedSubview:NWPill(@"Proxy", NWAccent(), ^(id s){
+                [weakSelf openModule:@"proxy"];
+            })];
+        } else {
+            [quick addArrangedSubview:NWPill(@"Use", NWBlue(), ^(id s){
+                [weakSelf confirmSwitch:cid name:(c[@"name"] ?: cid)];
+            })];
         }
-        [buttons addArrangedSubview:NWPill(@"Renommer", NWDim(), ^(id s){
-            [weakSelf promptTextWithTitle:@"Renommer le conteneur"
-                              placeholder:@"Nom"
-                                    value:(c[@"name"] ?: @"")
-                                   secure:NO
-                               completion:^(NSString *text) {
-                if (!text.length) return;
-                NWUpdateContainerField(cid, @"name", text);
-                [weakSelf rebuild];
-            }];
+        [card addArrangedSubview:quick];
+
+        // --- Rename Container / Delete Container (copy Blaze) ---
+        UIStackView *actions = [[UIStackView alloc] init];
+        actions.axis = UILayoutConstraintAxisHorizontal;
+        actions.spacing = 8;
+        actions.distribution = UIStackViewDistributionFillEqually;
+
+        [actions addArrangedSubview:NWPill(@"Rename Container", NWDim(), ^(id s){
+            [weakSelf promptRename:cid current:(c[@"name"] ?: @"")];
         })];
-        [buttons addArrangedSubview:NWPill(@"Supprimer", NWRed(), ^(id s){
-            UIAlertController *a = [UIAlertController
-                alertControllerWithTitle:[NSString stringWithFormat:@"Supprimer « %@ » ?", c[@"name"] ?: cid]
-                message:@"Compte, cookies et empreinte de ce conteneur seront effacés."
-                preferredStyle:UIAlertControllerStyleAlert];
-            [a addAction:[UIAlertAction actionWithTitle:@"Supprimer" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *act) {
-                BOOL wasActive = [cid isEqualToString:NWActiveID];
-                NWDeleteContainer(cid);
-                [weakSelf rebuild];
-                if (wasActive) NWAskRelaunch(@"Instagram");
-            }]];
-            [a addAction:[UIAlertAction actionWithTitle:@"Annuler" style:UIAlertActionStyleCancel handler:nil]];
-            [weakSelf presentViewController:a animated:YES completion:nil];
+        [actions addArrangedSubview:NWPill(@"Delete Container", NWRed(), ^(id s){
+            [weakSelf confirmDelete:cid name:(c[@"name"] ?: cid)];
         })];
-        [card addArrangedSubview:buttons];
+        [card addArrangedSubview:actions];
     }
 
-    [self addSection:@"Nouveau"];
-    UIButton *add = NWPill(@"+ Nouveau conteneur", NWAccent(), ^(id s){
-        [weakSelf promptTextWithTitle:@"Nouveau conteneur"
-                          placeholder:@"Nom (ex: Télo 2)"
-                                value:nil
-                               secure:NO
-                           completion:^(NSString *text) {
-            NSString *cid = NWCreateContainer(text.length ? text : nil);
-            [weakSelf rebuild];
-            NWAskRelaunch([NSString stringWithFormat:@"Le conteneur %@", cid]);
-        }];
-    });
-    add.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
-    [self.content addArrangedSubview:add];
+    // --- "New Container" (copy Blaze) : ligne + icone carte (fake GPS) -----
+    [self addSection:@"New Container"];
 
-    UILabel *note = NWLabelMake(@"Chaque conteneur possède ses prefs, cookies, keychain, empreinte et position. Instagram redemande ses autorisations internes à la création.",
+    UIStackView *newRow = [[UIStackView alloc] init];
+    newRow.axis = UILayoutConstraintAxisHorizontal;
+    newRow.spacing = 8;
+    newRow.alignment = UIStackViewAlignmentCenter;
+
+    UIStackView *newCard = [self addPaddedCard];
+    __strong typeof(weakSelf) self2 = weakSelf;
+
+    UIStackView *ntop = [[UIStackView alloc] init];
+    ntop.axis = UILayoutConstraintAxisHorizontal;
+    ntop.spacing = 8;
+    ntop.alignment = UIStackViewAlignmentCenter;
+    UIImageView *nicon = [[UIImageView alloc] initWithImage:NWSymbol(@"folder.fill", 15)];
+    nicon.tintColor = NWAccent();
+    UILabel *ntitle = NWLabelMake(@"New Container", 15, UIColor.whiteColor, UIFontWeightSemibold);
+    [ntop addArrangedSubview:nicon];
+    [ntop addArrangedSubview:ntitle];
+    [newCard addArrangedSubview:ntop];
+    UILabel *nsub = NWLabelMake(@"Enter container name...", 11.5, NWDim(), UIFontWeightRegular);
+    [newCard addArrangedSubview:nsub];
+
+    UIButton *createPill = NWPill(@"Create", NWAccent(), ^(id s){
+        if (!self2) return;
+        [self2 presentNewContainerSheet:nil];
+    });
+    createPill.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+    [newCard addArrangedSubview:createPill];
+
+    // Petite icone carte : choix de la position AVANT la creation.
+    UIButton *mapBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [mapBtn setImage:NWSymbol(@"map.fill", 22) forState:UIControlStateNormal];
+    mapBtn.tintColor = NWBlue();
+    mapBtn.backgroundColor = [NWBlue() colorWithAlphaComponent:0.16];
+    mapBtn.layer.cornerRadius = 12;
+    mapBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [mapBtn.widthAnchor constraintEqualToConstant:44].active = YES;
+    [mapBtn.heightAnchor constraintEqualToConstant:44].active = YES;
+    mapBtn.accessibilityLabel = @"Spoof Location";
+    NWBind(mapBtn, ^(id s){
+        if (!self2) return;
+        CLLocationCoordinate2D initial = CLLocationCoordinate2DMake(48.8566, 2.3522);
+        NWOpenMapPicker(self2, initial, ^(double lat, double lon, NSString *label) {
+            __strong typeof(weakSelf) s3 = weakSelf;
+            if (!s3) return;
+            NSDictionary *loc = @{@"on": @YES, @"lat": @(lat), @"lon": @(lon),
+                                  @"label": label.length ? label : @"Current Location"};
+            [s3 presentNewContainerSheet:loc];
+        });
+    });
+
+    [newRow addArrangedSubview:newCard];
+    [newRow addArrangedSubview:mapBtn];
+    [self.content addArrangedSubview:newRow];
+
+    UILabel *note = NWLabelMake(@"Every container keeps its own prefs, cookies, keychain, fingerprint and location. Instagram will ask for its internal permissions again on creation.",
                                 11, NWDim(), UIFontWeightRegular);
     [self.content addArrangedSubview:note];
+}
+
+// Feuille "New Container" (copy Blaze). locOpt : position choisie sur la carte.
+- (void)presentNewContainerSheet:(NSDictionary *)locOpt {
+    NWNewContainerSheet *sheet = [[NWNewContainerSheet alloc] init];
+    sheet.initialLoc = locOpt;
+    __weak typeof(self) weakSelf = self;
+    sheet.onCreate = ^(NSString *name, NSDictionary *loc, BOOL ghostOn) {
+        NSString *cid = NWCreateContainerWithLocGhost(name, loc ? loc : locOpt, ghostOn);
+        [weakSelf rebuild];
+        NWAskRelaunch([NSString stringWithFormat:@"The container %@", name.length ? name : cid]);
+    };
+    sheet.modalPresentationStyle = UIModalPresentationOverFullScreen;
+    sheet.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+// Bascule de conteneur (copy Blaze : "Are you sure you want to switch...").
+- (void)confirmSwitch:(NSString *)cid name:(NSString *)name {
+    __weak typeof(self) weakSelf = self;
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"Containers"
+        message:[NSString stringWithFormat:@"Are you sure you want to switch to the %@ container? Restarting the app is required!", name]
+        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"Yes, I'm sure!" style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
+        NWSwitchContainer(cid);
+        [weakSelf rebuild];
+        NWAskRelaunch([NSString stringWithFormat:@"The container %@", name]);
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+// Renommage (copy Blaze).
+- (void)promptRename:(NSString *)cid current:(NSString *)current {
+    __weak typeof(self) weakSelf = self;
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Rename Container"
+                                                               message:@"Enter the name you want to change your container to"
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"Container name...";
+        tf.text = current;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"Rename Container" style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
+        NSString *t = [a.textFields.firstObject.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (!t.length) {
+            NWAlert(@"Rename Container", @"Cannot rename the container because the name is blank!");
+            return;
+        }
+        NWUpdateContainerField(cid, @"name", t);
+        [weakSelf rebuild];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+// Suppression (copy Blaze : "Are you sure you want to delete the %@ container?").
+- (void)confirmDelete:(NSString *)cid name:(NSString *)name {
+    __weak typeof(self) weakSelf = self;
+    BOOL wasActive = [cid isEqualToString:NWActiveID];
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"Delete Container"
+        message:[NSString stringWithFormat:@"Are you sure you want to delete the %@ container? This action cannot be undone and will delete everything associated with the container.", name]
+        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"Yes, I'm sure!" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *act) {
+        NWDeleteContainer(cid);
+        [weakSelf rebuild];
+        if (wasActive) NWAskRelaunch(@"Instagram");
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 // --- Proxy ----------------------------------------------------------------
@@ -2535,18 +3686,47 @@ static void NWInstallFloatingButton(void) {
 - (void)buildProxy {
     NSDictionary *p = NWActiveProxy() ?: @{};
     BOOL on = [p[@"on"] boolValue];
+    NSString *cname = NWActiveContainerDict()[@"name"] ?: @"default";
+    NSString *host = [p[@"host"] isKindOfClass:[NSString class]] ? p[@"host"] : @"";
+    NSString *port = [p[@"port"] isKindOfClass:[NSString class]] ? p[@"port"] : @"";
+    NSString *user = [p[@"user"] isKindOfClass:[NSString class]] ? p[@"user"] : @"";
+    NSString *pass = [p[@"pass"] isKindOfClass:[NSString class]] ? p[@"pass"] : @"";
     __weak typeof(self) weakSelf = self;
 
-    [self addSection:@"Proxy HTTPS · BETA"];
-    UIStackView *hero = [self addPaddedCard];
-    UILabel *title = NWLabelMake(@"Reste invisible", 17, UIColor.whiteColor, UIFontWeightBold);
-    UILabel *sub = NWLabelMake(@"Proxy appliqué au conteneur actif. Compatible HTTPS uniquement (pas SOCKS5). La réception des SMS peut varier.",
-                               11, NWDim(), UIFontWeightRegular);
-    [hero addArrangedSubview:title];
-    [hero addArrangedSubview:sub];
+    // --- Hero (copy Blaze : "Stay Invisible") ------------------------------
+    UIView *hero = [[UIView alloc] init];
+    hero.backgroundColor = NWCardColor();
+    hero.layer.cornerRadius = 18;
+    hero.layer.borderWidth = 1;
+    hero.layer.borderColor = [NWAccent() colorWithAlphaComponent:0.35].CGColor;
 
-    NWSwitchRow *sw = [[NWSwitchRow alloc] initWithIcon:@"globe" title:@"Activer le proxy" on:on];
-    [sw.heightAnchor constraintEqualToConstant:54].active = YES;
+    UIStackView *v = [[UIStackView alloc] init];
+    v.axis = UILayoutConstraintAxisVertical;
+    v.spacing = 8;
+    v.layoutMargins = UIEdgeInsetsMake(16, 16, 16, 16);
+    v.layoutMarginsRelativeArrangement = YES;
+    v.translatesAutoresizingMaskIntoConstraints = NO;
+    [hero addSubview:v];
+    [NSLayoutConstraint activateConstraints:@[
+        [v.topAnchor constraintEqualToAnchor:hero.topAnchor],
+        [v.leadingAnchor constraintEqualToAnchor:hero.leadingAnchor],
+        [v.trailingAnchor constraintEqualToAnchor:hero.trailingAnchor],
+        [v.bottomAnchor constraintEqualToAnchor:hero.bottomAnchor],
+    ]];
+    UILabel *ptitle = NWLabelMake(@"Stay Invisible", 19, UIColor.whiteColor, UIFontWeightBold);
+    UILabel *psub = NWLabelMake(@"Only compatible with HTTPS proxy, not SOCKS5 proxy! Currently under BETA, you might not receive any SMS code.",
+                                11.5, NWDim(), UIFontWeightRegular);
+    [v addArrangedSubview:ptitle];
+    [v addArrangedSubview:psub];
+    [self.content addArrangedSubview:hero];
+
+    // --- Section "Proxy (BETA)" (switch copy Blaze) ------------------------
+    [self addSection:@"Proxy (BETA)"];
+    NWSwitchRow *sw = [[NWSwitchRow alloc] initWithIcon:@"shield.lefthalf.filled"
+                                                   title:@"Enable"
+                                               subtitle:[NSString stringWithFormat:@"Proxy for %@ container", cname]
+                                                     on:on];
+    [sw.heightAnchor constraintEqualToConstant:60].active = YES;
     sw.onChange = ^(BOOL value) {
         NWUpdateProxyKey(@"on", @(value));
         [weakSelf rebuild];
@@ -2554,41 +3734,75 @@ static void NWInstallFloatingButton(void) {
     UIStackView *toggleCard = [self addRowsCard];
     [toggleCard addArrangedSubview:sw];
 
+    // --- Configuration -----------------------------------------------------
     [self addSection:@"Configuration"];
     UIStackView *rows = [self addRowsCard];
-    [self addRow:rows icon:@"server.rack" title:@"Hôte / IP"
-           value:(p[@"host"] ?: @"—") action:^{
-        [weakSelf promptTextWithTitle:@"Hôte proxy" placeholder:@"ex: 1.2.3.4" value:p[@"host"] secure:NO completion:^(NSString *t) {
+    [self addRow:rows icon:@"server.rack" title:@"Host/I.P"
+           value:(host.length ? host : @"No host available...") action:^{
+        [weakSelf promptTextWithTitle:@"Host/I.P"
+                          placeholder:@"Enter host name..."
+                                value:host
+                               secure:NO
+                           completion:^(NSString *t) {
             NWUpdateProxyKey(@"host", t);
             [weakSelf rebuild];
         }];
     }];
-    [self addRow:rows icon:@"number" title:@"Port" value:(p[@"port"] ?: @"—") action:^{
-        [weakSelf promptTextWithTitle:@"Port proxy" placeholder:@"8080" value:p[@"port"] secure:NO completion:^(NSString *t) {
+    [self addRow:rows icon:@"number" title:@"Port"
+           value:(port.length ? port : @"No port available...") action:^{
+        [weakSelf promptTextWithTitle:@"Port"
+                          placeholder:@"Enter port number..."
+                                value:port
+                               secure:NO
+                           completion:^(NSString *t) {
             NWUpdateProxyKey(@"port", t);
             [weakSelf rebuild];
         }];
     }];
-    [self addRow:rows icon:@"person" title:@"Utilisateur" value:(p[@"user"] ?: @"—") action:^{
-        [weakSelf promptTextWithTitle:@"Utilisateur" placeholder:@"username" value:p[@"user"] secure:NO completion:^(NSString *t) {
+
+    // --- Authentication (copy Blaze) ---------------------------------------
+    [self addSection:@"Authentication"];
+    UIStackView *auth = [self addRowsCard];
+    [self addRow:auth icon:@"lock.fill" title:@"Authentication with credentials"
+           value:(user.length ? @"Enabled" : @"Disabled") action:^{
+        NWUpdateProxyKey(@"auth", @(![p[@"auth"] boolValue]));
+        [weakSelf rebuild];
+    }];
+    [self addRow:auth icon:@"person" title:@"Username"
+           value:(user.length ? user : @"No username available...") action:^{
+        [weakSelf promptTextWithTitle:@"Username"
+                          placeholder:@"Enter username..."
+                                value:user
+                               secure:NO
+                           completion:^(NSString *t) {
             NWUpdateProxyKey(@"user", t);
             [weakSelf rebuild];
         }];
     }];
-    [self addRow:rows icon:@"lock.fill" title:@"Mot de passe" value:(p[@"pass"] ?: @"—") action:^{
-        [weakSelf promptTextWithTitle:@"Mot de passe" placeholder:@"password" value:p[@"pass"] secure:YES completion:^(NSString *t) {
+    [self addRow:auth icon:@"lock.shield.fill" title:@"Password"
+           value:(pass.length ? @"••••••••" : @"No password available...") action:^{
+        [weakSelf promptTextWithTitle:@"Password"
+                          placeholder:@"Enter password..."
+                                value:pass
+                               secure:YES
+                           completion:^(NSString *t) {
             NWUpdateProxyKey(@"pass", t);
             [weakSelf rebuild];
         }];
     }];
 
-    [self addSection:@"Outils"];
+    // --- Actions (copy Blaze) ---------------------------------------------
+    [self addSection:@"Actions"];
     UIStackView *tools = [self addRowsCard];
-    [self addRow:tools icon:@"network" title:@"Vérifier mon IP" value:nil action:^{
+    [self addRow:tools icon:@"globe" title:@"I.P Checker"
+           value:@"Proxy connection and details" action:^{
         [weakSelf checkIP];
     }];
-    [self addRow:tools icon:@"trash.fill" title:@"Réinitialiser le proxy" value:nil action:^{
-        NWUpdateContainerField(NWActiveID, @"proxy", @{@"on": @NO, @"host": @"", @"port": @"", @"user": @"", @"pass": @""});
+    [self addRow:tools icon:@"trash.fill" title:@"Proxy data to default settings"
+           value:@"Reset" action:^{
+        NWUpdateContainerField(NWActiveID, @"proxy",
+                               @{@"on": @NO, @"host": @"", @"port": @"", @"user": @"", @"pass": @""});
+        NWAlert(@"Proxy", @"Proxy successfully reset to default settings");
         [weakSelf rebuild];
     }];
 }
@@ -2606,9 +3820,9 @@ static void NWInstallFloatingButton(void) {
         }
         dispatch_async(dispatch_get_main_queue(), ^{
             if (ip.length) {
-                NWAlert(@"Adresse IP publique", ip);
+                NWAlert(@"I.P Address", ip);
             } else {
-                NWAlert(@"IP indisponible", @"Impossible de récupérer l'IP. Vérifie ta connexion ou ton proxy.");
+                NWAlert(@"I.P Address", @"Failed to check for I.P data, please try again later.");
             }
             (void)weakSelf;
         });
@@ -2618,88 +3832,124 @@ static void NWInstallFloatingButton(void) {
 // --- Changelog / Support / Reset -----------------------------------------
 
 - (void)buildChangelog {
+    [self addSection:@"Version 1.2.0 · 03/11/2026"];
+    UIStackView *v2 = [self addPaddedCard];
+    UILabel *b2 = NWLabelMake(
+        @"• Menu rebuilt on the Blaze design: dashboard, grid, cards, icons\n"
+         "• Full-screen world map picker with search (OpenStreetMap / Nominatim)\n"
+         "• Map icon on every new container creation\n"
+         "• Ghost master switch (Enable · Ghost for ... container)\n"
+         "• Container dialogs copied from Blaze: New / Rename / Delete\n"
+         "• Fake GPS: real location no longer overwrites the spoofed one",
+        12.5, [UIColor colorWithWhite:0.85 alpha:1], UIFontWeightRegular);
+    [v2 addArrangedSubview:b2];
+
     [self addSection:@"Version 1.1.0 · 02/11/2026"];
     UIStackView *card = [self addPaddedCard];
     UILabel *body = NWLabelMake(
-        @"• Bouton flottant rendu persistant (fenêtre overlay dédiée)\n"
-         "• Menu refait façon Blaze : dashboard, grille, cartes, icônes\n"
-         "• Modèles iPhone 13 → 17 et iOS 26.0 → 27.0.1\n"
-         "• Fake GPS immédiat + recherche mondiale OpenStreetMap\n"
-         "• Ghost : modèle, iOS, RAM, locale, fuseau, IDFV / IDFA\n"
-         "• Conteneurs : créer, renommer, basculer, supprimer\n"
-         "• Base Instagram 453.0 nettoyée (aucun RyukGram / FLEX)",
+        @"• Floating button made persistent (dedicated overlay window)\n"
+         "• iPhone 13 → 17 models and iOS 26.0 → 27.0.1\n"
+         "• Immediate fake GPS + world search\n"
+         "• Ghost: model, iOS, RAM, locale, timezone, IDFV / IDFA\n"
+         "• Containers: create, rename, switch, delete\n"
+         "• Instagram 453.0 base cleaned (no RyukGram / FLEX)",
         12.5, [UIColor colorWithWhite:0.85 alpha:1], UIFontWeightRegular);
     [card addArrangedSubview:body];
 
     [self addSection:@"Version 1.0.0"];
     UIStackView *old = [self addPaddedCard];
-    UILabel *o = NWLabelMake(@"• Première version : conteneurs, fingerprint, fake GPS, vault keychain.",
+    UILabel *o = NWLabelMake(@"• First release: containers, fingerprint, fake GPS, keychain vault.",
                              12.5, NWDim(), UIFontWeightRegular);
     [old addArrangedSubview:o];
 }
 
 - (void)buildSupport {
     __weak typeof(self) weakSelf = self;
-    [self addSection:@"nine9wham"];
-    UIStackView *card = [self addPaddedCard];
-    UILabel *title = NWLabelMake(@"@nine9wham", 18, UIColor.whiteColor, UIFontWeightBold);
-    UILabel *sub = NWLabelMake(@"Instagram modifié · conteneurs isolés · fake GPS · ghost fingerprint",
-                               12, NWDim(), UIFontWeightRegular);
-    [card addArrangedSubview:title];
-    [card addArrangedSubview:sub];
 
+    // --- Section "Support" (copy Blaze) ------------------------------------
+    [self addSection:@"Support"];
     UIStackView *rows = [self addRowsCard];
-    [self addRow:rows icon:@"link" title:@"Dépôt GitHub" value:@"mpouki04-tech/nine9wham" action:^{
+    [self addRow:rows icon:@"paperplane.fill" title:@"Contact us on Telegram"
+           value:@"@nine9wham" action:^{
         NSURL *u = [NSURL URLWithString:@"https://github.com/mpouki04-tech/nine9wham"];
         [UIApplication.sharedApplication openURL:u options:@{} completionHandler:nil];
         (void)weakSelf;
     }];
-    [self addRow:rows icon:@"arrow.down.circle" title:@"Télécharger l'IPA" value:@"Release nine9wham" action:^{
+    [self addRow:rows icon:@"quote.bubble.fill" title:@"Telegram - @nine9wham"
+           value:@"Join our channel" action:^{
         NSURL *u = [NSURL URLWithString:@"https://github.com/mpouki04-tech/nine9wham/releases"];
         [UIApplication.sharedApplication openURL:u options:@{} completionHandler:nil];
     }];
-    [self addRow:rows icon:@"doc.on.doc" title:@"Copier le lien de release" value:nil action:^{
-        UIPasteboard.generalPasteboard.string = @"https://github.com/mpouki04-tech/nine9wham/releases";
-        NWAlert(@"Lien copié", @"Le lien des releases est dans le presse-papiers.");
+
+    // --- Section "nine9wham" ----------------------------------------------
+    [self addSection:@"nine9wham"];
+    UIStackView *info = [self addRowsCard];
+    [self addRow:info icon:@"link" title:@"GitHub"
+           value:@"mpouki04-tech/nine9wham" action:^{
+        NSURL *u = [NSURL URLWithString:@"https://github.com/mpouki04-tech/nine9wham"];
+        [UIApplication.sharedApplication openURL:u options:@{} completionHandler:nil];
     }];
-    [self addRow:rows icon:@"info" title:@"Version" value:@"1.1.0 · build 453.0" action:nil];
+    [self addRow:info icon:@"arrow.down.circle" title:@"Download"
+           value:@"Release nine9wham" action:^{
+        NSURL *u = [NSURL URLWithString:@"https://github.com/mpouki04-tech/nine9wham/releases"];
+        [UIApplication.sharedApplication openURL:u options:@{} completionHandler:nil];
+    }];
+    [self addRow:info icon:@"doc.on.doc" title:@"Copy link"
+           value:@"Release page copied" action:^{
+        UIPasteboard.generalPasteboard.string = @"https://github.com/mpouki04-tech/nine9wham/releases";
+        NWAlert(@"nine9wham", @"The token data was copied to the clipboard");
+    }];
+    [self addRow:info icon:@"number" title:@"Version"
+           value:[NSString stringWithFormat:@"Version: %@",
+                   NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"] ?: @"453.0"]
+          action:nil];
+
+    UILabel *foot = NWLabelMake(@"Instagram modified · isolated containers · fake GPS · ghost fingerprint",
+                                11, NWDim(), UIFontWeightRegular);
+    foot.textAlignment = NSTextAlignmentCenter;
+    [self.content addArrangedSubview:foot];
 }
 
 - (void)buildReset {
     __weak typeof(self) weakSelf = self;
-    [self addSection:@"Zone dangereuse"];
-    UIStackView *card = [self addPaddedCard];
-    UILabel *title = NWLabelMake(@"Tout réinitialiser", 17, UIColor.whiteColor, UIFontWeightBold);
-    UILabel *body = NWLabelMake(@"Efface tous les conteneurs, réglages, empreintes, prefs et cookies Instagram. Les comptes seront perdus sur cet appareil.",
-                                12, NWDim(), UIFontWeightRegular);
-    [card addArrangedSubview:title];
-    [card addArrangedSubview:body];
 
-    UIButton *reset = NWPill(@"Réinitialiser nine9wham", NWRed(), ^(id s){
-        UIAlertController *a = [UIAlertController
-            alertControllerWithTitle:@"Tout effacer ?"
-            message:@"Cette action supprime tous les conteneurs et réglages. Elle est irréversible."
-            preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"Oui, tout effacer" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *act) {
-            [[NSFileManager defaultManager] removeItemAtPath:NWSupportDir() error:nil];
-            [[NSFileManager defaultManager] removeItemAtPath:NWStatePath() error:nil];
-            [NSUserDefaults.standardUserDefaults removePersistentDomainForName:NWBundleID()];
-            [NSUserDefaults.standardUserDefaults synchronize];
-            [NSHTTPCookieStorage.sharedHTTPCookieStorage removeCookiesSinceDate:[NSDate dateWithTimeIntervalSince1970:0]];
-            NWVaultDelete();
-            NWState = @{};
-            NWActiveID = nil;
-            NWActiveFP = nil;
-            NWActiveLoc = nil;
-            NWLog("reset complet effectue");
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ exit(0); });
-        }]];
-        [a addAction:[UIAlertAction actionWithTitle:@"Annuler" style:UIAlertActionStyleCancel handler:nil]];
-        [weakSelf presentViewController:a animated:YES completion:nil];
-    });
-    reset.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
-    [self.content addArrangedSubview:reset];
+    [self addSection:@"Reset"];
+    UIStackView *card = [self addRowsCard];
+    [self addRow:card icon:@"trash.fill" title:@"Erase nine9wham's"
+           value:@"Containers & settings to default" action:^{
+        [weakSelf confirmReset];
+    }];
+
+    UILabel *note = NWLabelMake(@"If you only want to delete a container, do it from the container list.",
+                                11, NWDim(), UIFontWeightRegular);
+    [self.content addArrangedSubview:note];
+}
+
+// Confirmation du reset (copy Blaze : "Yes, I'm sure!" / "Cancel").
+- (void)confirmReset {
+    __weak typeof(self) weakSelf = self;
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"nine9wham"
+        message:@"Are you sure you want to reset nine9wham? Please note it will erase everything including all containers, settings and any config files. If you only want to delete the container then please do it from the container list."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"Yes, I'm sure!" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *act) {
+        [[NSFileManager defaultManager] removeItemAtPath:NWSupportDir() error:nil];
+        [[NSFileManager defaultManager] removeItemAtPath:NWStatePath() error:nil];
+        [NSUserDefaults.standardUserDefaults removePersistentDomainForName:NWBundleID()];
+        [NSUserDefaults.standardUserDefaults synchronize];
+        [NSHTTPCookieStorage.sharedHTTPCookieStorage removeCookiesSinceDate:[NSDate dateWithTimeIntervalSince1970:0]];
+        NWVaultDelete();
+        NWState = @{};
+        NWActiveID = nil;
+        NWActiveFP = nil;
+        NWActiveLoc = nil;
+        NWLog("reset complet effectue");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ exit(0); });
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+    (void)weakSelf;
 }
 
 // --- Outils du dashboard --------------------------------------------------
@@ -2718,11 +3968,11 @@ static void NWInstallFloatingButton(void) {
         tf.secureTextEntry = secure;
         tf.clearButtonMode = UITextFieldViewModeWhileEditing;
     }];
-    [a addAction:[UIAlertAction actionWithTitle:@"Valider" style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
+    [a addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
         NSString *t = a.textFields.firstObject.text ?: @"";
         if (completion) completion(t);
     }]];
-    [a addAction:[UIAlertAction actionWithTitle:@"Annuler" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
 }
 

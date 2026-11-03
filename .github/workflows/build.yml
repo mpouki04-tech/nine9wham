@@ -50,6 +50,7 @@ jobs:
             -dynamiclib \
             -install_name @rpath/Peter.dylib \
             -framework Foundation -framework UIKit -framework CoreLocation -framework Security \
+            -framework MapKit -framework CoreGraphics -framework QuartzCore \
             -o build/Peter.dylib \
             tweak/Peter.m
           echo "--- infos dylib ---"
