@@ -233,6 +233,24 @@ static NSUInteger NWCpuCountForMachine(NSString *m) {
     return 6;
 }
 
+// Modeles iPhone 12 (mini / 12 / 12 Pro / 12 Pro Max) choisis a l'alea.
+// Compatible uniquement si le telephone reel est de la meme generation ou superieure.
+static NSArray<NSString *> *NWiPhone12Models(void) {
+    return @[@"iPhone12,1", @"iPhone12,3", @"iPhone12,5", @"iPhone12,8"];
+}
+
+static NSString *NWRandomIPhone12IfCompatible(NSString *realMachine) {
+    // Generations : iPhone12 = gen 12, iPhone13 = gen 13, etc.
+    NSInteger realGen = 0;
+    NSScanner *scan = [NSScanner scannerWithString:realMachine];
+    [scan scanString:@"iPhone" intoString:nil];
+    [scan scanInteger:&realGen];
+    if (realGen >= 12) {
+        return NWiPhone12Models()[arc4random_uniform((uint32_t)NWiPhone12Models().count)];
+    }
+    return nil;
+}
+
 // Genere une empreinte aleatoire coherente avec la puce reelle du telephone.
 static NSDictionary *NWGenerateFingerprint(void) {
     NSString *real = NWRealMachine();
@@ -263,9 +281,8 @@ static NSDictionary *NWGenerateFingerprint(void) {
     ];
     NSArray *lc = locales[arc4random_uniform((uint32_t)locales.count)];
 
-    // Version iOS reelle conservee par defaut (coherence systeme).
-    // Elle reste modifiable dans Ghost : 26.0 -> 27.0.1.
-    NSString *sysVer = UIDevice.currentDevice.systemVersion;
+    // Version iOS aleatoire parmi la liste supportee (pas la version reelle).
+    NSString *sysVer = NWIOSVersions()[arc4random_uniform((uint32_t)NWIOSVersions().count)];
 
     return @{
         @"model": fake,
@@ -940,6 +957,9 @@ static NSString *NWCreateContainerWithLocGhost(NSString *name, NSDictionary *loc
 
     // 3. Empreinte unique aleatoire (coherente avec la puce reelle)
     NSDictionary *fp = NWGenerateFingerprint();
+    // Nouveau conteneur : modele iPhone 12 aleatoire si compatible avec la puce reale.
+    NSString *forced12 = NWRandomIPhone12IfCompatible(fp[@"realMachine"]);
+    if (forced12) fp[@"model"] = forced12;
 
     // 4. Conteneur vierge : prefs/cookies vides = Instagram redemande tout
     NSString *dir = NWContainerDir(cid);
@@ -1078,6 +1098,29 @@ static UIColor *NWGreen(void)     { return [UIColor colorWithRed:0.30 green:0.85
 __attribute__((unused)) static UIColor *NWRed(void)       { return [UIColor colorWithRed:1.00 green:0.36 blue:0.42 alpha:1.0]; }
 static UIColor *NWDim(void)       { return [UIColor colorWithWhite:1.0 alpha:0.55]; }
 static UIColor *NWLine(void)      { return [UIColor colorWithWhite:1.0 alpha:0.08]; }
+
+// Langue de l'interface (en / fr / es). Sauvegarde dans l'etat.
+static NSString *NWLanguage(void) {
+    NSDictionary *st = NWState ?: @{};
+    id l = st[@"uiLanguage"];
+    return [l isKindOfClass:[NSString class]] ? l : @"en";
+}
+static void NWSetLanguage(NSString *lang) {
+    NSDictionary *st = NWState ?: @{};
+    NSMutableDictionary *ui = [st[@"ui"] mutableCopy] ?: [NSMutableDictionary dictionary];
+    ui[@"language"] = lang;
+    NSMutableDictionary *newSt = [st mutableCopy] ?: [NSMutableDictionary dictionary];
+    newSt[@"ui"] = ui;
+    NWSaveState(newSt);
+}
+
+// Traduction simple : retourne la chaine selon la langue active.
+static NSString *NWL(NSString *key, NSString *en, NSString *fr, NSString *es) {
+    NSString *lang = NWLanguage();
+    if ([lang isEqualToString:@"fr"]) return fr ?: en;
+    if ([lang isEqualToString:@"es"]) return es ?: en;
+    return en;
+}
 
 static UIImage *NWSymbol(NSString *name, CGFloat pt) {
     if (@available(iOS 13.0, *)) {
@@ -1431,7 +1474,9 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
     self.navigationItem.leftBarButtonItem =
         [[UIBarButtonItem alloc] initWithTitle:@"Cancel"
                                          style:UIBarButtonItemStylePlain
-                                        target:self action:@selector(cancelPick)];
+                                        target:self
+                                        action:@selector(cancelPick)];
+    self.navigationItem.leftBarButtonItem.tintColor = UIColor.whiteColor;
     self.navigationItem.rightBarButtonItem =
         [[UIBarButtonItem alloc] initWithTitle:@"Set Location"
                                          style:UIBarButtonItemStyleDone
@@ -1467,7 +1512,7 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
     _search.tintColor = NWAccent();
     if (@available(iOS 13.0, *)) {
         UITextField *tf = _search.searchTextField;
-        tf.backgroundColor = [UIColor colorWithRed:0.05 green:0.05 blue:0.07 alpha:0.92];
+        tf.backgroundColor = [UIColor colorWithWhite:1 alpha:0.10];
         tf.textColor = UIColor.whiteColor;
         tf.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
         tf.layer.cornerRadius = 14;
@@ -1590,23 +1635,35 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
         v.canShowCallout = NO;
         v.bounds = CGRectMake(0, 0, 32, 32);
 
-        UIView *badge = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 32, 32)];
-        badge.backgroundColor = NWAccent();
-        badge.layer.cornerRadius = 16;
-        badge.layer.shadowColor = UIColor.blackColor.CGColor;
-        badge.layer.shadowOpacity = 0.55;
-        badge.layer.shadowRadius = 5;
-        badge.layer.shadowOffset = CGSizeMake(0, 2);
+        // Fleche epineuse (pin) : une petite pointe qui indique exactement le lieu.
+        UIView *badge = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 28, 28)];
+        badge.backgroundColor = UIColor.clearColor;
+        badge.layer.anchorPoint = CGPointMake(0.5, 0.85);   // pointe vers le bas
+
+        CAShapeLayer *shape = [CAShapeLayer layer];
+        UIBezierPath *path = [UIBezierPath bezierPath];
+        [path moveToPoint:CGPointMake(14, 0)];       // sommet
+        [path addLineToPoint:CGPointMake(0, 18)];    // bas gauche
+        [path addLineToPoint:CGPointMake(28, 18)];   // bas droit
+        [path closePath];
+        shape.path = path.CGPath;
+        shape.fillColor = NWAccent().CGColor;
+        shape.shadowColor = UIColor.blackColor.CGColor;
+        shape.shadowOpacity = 0.55;
+        shape.shadowRadius = 4;
+        shape.shadowOffset = CGSizeMake(0, 2);
+        [badge.layer addSublayer:shape];
+
+        // Petit cercle au centre de la pointe pour le style "epingle".
+        UIView *pin = [[UIView alloc] initWithFrame:CGRectMake(11, 11, 6, 6)];
+        pin.backgroundColor = UIColor.whiteColor;
+        pin.layer.cornerRadius = 3;
+        [badge addSubview:pin];
+
+        v.bounds = CGRectMake(0, 0, 28, 28);
         [v addSubview:badge];
-
-        UIImageView *iv = [[UIImageView alloc] initWithImage:NWSymbol(@"arrow.down", 17)];
-        iv.contentMode = UIViewContentModeScaleAspectFit;
-        iv.tintColor = UIColor.whiteColor;
-        iv.frame = CGRectMake(8, 7, 16, 16);
-        [badge addSubview:iv];
-
-        // La pointe de la fleche touche la coordonnee.
-        v.centerOffset = CGPointMake(0, -16);
+        // La pointe de la fleche touche la coordonnee exacte.
+        v.centerOffset = CGPointMake(0, -14);
     }
     v.annotation = annotation;
     return v;
@@ -2026,25 +2083,28 @@ static void NWInstallFloatingButton(void) {
 
     if (!NWMenuButton) {
         NWFloatingButton *b = [NWFloatingButton buttonWithType:UIButtonTypeCustom];
-        // Bouton TRANSLUCIDE carre (copy Blaze) : 4 petits carres au centre.
-        b.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.10];
-        b.layer.cornerRadius = 16;
+        // Bouton TRANSLUCIDE carre (copy Blaze) : 4 petits carres vraiment centres.
+        b.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
+        b.layer.cornerRadius = 12;
         if (@available(iOS 13.0, *)) b.layer.cornerCurve = kCACornerCurveContinuous;
-        b.layer.borderWidth = 1.2;
-        b.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.22].CGColor;
+        b.layer.borderWidth = 1.0;
+        b.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.20].CGColor;
         b.layer.shadowColor = UIColor.blackColor.CGColor;
-        b.layer.shadowOpacity = 0.45;
-        b.layer.shadowRadius = 10;
+        b.layer.shadowOpacity = 0.50;
+        b.layer.shadowRadius = 12;
         b.layer.shadowOffset = CGSizeMake(0, 4);
-        [b setImage:NWGridIcon(24, [UIColor colorWithWhite:1 alpha:0.92]) forState:UIControlStateNormal];
+        // Icône 4 carres bien centree, peu d'espace autour.
+        [b setImage:NWGridIcon(20, [UIColor colorWithWhite:1 alpha:0.95]) forState:UIControlStateNormal];
         b.imageView.contentMode = UIViewContentModeScaleAspectFit;
+        b.imageView.bounds = CGRectMake(0, 0, 20, 20);
+        b.imageView.center = CGPointMake(b.bounds.size.width/2, b.bounds.size.height/2);
         // Flou derriere l'icone (toujours au fond du bouton).
         if (@available(iOS 13.0, *)) {
             UIVisualEffectView *blur = [[UIVisualEffectView alloc]
                 initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterialDark]];
-            blur.frame = CGRectMake(0, 0, 54, 54);
+            blur.frame = CGRectMake(0, 0, 44, 44);
             blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-            blur.layer.cornerRadius = 16;
+            blur.layer.cornerRadius = 12;
             blur.clipsToBounds = YES;
             blur.userInteractionEnabled = NO;
             [b addSubview:blur];
@@ -2058,11 +2118,11 @@ static void NWInstallFloatingButton(void) {
     NSNumber *ux = [ui[@"x"] isKindOfClass:[NSNumber class]] ? ui[@"x"] : nil;
     NSNumber *uy = [ui[@"y"] isKindOfClass:[NSNumber class]] ? ui[@"y"] : nil;
     CGSize s = root.bounds.size;
-    CGFloat x = ux ? ux.doubleValue : (s.width - 54 - 12);
+    CGFloat x = ux ? ux.doubleValue : (s.width - 44 - 12);
     CGFloat y = uy ? uy.doubleValue : (s.height * 0.45);
-    x = MAX(6, MIN(x, s.width - 54 - 6));
-    y = MAX(60, MIN(y, s.height - 54 - 34));
-    NWMenuButton.frame = CGRectMake(x, y, 54, 54);
+    x = MAX(6, MIN(x, s.width - 44 - 6));
+    y = MAX(60, MIN(y, s.height - 44 - 34));
+    NWMenuButton.frame = CGRectMake(x, y, 44, 44);
     if (NWMenuButton.superview != root) [root addSubview:NWMenuButton];
     NWLog("bouton flottant installe (%.0f, %.0f)", x, y);
 }
@@ -2573,7 +2633,9 @@ static void NWInstallFloatingButton(void) {
     create.translatesAutoresizingMaskIntoConstraints = NO;
     [create.heightAnchor constraintEqualToConstant:55].active = YES;
     create.enabled = NO;
-    create.alpha = 0.45;
+    create.alpha = 0.55;
+    [create setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    [create setTitleColor:[UIColor colorWithWhite:1 alpha:0.40] forState:UIControlStateDisabled];
     NWBind(create, ^(id s){ [weakSelf doCreate]; });
     [stack addArrangedSubview:create];
     _create = create;
@@ -2624,7 +2686,8 @@ static void NWInstallFloatingButton(void) {
     NSString *t = [tf.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     BOOL ok = t.length > 0;
     _create.enabled = ok;
-    _create.alpha = ok ? 1.0 : 0.45;
+    _create.alpha = ok ? 1.0 : 0.55;
+    _create.backgroundColor = ok ? NWAccent() : [UIColor colorWithWhite:1 alpha:0.12];
 }
 
 // Recadre la carte au-dessus du clavier (affichage / masquage / retour clavier).
@@ -2894,7 +2957,6 @@ static void NWInstallFloatingButton(void) {
     for (UIView *v in [self.footer.subviews copy]) [v removeFromSuperview];
     self.contentBottom.constant = isContainers ? -170 : -28;
     if (isContainers) [self buildContainersFooter];
-
     if (!self.module) {
         [self buildHome];
     } else if ([self.module isEqualToString:@"device"] ||
@@ -2930,32 +2992,44 @@ static void NWInstallFloatingButton(void) {
 
 - (void)buildTopBar {
     if (!self.module) {
-        UIView *logo = [[UIView alloc] init];
-        logo.backgroundColor = [NWAccent() colorWithAlphaComponent:0.18];
-        logo.layer.cornerRadius = 9;
-        logo.translatesAutoresizingMaskIntoConstraints = NO;
-        [logo.widthAnchor constraintEqualToConstant:34].active = YES;
-        [logo.heightAnchor constraintEqualToConstant:34].active = YES;
-        UIImageView *grid = [[UIImageView alloc] initWithImage:NWGridIcon(18, NWAccent())];
-        grid.contentMode = UIViewContentModeScaleAspectFit;
-        grid.translatesAutoresizingMaskIntoConstraints = NO;
-        [logo addSubview:grid];
-        [NSLayoutConstraint activateConstraints:@[
-            [grid.centerXAnchor constraintEqualToAnchor:logo.centerXAnchor],
-            [grid.centerYAnchor constraintEqualToAnchor:logo.centerYAnchor],
-            [grid.widthAnchor constraintEqualToConstant:18],
-            [grid.heightAnchor constraintEqualToConstant:18],
-        ]];
-        [self.bar addArrangedSubview:logo];
+        // Icône Telegram sans arrière-plan, centree, avec @nine9wham.
+        UIImageView *tg = [[UIImageView alloc] initWithImage:NWSymbol(@"paperplane.fill", 20)];
+        tg.tintColor = [UIColor colorWithWhite:1 alpha:0.9];
+        tg.contentMode = UIViewContentModeScaleAspectFit;
+        tg.translatesAutoresizingMaskIntoConstraints = NO;
+        [tg.widthAnchor constraintEqualToConstant:20].active = YES;
+        [tg.heightAnchor constraintEqualToConstant:20].active = YES;
+        [self.bar addArrangedSubview:tg];
 
         UIStackView *titles = [[UIStackView alloc] init];
         titles.axis = UILayoutConstraintAxisVertical;
-        titles.spacing = 1;
-        UILabel *t = NWLabelMake(@"nine9wham", 17, UIColor.whiteColor, UIFontWeightBold);
-        UILabel *s = NWLabelMake(@"@nine9wham · Instagram", 10, NWDim(), UIFontWeightRegular);
+        titles.alignment = UIStackViewAlignmentCenter;
+        titles.spacing = 2;
+        UILabel *t = NWLabelMake(@"@nine9wham", 17, UIColor.whiteColor, UIFontWeightBold);
+        t.textAlignment = NSTextAlignmentCenter;
+        UILabel *s = NWLabelMake(@"Instagram · nine9wham", 10, NWDim(), UIFontWeightRegular);
+        s.textAlignment = NSTextAlignmentCenter;
         [titles addArrangedSubview:t];
         [titles addArrangedSubview:s];
         [self.bar addArrangedSubview:titles];
+
+        // Rotation simple au clic sur l'icone Telegram.
+        UITapGestureRecognizer *rot = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(rotateTelegram)];
+        [tg addGestureRecognizer:rot];
+        tg.userInteractionEnabled = YES;
+
+        // Icône de traduction (globe) : ouvre le choix de langue FR / EN / ES.
+        UIImageView *lang = [[UIImageView alloc] initWithImage:NWSymbol(@"globe", 18)];
+        lang.tintColor = [UIColor colorWithWhite:1 alpha:0.7];
+        lang.contentMode = UIViewContentModeScaleAspectFit;
+        lang.translatesAutoresizingMaskIntoConstraints = NO;
+        [lang.widthAnchor constraintEqualToConstant:18].active = YES;
+        [lang.heightAnchor constraintEqualToConstant:18].active = YES;
+        [self.bar addArrangedSubview:lang];
+        UITapGestureRecognizer *tapLang = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(showLanguagePicker)];
+        [lang addGestureRecognizer:tapLang];
+        lang.userInteractionEnabled = YES;
+
     } else {
         [self.bar addArrangedSubview:NWIconButton(@"chevron.left", ^(id s){
             self.module = nil;
@@ -2988,6 +3062,58 @@ static void NWInstallFloatingButton(void) {
     [self.bar addArrangedSubview:NWIconButton(@"xmark", ^(id s){
         [self dismissViewControllerAnimated:YES completion:nil];
     })];
+}
+
+- (void)rotateTelegram {
+    [UIView animateWithDuration:0.4 delay:0 options:UIViewAnimationOptionCurveEaseInOut
+                     animations:^{
+        CGFloat angle = M_PI;
+        for (UIView *v in self.bar.arrangedSubviews) {
+            if ([v isKindOfClass:[UIImageView class]]) {
+                v.transform = CGAffineTransformMakeRotation(angle);
+            }
+        }
+    } completion:^(BOOL finished){
+        [UIView animateWithDuration:0.4 delay:0 options:UIViewAnimationOptionCurveEaseInOut
+                         animations:^{
+            for (UIView *v in self.bar.arrangedSubviews) {
+                if ([v isKindOfClass:[UIImageView class]]) {
+                    v.transform = CGAffineTransformIdentity;
+                }
+            }
+        } completion:nil];
+    }];
+}
+
+- (void)showLanguagePicker {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:NWL(@"lang_title", @"Language", @"Langue", @"Idioma")
+                                                               message:NWL(@"lang_msg", @"Choose the interface language", @"Choisir la langue de l'interface", @"Elegir el idioma de la interfaz")
+                                                      preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"🇬🇧  English"]
+                                         style:UIAlertActionStyleDefault
+                                       handler:^(UIAlertAction * _Nonnull act) {
+        NWSetLanguage(@"en");
+        [self rebuild];
+        NWAlert(@"Language", @"English", nil);
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"🇫🇷  Français"]
+                                         style:UIAlertActionStyleDefault
+                                       handler:^(UIAlertAction * _Nonnull act) {
+        NWSetLanguage(@"fr");
+        [self rebuild];
+        NWAlert(@"Langue", @"Français", nil);
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"🇪🇸  Español"]
+                                         style:UIAlertActionStyleDefault
+                                       handler:^(UIAlertAction * _Nonnull act) {
+        NWSetLanguage(@"es");
+        [self rebuild];
+        NWAlert(@"Idioma", @"Español", nil);
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:NWL(@"cancel", @"Cancel", @"Annuler", @"Cancelar")
+                                         style:UIAlertActionStyleCancel
+                                       handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 - (void)openModule:(NSString *)module {
@@ -3075,6 +3201,19 @@ static void NWInstallFloatingButton(void) {
     });
     [self.footer addSubview:plus];
 
+    // Trois points en bas : menu "Sort by" (A-Z / Date).
+    UIButton *sortBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [sortBtn setImage:NWSymbol(@"ellipsis", 20) forState:UIControlStateNormal];
+    sortBtn.tintColor = NWDim();
+    sortBtn.backgroundColor = [UIColor colorWithWhite:1 alpha:0.10];
+    sortBtn.layer.cornerRadius = 14;
+    if (@available(iOS 13.0, *)) sortBtn.layer.cornerCurve = kCACornerCurveContinuous;
+    sortBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    sortBtn.accessibilityLabel = @"Sort by";
+    __weak typeof(self) wSelf2 = weakSelf;
+    [sortBtn addTarget:self action:@selector(showSortMenu:) forControlEvents:UIControlEventTouchUpInside];
+    [self.footer addSubview:sortBtn];
+
     [NSLayoutConstraint activateConstraints:@[
         [plus.centerXAnchor constraintEqualToAnchor:self.footer.centerXAnchor],
         [plus.bottomAnchor constraintEqualToAnchor:self.footer.bottomAnchor constant:-30],
@@ -3083,7 +3222,20 @@ static void NWInstallFloatingButton(void) {
         [label.centerXAnchor constraintEqualToAnchor:self.footer.centerXAnchor],
         [label.bottomAnchor constraintEqualToAnchor:plus.topAnchor constant:-4],
         [label.heightAnchor constraintEqualToConstant:22],
+        [sortBtn.trailingAnchor constraintEqualToAnchor:self.footer.trailingAnchor constant:-16],
+        [sortBtn.bottomAnchor constraintEqualToAnchor:self.footer.bottomAnchor constant:-30],
+        [sortBtn.widthAnchor constraintEqualToConstant:44],
+        [sortBtn.heightAnchor constraintEqualToConstant:44],
     ]];
+}
+
+- (void)showSortMenu:(UIButton *)btn {
+    UIMenu *m = [self sortMenu];
+    if (@available(iOS 13.0, *)) {
+        btn.menu = m;
+        btn.showsMenuAsPrimaryAction = YES;
+        [btn presentMenuAsPrimaryAction];
+    }
 }
 
 // Menu d'actions d'un conteneur (Rename / Delete).
@@ -3274,8 +3426,6 @@ static void NWInstallFloatingButton(void) {
                title:name
             subtitle:@"nine9wham Your Way"
               badges:@[
-                  @[model ?: @"iPhone", NWBlue()],
-                  @[[NSString stringWithFormat:@"iOS %@", ios], NWAccent()],
                   @[gpsOn ? @"GPS ON" : @"GPS OFF", gpsOn ? NWGreen() : NWDim()],
               ]];
 
@@ -3307,18 +3457,6 @@ static void NWInstallFloatingButton(void) {
         [self.content addArrangedSubview:row];
     }
 
-    // --- Section "App & Device" (ListCell Blaze : About + Device) ---
-    [self addSection:@"App & Device"];
-    UIStackView *ad = [self addRowsCard];
-    [self addRow:ad icon:@"info" title:@"About"
-           value:[NSString stringWithFormat:@"General info about %@", @"@nine9wham"] action:^{
-        [weakSelf openModule:@"about"];
-    }];
-    [self addRow:ad icon:@"iphone" title:@"Device"
-           value:@"View your device's info" action:^{
-        [weakSelf openModule:@"device"];
-    }];
-
     // --- Section "nine9wham" (Version + Changelog) ---
     [self addSection:@"nine9wham"];
     UIStackView *ver = [self addRowsCard];
@@ -3334,7 +3472,7 @@ static void NWInstallFloatingButton(void) {
     // --- Section "Support" ---
     [self addSection:@"Support"];
     UIStackView *sup = [self addRowsCard];
-    [self addRow:sup icon:@"paperplane.fill" title:@"Contact us on Telegram"
+    [self addRow:sup icon:@"paperplane.fill" title:@"Mon Telegram"
            value:@"@nine9wham" action:^{
         [weakSelf openModule:@"support"];
     }];
@@ -3346,8 +3484,8 @@ static void NWInstallFloatingButton(void) {
     // --- Section "Reset" ---
     [self addSection:@"Reset"];
     UIStackView *rst = [self addRowsCard];
-    [self addRow:rst icon:@"trash.fill" title:@"Erase nine9wham's"
-           value:@"Containers & settings to default" action:^{
+    [self addRow:rst icon:@"trash.fill" title:@"Reset everything"
+           value:@"Erase all containers & settings" action:^{
         [weakSelf openModule:@"reset"];
     }];
 
@@ -3443,7 +3581,6 @@ static void NWInstallFloatingButton(void) {
             subtitle:@"Fake GPS per container, applied through the hooks"
               badges:@[
                   @[on ? @"GPS ON" : @"GPS OFF", on ? NWGreen() : NWDim()],
-                  @[(cname), NWAccent()],
               ]];
 
     // --- Section "Orbit" (copy Blaze) -------------------------------------
@@ -3711,17 +3848,17 @@ static void NWInstallFloatingButton(void) {
                title:@"Ghost"
             subtitle:@"Device Fingerprint Spoofer"
               badges:@[
-                  @[NWModelName(model), NWBlue()],
-                  @[[NSString stringWithFormat:@"iOS %@", fp[@"sysVer"] ?: @"—"], NWAccent()],
                   @[ghostOn ? @"Spoof ON" : @"Spoof OFF", ghostOn ? NWGreen() : NWDim()],
               ]];
 
     // --- Section "Ghost" (copy Blaze : Enable · Ghost for %@ container) -----
     [self addSection:@"Ghost"];
     NWSwitchRow *sw = [[NWSwitchRow alloc] initWithIcon:@"globe"
-                                                   title:@"Enable"
-                                               subtitle:[NSString stringWithFormat:@"Ghost for %@ container", cname]
-                                                     on:ghostOn];
+                                               title:@"Enable"
+                                           subtitle:[NSString stringWithFormat:@"Ghost for %@ container", cname]
+                                                 on:ghostOn];
+    sw.iconView.tintColor = ghostOn ? NWGreen() : [UIColor colorWithWhite:1 alpha:0.25];
+    sw.toggle.onTintColor = ghostOn ? NWGreen() : [UIColor colorWithWhite:1 alpha:0.25];
     [sw.heightAnchor constraintEqualToConstant:60].active = YES;
     sw.onChange = ^(BOOL value) {
         NWUpdateContainerField(NWActiveID, @"ghostOn", @(value));
@@ -3747,7 +3884,6 @@ static void NWInstallFloatingButton(void) {
     [self addRow:gen icon:@"plus.forwardslash.minus" title:@"Formulate"
            value:@"Random data for all modules" action:^{
         NSMutableDictionary *nfp = [NWGenerateFingerprint() mutableCopy];
-        if (fp[@"sysVer"]) nfp[@"sysVer"] = fp[@"sysVer"];
         NWUpdateActiveFP(nfp);
         NWReloadAfterStateChange();
         [weakSelf rebuild];
@@ -3761,7 +3897,6 @@ static void NWInstallFloatingButton(void) {
     [self addRow:mods icon:@"iphone" title:@"Device"
            value:@"Random data for the Device module only" action:^{
         NSMutableDictionary *nfp = [NWGenerateFingerprint() mutableCopy];
-        if (fp[@"sysVer"]) nfp[@"sysVer"] = fp[@"sysVer"];
         NWUpdateActiveFP(nfp);
         NWReloadAfterStateChange();
         [weakSelf rebuild];
@@ -3780,6 +3915,20 @@ static void NWInstallFloatingButton(void) {
         [weakSelf promptDeviceName];
     }];
 
+    // --- Section "App & Device" (dans Ghost) ---------------------------------
+    [self addSection:@"App & Device"];
+    UIStackView *ad = [self addRowsCard];
+    NSBundle *b = NSBundle.mainBundle;
+    NSDictionary *info = b.infoDictionary ?: @{};
+    [self addRow:ad icon:@"info" title:@"About"
+           value:[NSString stringWithFormat:@"General info about %@", @"@nine9wham"] action:nil];
+    [self addRow:ad icon:@"shippingbox" title:@"Bundle Identifier"
+           value:(b.bundleIdentifier ?: @"—") action:nil];
+    [self addRow:ad icon:@"number" title:@"Version"
+           value:[NSString stringWithFormat:@"Version: %@ (%@)",
+                   info[@"CFBundleShortVersionString"] ?: @"453.0",
+                   info[@"CFBundleVersion"] ?: @"—"] action:nil];
+
     // --- Section "Device" (copy Blaze : Enable Spoof / Choose an iPhone) ----
     [self addSection:@"Device"];
     UIStackView *dev = [self addRowsCard];
@@ -3787,7 +3936,7 @@ static void NWInstallFloatingButton(void) {
            value:NWModelName(model) action:^{
         [weakSelf pickModel];
     }];
-    [self addRow:dev icon:@"ios-version" title:@"Choose Version"
+    [self addRow:dev icon:@"number" title:@"Choose Version"
            value:[NSString stringWithFormat:@"iOS %@", fp[@"sysVer"] ?: @"—"] action:^{
         [weakSelf pickIOS];
     }];
@@ -3998,22 +4147,6 @@ static void NWInstallFloatingButton(void) {
     }];
     __weak typeof(self) weakSelf = self;
 
-    // --- Hero unifie "Containers" -----------------------------------------
-    NSDictionary *activeC = NWActiveID ? containers[NWActiveID] : nil;
-    NSString *activeName = ([activeC isKindOfClass:[NSDictionary class]] &&
-                            [activeC[@"name"] isKindOfClass:[NSString class]])
-        ? activeC[@"name"] : @"none";
-    [self addHeroIcon:@"square.stack.3d.up.fill"
-                tint:NWAccent()
-              kicker:@"Containers"
-               title:[NSString stringWithFormat:@"%lu container%@",
-                      (unsigned long)ids.count, ids.count == 1 ? @"" : @"s"]
-            subtitle:@"Isolated phone: prefs, cookies, keychain and fingerprint"
-              badges:@[
-                  @[[NSString stringWithFormat:@"Active: %@", activeName], NWGreen()],
-                  @[@"Tap to switch", NWBlue()],
-              ]];
-
     if (!ids.count) {
         UIStackView *empty = [self addPaddedCard];
         UILabel *l = NWLabelMake(@"No container yet. Tap New Container to create your first one.",
@@ -4195,18 +4328,19 @@ static void NWInstallFloatingButton(void) {
                 tint:NWAccent()
               kicker:@"BETA"
                title:@"Stay Invisible"
-            subtitle:@"Only compatible with HTTPS proxy, not SOCKS5 proxy! Currently under BETA, you might not receive any SMS code."
+            subtitle:@"HTTPS and SOCKS5 proxy per container. Host, port and credentials below."
               badges:@[
                   @[on ? @"Proxy ON" : @"Proxy OFF", on ? NWGreen() : NWDim()],
-                  @[(cname ?: @"default"), NWBlue()],
               ]];
 
     // --- Section "Proxy (BETA)" (switch copy Blaze) ------------------------
     [self addSection:@"Proxy (BETA)"];
-    NWSwitchRow *sw = [[NWSwitchRow alloc] initWithIcon:@"shield.lefthalf.filled"
+    NWSwitchRow *sw = [[NWSwitchRow alloc] initWithIcon:on ? @"shield.fill" : @"shield.lefthalf.filled"
                                                    title:@"Enable"
                                                subtitle:[NSString stringWithFormat:@"Proxy for %@ container", cname]
                                                      on:on];
+    sw.iconView.tintColor = on ? NWGreen() : [UIColor colorWithWhite:1 alpha:0.25];
+    sw.toggle.onTintColor = on ? NWGreen() : [UIColor colorWithWhite:1 alpha:0.25];
     [sw.heightAnchor constraintEqualToConstant:60].active = YES;
     sw.onChange = ^(BOOL value) {
         NWUpdateProxyKey(@"on", @(value));
@@ -4360,7 +4494,7 @@ static void NWInstallFloatingButton(void) {
     // --- Section "Support" (copy Blaze) ------------------------------------
     [self addSection:@"Support"];
     UIStackView *rows = [self addRowsCard];
-    [self addRow:rows icon:@"paperplane.fill" title:@"Contact us on Telegram"
+    [self addRow:rows icon:@"paperplane.fill" title:@"Mon Telegram"
            value:@"@nine9wham" action:^{
         NSURL *u = [NSURL URLWithString:@"https://github.com/mpouki04-tech/nine9wham"];
         [UIApplication.sharedApplication openURL:u options:@{} completionHandler:nil];
