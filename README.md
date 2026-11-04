@@ -19,18 +19,28 @@
 | **Fake GPS (Orbit / Maps)** | **Carte du monde** (`MKMapView`) avec recherche (Nominatim) + sélection manuelle + « Current Location » + villes, **par conteneur**. Hooks `CLLocationManager` + injection des positions au delegate, plus d'appel réel quand le fake est actif. |
 | **Proxy (BETA)** | `Stay Invisible` — HTTPS/SOCKS5 par conteneur : Host/I.P, Port, authentification, I.P Checker. |
 | **Nouveau conteneur = nouvelles autorisations** | Prefs vierges → Instagram **redemande** ses autorisations internes (fichiers, contacts, etc.) à la création. |
-| **Survie des comptes** | Snapshot **toutes les 15 s** + à l'entrée en arrière-plan, et **vault dans le keychain** : la réinstallation hebdomadaire (Sideloadly, cert 7 jours) et les mises à jour **ne perdent pas les conteneurs**. |
+| **Survie des comptes** | Snapshot **toutes les 15 s** + à l'entrée en arrière-plan, et **vault dans le keychain**. Pour une re-install Sideloadly (cert 7 jours), utilisez **Export backup** dans le menu Support pour sauvegarder tous vos comptes vers un fichier chiffre, puis **Import backup** apres re-install. |
 
 ### Limitation connue (iOS)
 
 Les autorisations **système** (Fichiers, Appareil photo…) ne peuvent pas être re-déclenchées depuis l'app : iOS ne le permet à aucune app. En revanche toutes les demandes **internes** d'Instagram se re-déclenchent avec des prefs vierges. La sauvegarde des comptes, elle, repose sur le keychain (survit à la ré-install).
+
+## Sauvegarde & restauration (re-install Sideloadly / mise a jour)
+
+Avec Sideloadly gratuit (certificat 7 jours), le dossier interne de l'app est efface a chaque re-installation. Pour ne pas perdre vos 100 comptes :
+
+**1. Exporter une sauvegarde** : Menu → Support → **Export backup** → saisissez un mot de passe. Un fichier `nine9wham_backup_<date>.nw9` est cree dans `Documents/nine9wham_backups/`. Recuperez-le via l'app **Fichiers** ou **iCloud Drive** et gardez-le sur votre ordinateur.
+
+**2. Restaurer** : apres re-install de l'IPA, ouvrez le menu → Support → **Import backup** → choisissez le fichier `.nw9` dans la liste → saisissez le mot de passe. Tous les comptes, prefxs, cookies, empreintes et localisations sont restaures. L'app redemarre automatiquement.
+
+Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). Sans le mot de passe, il est illisible.
 
 ---
 
 ## Installer
 
 1. Télécharger l'IPA : **[Release `nine9wham`](https://github.com/mpouki04-tech/nine9wham/releases/download/nine9wham/nine9wham_instagram_453.ipa)**
-   sha256 : `33b2cb657d07b3249d3584d21f509ab041775ad6939449917b6edde892d5e17f` (338 652 879 octets)
+   sha256 : `314d27ce3199e84c572f4815bfeebfaa4abea8fc15f62cab849411865c57d23e` (338 658 928 octets)
 2. Ouvrir **Sideloadly** → sélectionner l'IPA → Install (certificat 7 jours, même Apple ID). Sideloadly est ici **uniquement** l'outil d'installation : aucune licence Blaze/Bumble n'est incluse.
 3. Lancer Instagram → le bouton **carré translucide (4 carrés)** apparaît à droite.
 
