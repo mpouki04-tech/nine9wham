@@ -883,6 +883,8 @@ static NSData *NWVaultRead(void) {
 
 #pragma mark - Backup & Restore (survie re-install Sideloadly / mise a jour)
 
+static void NWPersistState(void);   // forward declaration (definie plus bas)
+
 // Dossier Documents (accessible via Fichiers / iCloud, survit a la re-install).
 static NSString *NWDocumentsDir(void) {
     return NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
@@ -1024,7 +1026,7 @@ static NSString *NWBackupExport(NSString *password, NSError **outErr) {
     if (!crypt) return nil;
 
     NSString *fileName = [NSString stringWithFormat:@"nine9wham_backup_%@.nw9",
-                          [[NSDate date] stringWithFormat:@"%.0f", [[NSDate date] timeIntervalSince1970]]];
+                          [NSString stringWithFormat:@"%.0f", [[NSDate date] timeIntervalSince1970]]];
     NSString *path = [NWBackupDir() stringByAppendingPathComponent:fileName];
     if (![crypt writeToFile:path atomically:YES]) { if (outErr) *outErr = [NSError errorWithDomain:@"nine9wham.backup" code:7 userInfo:nil]; return nil; }
     NWLog("backup exporte: %@ (%lu octets)", path, (unsigned long)crypt.length);
@@ -1054,7 +1056,7 @@ static BOOL NWBackupImport(NSString *filePath, NSString *password, NSError **out
 static NSArray<NSString *> *NWListBackups(void) {
     NSString *dir = NWBackupDir();
     NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
-    NSMutableArray *sorted = [files mutableArray];
+    NSMutableArray *sorted = [files mutableCopy];
     [sorted sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
         NSString *pa = [dir stringByAppendingPathComponent:a];
         NSString *pb = [dir stringByAppendingPathComponent:b];
