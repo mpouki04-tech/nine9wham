@@ -60,7 +60,7 @@ Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). San
 - **Instagram se traduit vraiment** : `NWApplySystemLanguage` écrivait `AppleLanguages`/`AppleLocale` dans `NSUserDefaults` **sans redémarrage** → `NSBundle` gardait la localisation figée. **Fix** : écriture **double** (`NSUserDefaults` **+** `CFPreferencesSetAppValue`/`CFPreferencesAppSynchronize`) puis **relance proposée** (0,7 s, avec 6 nouvelles tentatives si une vue est encore présentée) après le choix d’une langue, d’un pays ou d’une locale. États-Unis → Instagram en anglais, et inversement.
 - **Crash à la création de compte : preuves, pas de suppositions** — la cause exacte restant à prouver, le **rapporteur** (déjà actif) est désormais consultable : **Support → « Crash log »** (`Documents/nine9wham_crash.log`, nom + raison + pile, écrit en `write()` async-signal-safe, re-affirmé toutes les 2 s). Garde-fous ajoutés : `@try` autour du handler du timer 2 s et de l’ouverture du menu, **vérification de type** de l’état (`fp`/`loc`/`containers`/`ghostOn`), `NWDeliverFake` protégé, 3ᵉ repli réseau `backgroundSessionConfigurationWithIdentifier`, `NWTopVC` qui remonte les vues en cours de *dismissal*.
 
-### Vague 6 (build actuel) — fix d'inscription + base 454
+### Vague 6a — fix d'inscription + base 454
 
 - **Cause du crash à la création de compte identifiée** : ce n'est **pas** le fichier de base — c'est le **sideloading lui-même**. Un IPA décrypté « pur » installé avec un certificat personnel **n'a pas l'entitlement** `com.apple.security.application-groups` → `-[NSFileManager containerURLForSecurityApplicationGroupIdentifier:]` renvoie **nil**, et l'*access group* keychain réel n'est pas celui qu'Instagram demande (`errSecMissingEntitlement`). Instagram plante sur ce `nil` à l'inscription/connexion.
 - **Preuve par deux projets indépendants qui fonctionnent** : `IGSideloadFix` (opa334) — *« Fix crash on login when Instagram is installed via sideloading »* — et **RyukGram**, dont l'IPA qui marche contient le **hook identique** de `containerURLForSecurityApplicationGroupIdentifier:` (visible dans son `__objc_methname`).
@@ -72,12 +72,19 @@ Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). San
 - **Base passée de 453.0.0 à 454.0.0** : la nouvelle base (`com.burbn.instagram_v454.0.0_und3fined.ipa`, 3647 entrées, `cryptid=0`, rpath présent, sans dylib) est vérifiée en local puis téléversée dans la release `base` ; le CI publie désormais `nine9wham_instagram_454.ipa`.
 - **Rapporteur de crash toujours actif** : si un plantage subsistait, **Support → « Crash log »** donne le nom, la raison et la pile — envoyez-la moi.
 
+### Vague 6b (build actuel) — langue PAR CONTENEUR + pays → langue/fuseau
+
+- **Langue du téléphone = celle du conteneur, pas du menu.** `NWEffectiveLocale()` est réécrit : il lit **d'abord** la locale du conteneur actif (`fp["locale"]`, ex. `es_ES`) et n'utilise la langue du menu que comme repli. Avant : conteneur Espagne + menu anglais donnait `en_ES` → Instagram ne détectait **jamais** la langue du conteneur. Maintenant chaque conteneur est vu comme un appareil séparé dont la langue est celle de sa locale.
+- **Deux chemins de détection MANQUAIENT** et sont maintenant hookés (empreinte complète) : `+[NSLocale autoupdatingCurrentLocale]` (2ᵉ lecture de la « langue du téléphone » par les SDK Meta, avec cache) et `-[NSBundle preferredLocalizations]` (bundle principal uniquement — c'est par là que la langue de l'UI d'Instagram passe). Avant, `currentLocale` + `preferredLanguages` étaient couverts ; avec ces 2 nouveaux, les 4 chemins de détection de langue sont fermés.
+- **Le pays choisi suit tout** : nouvelle table de 48 pays `[code, langue, fuseau]` (`NWCountryRows`). Quand un lieu est choisi (goulot `NWApplyLocation` = carte du monde, cellule conteneur, sheet « New Container »), le **nom du pays en fin de label** est reconnu (reverse geocoding Nominatim, ex. *"…, United States"*) → le conteneur adopte **langue + fuseau + locale** du pays (`NWSetContainerLocale` écrit `fp["locale"]` + `fp["tz"]`, persistés). Choisir États-Unis → l'anglais (`en_US`, `America/New_York`) est appliqué au conteneur, immédiat pour l'actif + écrit dans `AppleLanguages`/`AppleLocale` pour le restart.
+- **Le menu ne pilote plus la langue du téléphone** : il ne change que l'UI du dashboard (traduits à chaud FR/EN/ES via `NWL`). La langue du téléphone est dérivée du conteneur actif uniquement (règle inchangée : pas d'écriture iOS quand le Ghost est OFF).
+
 ---
 
 ## Installer
 
 1. Télécharger l'IPA : **[Release `nine9wham`](https://github.com/mpouki04-tech/nine9wham/releases/download/nine9wham/nine9wham_instagram_454.ipa)**
-   sha256 : `05b0a008e2641c09a14a72bf43ee88743dc15b8983978fa0396be8b97ba39b44` (346 745 529 octets)
+   sha256 : `df157b7afcb5eafb1a16667c82404537325d08af90eb77fba4eedcbdd378c5ce` (346 750 027 octets)
 2. Ouvrir **Sideloadly** → sélectionner l'IPA → Install (certificat 7 jours, même Apple ID). Sideloadly est ici **uniquement** l'outil d'installation : aucune licence Blaze/Bumble n'est incluse.
 3. Lancer Instagram → le bouton **carré translucide (4 carrés)** apparaît **centré en bas**.
 
