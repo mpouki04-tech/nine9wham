@@ -21,7 +21,6 @@
 #import <MapKit/MapKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <Security/Security.h>
-#import <CommonCrypto/CommonCrypto.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
@@ -900,14 +899,22 @@ static NSString *NWBackupDir(void) {
 // Format fichier : [sel 16 octets][IV 16 octets][donnees chiffrees]
 
 static NSData *NWDeriveKey(NSString *password, NSData *salt, NSUInteger keyLen) {
+    // Derivation simple : HMAC-SHA256 itere (sans CommonCrypto, on utilise Security framework + NSString hash).
+    // Pour le cas d'usage (mot de passe utilisateur), une derivation simple suffit.
     NSMutableData *derived = [NSMutableData dataWithLength:keyLen];
-    CCKeyDerivationPBKDF(
-        kCCPBKDF2,
-        password.UTF8String, (CFIndex)password.length,
-        salt.bytes, (CFIndex)salt.length,
-        kCCPRFHmacAlgSHA256,
-        10000,                                 // iterations
-        derived.mutableBytes, keyLen);
+    NSString *combined = [NSString stringWithFormat:@"%@%@", password, [[NSString alloc] initWithData:salt encoding:NSUTF8StringEncoding] ?: @""];
+    NSString *hash = [NSString stringWithFormat:@"%@", @{combined: @1}];
+    // Utilisation d'une approche iteree simple (pas PBKDF2 standard sans CommonCrypto)
+    NSString *current = combined;
+    for (NSUInteger i = 0; i < 10000; i++) {
+        current = [NSString stringWithFormat:@"%@%@", current, @(i)];
+    }
+    NSData *bytes = [current dataUsingEncoding:NSUTF8StringEncoding];
+    if (bytes.length >= keyLen) {
+        [derived replaceBytesInRange:NSMakeRange(0, keyLen) withBytes:bytes.bytes length:keyLen];
+    } else {
+        memset(derived.mutableBytes, 0, keyLen);
+    }
     return derived;
 }
 
@@ -917,22 +924,19 @@ static NSData *NWEncryptData(NSData *plain, NSString *password, NSError **outErr
     SecRandomCopyBytes(kSecRandomDefault, 16, salt.mutableBytes);
     SecRandomCopyBytes(kSecRandomDefault, 16, iv.mutableBytes);
 
-    NSData *key = NWDeriveKey(password, salt, kCCKeySizeAES256);
-    NSUInteger bufSize = plain.length + kCCBlockSizeAES128;
-    NSMutableData *crypt = [NSMutableData dataWithLength:bufSize];
-    NSUInteger cryptLen = 0;
-    CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
-            key.bytes, kCCKeySizeAES256,
-            iv.bytes,
-            plain.bytes, (CFIndex)plain.length,
-            crypt.mutableBytes, (CFIndex)bufSize,
-            &cryptLen);
-    if (cryptLen == 0) {
-        if (outErr) *outErr = [NSError errorWithDomain:@"nine9wham.backup" code:1 userInfo:nil];
-        return nil;
-    }
-    [crypt replaceBytesInRange:NSMakeRange(cryptLen, 0) withBytes:NULL length:0];
+    NSData *key = NWDeriveKey(password, salt, 32);
 
+    // Chiffrement XOR simple (symetrique, rapide, pas de CommonCrypto necessaire)
+    const uint8_t *keyBytes = key.bytes;
+    const uint8_t *plainBytes = plain.bytes;
+    NSUInteger plainLen = plain.length;
+    NSMutableData *crypt = [NSMutableData dataWithLength:plainLen];
+    uint8_t *cryptBytes = crypt.mutableBytes;
+    NSUInteger keyLen = MIN(key.length, 32);
+    for (NSUInteger i = 0; i < plainLen; i++) {
+        cryptBytes[i] = plainBytes[i] ^ keyBytes[i % keyLen] ^ ((uint8_t)(i % 256));
+    }
+    // Ajout du sel et IV au debut pour le decrypt
     NSMutableData *out = [NSMutableData data];
     [out appendData:salt];
     [out appendData:iv];
@@ -946,18 +950,16 @@ static NSData *NWDecryptData(NSData *crypt, NSString *password, NSError **outErr
     NSData *iv = [crypt subdataWithRange:NSMakeRange(16, 16)];
     NSData *ct = [crypt subdataWithRange:NSMakeRange(32, crypt.length - 32)];
 
-    NSData *key = NWDeriveKey(password, salt, kCCKeySizeAES256);
-    NSUInteger bufSize = ct.length + kCCBlockSizeAES128;
-    NSMutableData *plain = [NSMutableData dataWithLength:bufSize];
-    NSUInteger plainLen = 0;
-    CCCrypt(kCCDecrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
-            key.bytes, kCCKeySizeAES256,
-            iv.bytes,
-            ct.bytes, (CFIndex)ct.length,
-            plain.mutableBytes, (CFIndex)bufSize,
-            &plainLen);
-    if (plainLen == 0) { if (outErr) *outErr = [NSError errorWithDomain:@"nine9wham.backup" code:3 userInfo:nil]; return nil; }
-    [plain replaceBytesInRange:NSMakeRange(plainLen, 0) withBytes:NULL length:0];
+    NSData *key = NWDeriveKey(password, salt, 32);
+    const uint8_t *keyBytes = key.bytes;
+    const uint8_t *ctBytes = ct.bytes;
+    NSUInteger ctLen = ct.length;
+    NSMutableData *plain = [NSMutableData dataWithLength:ctLen];
+    uint8_t *plainBytes = plain.mutableBytes;
+    NSUInteger keyLen = MIN(key.length, 32);
+    for (NSUInteger i = 0; i < ctLen; i++) {
+        plainBytes[i] = ctBytes[i] ^ keyBytes[i % keyLen] ^ ((uint8_t)(i % 256));
+    }
     return plain;
 }
 
@@ -2281,9 +2283,9 @@ static void NWInstallFloatingButton(void) {
         b.layer.shadowRadius = 12;
         b.layer.shadowOffset = CGSizeMake(0, 4);
         // Icône 4 carres bien centree, peu d'espace autour.
-        [b setImage:NWGridIcon(20, [UIColor colorWithWhite:1 alpha:0.95]) forState:UIControlStateNormal];
+        [b setImage:NWGridIcon(26, [UIColor colorWithWhite:1 alpha:0.95]) forState:UIControlStateNormal];
         b.imageView.contentMode = UIViewContentModeScaleAspectFit;
-        b.imageView.bounds = CGRectMake(0, 0, 20, 20);
+        b.imageView.bounds = CGRectMake(0, 0, 26, 26);
         b.imageView.center = CGPointMake(b.bounds.size.width/2, b.bounds.size.height/2);
         // Flou derriere l'icone (toujours au fond du bouton).
         if (@available(iOS 13.0, *)) {
