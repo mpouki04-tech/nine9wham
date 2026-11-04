@@ -15,8 +15,8 @@ permissions:
 env:
   BASE_TAG: base
   OUT_TAG: nine9wham
-  BASE_IPA: com.burbn.instagram_453.0_und3fined.ipa
-  OUT_IPA: nine9wham_instagram_453.ipa
+  BASE_IPA: com.burbn.instagram_v454.0.0_und3fined.ipa
+  OUT_IPA: nine9wham_instagram_454.ipa
 
 jobs:
   build:

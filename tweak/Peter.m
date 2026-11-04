@@ -5828,6 +5828,138 @@ static id NWHook_defaultSessionCfg(id self, SEL _cmd) {
 }
 
 // ---------------------------------------------------------------------------
+// Sideload fix — IGSideloadFix (opa334) reecrit ici, sans Theos
+// ---------------------------------------------------------------------------
+// PREUVE (deux projets independants qui fonctionnent) :
+//   - IGSideloadFix : "Fix crash on login when Instagram is installed via
+//     sideloading" -> hook NSFileManager (conteneur de groupe) + accessGroup
+//     keychain (FBSDKKeychainStore / FBKeychainItemController / UICKeyChainStore) ;
+//   - RyukGram (IPA qui marche) : hook identique de
+//     -[NSFileManager containerURLForSecurityApplicationGroupIdentifier:]
+//     visible dans son __objc_methname.
+// MECANISME : en sideloading le certificat personnel n'a PAS l'entitlement
+//   com.apple.security.application-groups -> la methode renvoie nil (et
+//   l'access group keychain reel n'est pas celui qu'Instagram demande ->
+//   errSecMissingEntitlement). Instagram plante a l'inscription sur ce nil.
+// REPLI 1 : conteneur de groupe FACTICE dans Documents/FakeGroupContainers
+//           (creer les dossiers, comme IGSideloadFix).
+// REPLI 2 : accessGroup = le VRAI groupe du certificat, obtenu en posant un
+//           item bidon dans le keychain (puis supprime).
+// Note : InstagramAppCoreFramework est ABSENT des bases 453/454 (compile en
+//   statique) -> le dlopen d'IGSideloadFix est inutile ici.
+
+static NSString *NWAccessGroupReal = nil;
+static NSInteger NWAccessGroupTries = 0;
+static NSURL *(*NWOrig_containerURL)(id, SEL, NSString *);
+
+// Vrai access group du certificat : un item bidon SANS accessGroup est
+// assigne par le systeme au groupe reel de l'app (celui du profil).
+static void NWLoadAccessGroupReal(void) {
+    if (NWAccessGroupReal.length || NWAccessGroupTries >= 3) return;
+    NWAccessGroupTries++;
+    @try {
+        NSDictionary *query = @{
+            (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+            (__bridge id)kSecAttrAccount: @"nine9wham.sideload",
+            (__bridge id)kSecAttrService: @"nine9wham.sideload",
+            (__bridge id)kSecReturnAttributes: @YES,
+            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitOne,
+        };
+        // SecItemAdd n'accepte pas kSecMatchLimit : dictionnaire separe.
+        NSDictionary *add = @{
+            (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+            (__bridge id)kSecAttrAccount: @"nine9wham.sideload",
+            (__bridge id)kSecAttrService: @"nine9wham.sideload",
+            (__bridge id)kSecReturnAttributes: @YES,
+        };
+        CFTypeRef res = NULL;
+        OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)query, &res);
+        if (st == errSecItemNotFound) st = SecItemAdd((__bridge CFDictionaryRef)add, &res);
+        // Garde de type : sans MatchLimit le systeme peut renvoyer un NSArray.
+        if (st == errSecSuccess && res && CFGetTypeID(res) == CFDictionaryGetTypeID()) {
+            NSString *g = ((__bridge NSDictionary *)res)[(__bridge id)kSecAttrAccessGroup];
+            if ([g isKindOfClass:[NSString class]] && g.length) {
+                NWAccessGroupReal = g;
+                NWLog("sideload: access group reelle = %@", g);
+            }
+        }
+        if (res) CFRelease(res);
+        // Nettoyage de l'item bidon (la valeur est deja retenue).
+        SecItemDelete((__bridge CFDictionaryRef)@{
+            (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+            (__bridge id)kSecAttrAccount: @"nine9wham.sideload",
+            (__bridge id)kSecAttrService: @"nine9wham.sideload",
+        });
+    } @catch (NSException *e) {
+        NWLog("sideload access group: %@", e.reason);
+    }
+}
+
+// REPLI 1 : au lieu de nil, Instagram recoit un URL de conteneur valide.
+static NSURL *NWHook_containerURL(id self, SEL _cmd, NSString *gid) {
+    @try {
+        NSURL *real = NWOrig_containerURL ? NWOrig_containerURL(self, _cmd, gid) : nil;
+        if (real) return real;                 // comportement d'origine si dispo
+        if (![gid isKindOfClass:[NSString class]] || !gid.length) return nil;
+        NSString *root = [NWDocumentsDir() stringByAppendingPathComponent:@"FakeGroupContainers"];
+        NSURL *u = [NSURL fileURLWithPath:[root stringByAppendingPathComponent:gid] isDirectory:YES];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        for (NSString *sub in @[@"", @"Library", @"Library/Caches"]) {
+            NSString *p = [u.path stringByAppendingPathComponent:sub];
+            if (![fm fileExistsAtPath:p]) {
+                [fm createDirectoryAtPath:p withIntermediateDirectories:YES attributes:nil error:nil];
+            }
+        }
+        NWLog("sideload: conteneur de groupe factice -> %@", gid);
+        return u;
+    } @catch (NSException *e) {
+        NWLog("sideload containerURL: %@", e.reason);
+        return nil;
+    }
+}
+
+// REPLI 2 : le meme IMP pour les 3 classes, chaque origine dans son propre slot
+// (sinon l'appel d'origine d'une classe pourrait viser l'IMP d'une autre).
+static NSString *(*NWOrig_acFBC)(id, SEL);
+static NSString *(*NWOrig_acUIC)(id, SEL);
+static NSString *(*NWOrig_acFBSDK)(id, SEL);
+
+static NSString *NWAccessGroupOrOrig(id self, SEL _cmd, NSString *(*orig)(id, SEL)) {
+    @try {
+        NWLoadAccessGroupReal();
+        if (NWAccessGroupReal.length) return NWAccessGroupReal;
+        return orig ? orig(self, _cmd) : nil;
+    } @catch (NSException *e) {
+        NWLog("sideload accessGroup: %@", e.reason);
+        return NWAccessGroupReal;
+    }
+}
+static NSString *NWHook_acFBC(id s, SEL c)   { return NWAccessGroupOrOrig(s, c, NWOrig_acFBC); }
+static NSString *NWHook_acUIC(id s, SEL c)   { return NWAccessGroupOrOrig(s, c, NWOrig_acUIC); }
+static NSString *NWHook_acFBSDK(id s, SEL c) { return NWAccessGroupOrOrig(s, c, NWOrig_acFBSDK); }
+
+static void NWInstallSideloadFix(void) {
+    // 1. Conteneur de groupe : LA cause documentee du crash a l'inscription.
+    NWSwizzle([NSFileManager class],
+              @selector(containerURLForSecurityApplicationGroupIdentifier:),
+              (IMP)NWHook_containerURL, &NWOrig_containerURL);
+
+    // 2. Access group keychain : seules les classes PRESENTES sont hookes
+    //    (FBSDKKeychainStore n'existe plus dans 453/454, les deux autres oui).
+    int n = 0;
+    Class c = NSClassFromString(@"FBKeychainItemController");
+    if (c) { NWSwizzle(c, @selector(accessGroup), (IMP)NWHook_acFBC, &NWOrig_acFBC); n++; }
+    c = NSClassFromString(@"UICKeyChainStore");
+    if (c) { NWSwizzle(c, @selector(accessGroup), (IMP)NWHook_acUIC, &NWOrig_acUIC); n++; }
+    c = NSClassFromString(@"FBSDKKeychainStore");
+    if (c) { NWSwizzle(c, @selector(accessGroup), (IMP)NWHook_acFBSDK, &NWOrig_acFBSDK); n++; }
+
+    NWLoadAccessGroupReal();
+    NWLog("sideload fix installe (conteneur de groupe + %d accessGroup, groupe=%@)",
+          n, NWAccessGroupReal ?: @"(reel si dispo)");
+}
+
+// ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
 
@@ -5845,6 +5977,11 @@ static void NWInit(void) {
         // 0. Rapporteur de crash : installe AVANT tout hook, pour capturer le
         //    plantage a la creation de compte (nom + raison + pile).
         NWInstallCrashReporter();
+
+        // 0 bis. Sideload fix : conteneur de groupe + accessGroup keychain.
+        //    Sans cela Instagram plante a l'inscription en sideloading
+        //    (certificat personnel sans entitlement de groupe).
+        NWInstallSideloadFix();
 
         NWLog("demarrage — Instagram %@", UIDevice.currentDevice.systemVersion);
 

@@ -2,7 +2,7 @@
 
 **Instagram modifié** — menu flottant, **conteneurs** (téléphones virtuels isolés) et **fake GPS** par conteneur.
 
-> Base : Instagram **453.0.0** propre (`cryptid=0`, aucun dylib injecté) — voir [Choix de la base](#choix-de-la-base).
+> Base : Instagram **454.0.0** propre (`cryptid=0`, aucun dylib injecté) — voir [Choix de la base](#choix-de-la-base).
 
 ---
 
@@ -60,11 +60,23 @@ Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). San
 - **Instagram se traduit vraiment** : `NWApplySystemLanguage` écrivait `AppleLanguages`/`AppleLocale` dans `NSUserDefaults` **sans redémarrage** → `NSBundle` gardait la localisation figée. **Fix** : écriture **double** (`NSUserDefaults` **+** `CFPreferencesSetAppValue`/`CFPreferencesAppSynchronize`) puis **relance proposée** (0,7 s, avec 6 nouvelles tentatives si une vue est encore présentée) après le choix d’une langue, d’un pays ou d’une locale. États-Unis → Instagram en anglais, et inversement.
 - **Crash à la création de compte : preuves, pas de suppositions** — la cause exacte restant à prouver, le **rapporteur** (déjà actif) est désormais consultable : **Support → « Crash log »** (`Documents/nine9wham_crash.log`, nom + raison + pile, écrit en `write()` async-signal-safe, re-affirmé toutes les 2 s). Garde-fous ajoutés : `@try` autour du handler du timer 2 s et de l’ouverture du menu, **vérification de type** de l’état (`fp`/`loc`/`containers`/`ghostOn`), `NWDeliverFake` protégé, 3ᵉ repli réseau `backgroundSessionConfigurationWithIdentifier`, `NWTopVC` qui remonte les vues en cours de *dismissal*.
 
+### Vague 6 (build actuel) — fix d'inscription + base 454
+
+- **Cause du crash à la création de compte identifiée** : ce n'est **pas** le fichier de base — c'est le **sideloading lui-même**. Un IPA décrypté « pur » installé avec un certificat personnel **n'a pas l'entitlement** `com.apple.security.application-groups` → `-[NSFileManager containerURLForSecurityApplicationGroupIdentifier:]` renvoie **nil**, et l'*access group* keychain réel n'est pas celui qu'Instagram demande (`errSecMissingEntitlement`). Instagram plante sur ce `nil` à l'inscription/connexion.
+- **Preuve par deux projets indépendants qui fonctionnent** : `IGSideloadFix` (opa334) — *« Fix crash on login when Instagram is installed via sideloading »* — et **RyukGram**, dont l'IPA qui marche contient le **hook identique** de `containerURLForSecurityApplicationGroupIdentifier:` (visible dans son `__objc_methname`).
+- **Correctif intégré au `Peter.dylib`** (option « compiler soi-même », sans Theos, fidèle à IGSideloadFix) :
+  - **repli 1** — le hook de conteneur de groupe renvoie un **faux conteneur** `Documents/FakeGroupContainers/<gid>` (avec `Library` + `Library/Caches`) au lieu de `nil` ; l'original est conservé s'il répond ;
+  - **repli 2** — `accessGroup` de `FBKeychainItemController` / `UICKeyChainStore` (et `FBSDKKeychainStore` si présent) renvoie le **vrai** groupe du certificat, obtenu avec un item bidon posé puis supprimé du keychain ;
+  - classes absentes **ignorées** (`FBSDKKeychainStore` n'existe plus en 453/454), tout est sous `@try`, 3 tentatives maximum, `@try` sur chaque hook.
+  - `InstagramAppCoreFramework` est **absent** des bases 453/454 (compilé en statique) → le `dlopen` d'IGSideloadFix est inutile ici (vérifié dans le binaire).
+- **Base passée de 453.0.0 à 454.0.0** : la nouvelle base (`com.burbn.instagram_v454.0.0_und3fined.ipa`, 3647 entrées, `cryptid=0`, rpath présent, sans dylib) est vérifiée en local puis téléversée dans la release `base` ; le CI publie désormais `nine9wham_instagram_454.ipa`.
+- **Rapporteur de crash toujours actif** : si un plantage subsistait, **Support → « Crash log »** donne le nom, la raison et la pile — envoyez-la moi.
+
 ---
 
 ## Installer
 
-1. Télécharger l'IPA : **[Release `nine9wham`](https://github.com/mpouki04-tech/nine9wham/releases/download/nine9wham/nine9wham_instagram_453.ipa)**
+1. Télécharger l'IPA : **[Release `nine9wham`](https://github.com/mpouki04-tech/nine9wham/releases/download/nine9wham/nine9wham_instagram_454.ipa)**
    sha256 : `cabb629cd06bd74d22ccec4113a9fd4b8d525ebbfee337bcc88019c98e230a0b` (338 673 720 octets)
 2. Ouvrir **Sideloadly** → sélectionner l'IPA → Install (certificat 7 jours, même Apple ID). Sideloadly est ici **uniquement** l'outil d'installation : aucune licence Blaze/Bumble n'est incluse.
 3. Lancer Instagram → le bouton **carré translucide (4 carrés)** apparaît **centré en bas**.
@@ -97,7 +109,7 @@ nine9wham/
 └── .github/workflows/build.yml   # CI macOS : compile → injecte → repack → release
 ```
 
-**Méthode d'injection** (reprise de RyukGram) : `LC_LOAD_WEAK_DYLIB` `@rpath/Peter.dylib` + `LC_RPATH @executable_path/Frameworks` (déjà présent dans la base 453). Aucun `LC_LOAD_DYLIB` fort → l'app démarre même si le dylib manque.
+**Méthode d'injection** (reprise de RyukGram) : `LC_LOAD_WEAK_DYLIB` `@rpath/Peter.dylib` + `LC_RPATH @executable_path/Frameworks` (déjà présent dans la base 454). Aucun `LC_LOAD_DYLIB` fort → l'app démarre même si le dylib manque.
 
 **Hooks** :
 - ObjC : `UIDevice` (name/model/idfv), `NSProcessInfo` (mémoire/CPU, **gated par le switch Ghost** — OFF = valeurs réelles), `NSLocale`, `NSTimeZone`, `ASIdentifierManager` (IDFA).
@@ -115,14 +127,16 @@ nine9wham/
 
 ## Choix de la base
 
-La consigne initiale visait la base **449** (celle de RyukGram). La base utilisée est **453.0.0 propre** :
+La consigne initiale visait la base **449** (celle de RyukGram). La base utilisée est **454.0.0 propre** (mise à jour demandée, passée de 453 à 454) :
 
-- `cryptid=0` (déjà décryptée), 3 709 entrées, aucune modification,
+- `cryptid=0` (déjà décryptée), 3 647 entrées, aucune modification,
 - **aucun dylib injecté** (contrairement à RyukGram 449 qui en a 4 dans `Frameworks`),
 - `LC_RPATH @executable_path/Frameworks` **déjà présent** → injection valide sans toucher aux rpaths,
-- `CFBundleExecutable=Instagram`, `MinimumOSVersion=16.3`.
+- `CFBundleExecutable=Instagram`, `CFBundleVersion=1104268342`, `MinimumOSVersion=16.3`.
 
 Résultat : une base saine, sans résidu d'un autre tweak, et la méthode d'injection de RyukGram conservée à l'identique.
+
+> **Contrôles avant publication** : la base est vérifiée en local (`magic MH_MAGIC_64`, `cryptid=0`, rpath présent, aucun `Peter.dylib` déjà injecté) avant d'être téléversée dans la release `base` que le CI télécharge.
 
 ---
 
