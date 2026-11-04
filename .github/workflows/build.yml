@@ -15,7 +15,7 @@ permissions:
 env:
   BASE_TAG: base
   OUT_TAG: nine9wham
-  BASE_IPA: com.burbn.instagram_v454.0.0_und3fined.ipa
+  BASE_IPA: com.burbn.instagram_v454.0.0_sideload_clean.ipa
   OUT_IPA: nine9wham_instagram_454.ipa
 
 jobs:
@@ -44,7 +44,7 @@ jobs:
           mkdir -p build
           xcrun -sdk iphoneos clang \
             -arch arm64 \
-            -miphoneos-version-min=16.3 \
+            -miphoneos-version-min=15.0 \
             -O2 -fobjc-arc \
             -Wall -Wextra -Wno-unused-parameter \
             -dynamiclib \

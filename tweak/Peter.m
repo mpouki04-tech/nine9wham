@@ -41,6 +41,27 @@
 
 #define NWLog(fmt, ...) NSLog(@"[nine9wham] " fmt, ##__VA_ARGS__)
 
+// ---- v7 : declarations avancees (corps definis dans la section Device
+// identity, en aval). Les cles ci-dessus + ces protos rendent l'ordre du
+// fil sans surprise (hooks idfv, dashboard, overlay pill, safe-mode).
+static BOOL   NWDevBool(NSString *k);
+static BOOL   NWDevMaskOn(void);
+static BOOL   NWBlockAttest(void);
+static BOOL   NWSafeModeOn(void);
+static NSString *NWDevGetStr(NSString *k);
+static void     NWDevSetStr(NSString *k, NSString *v);
+static NSString *NWDevDevIDCurrent(void);
+static NSString *NWDevFDIDCurrent(void);
+static NSString *NWDevMidCurrent(void);
+static NSString *NWDevMidHdrCurrent(void);
+static NSString *NWDevShort(NSString *s);
+static void     NWDevRollIdentity(BOOL makeMask);
+static BOOL NWDevPillHiddenNow;          // tentative ; definition + loin
+static void NWEnsureDevPill(UIView *root);
+static void NWOpenDeviceIdentity(void);
+static void NWCloseMenu(void);
+static void NWPresentSafeModeUI(void);
+
 #pragma mark - Chemins
 
 static NSString *NWSupportDir(void) {
@@ -297,6 +318,9 @@ static NSDictionary *NWGenerateFingerprint(void) {
     // Version iOS aleatoire parmi la liste supportee (pas la version reelle).
     NSString *sysVer = NWIOSVersions()[arc4random_uniform((uint32_t)NWIOSVersions().count)];
 
+    // Identite device du conteneur : device id, family device id, machine id
+    // (= mid, la cle preferee d'Instagram) et son header. Une identite par
+    // conteneur : Instagram voit un appareil matierielment different.
     return @{
         @"model": fake,
         @"realMachine": real,
@@ -308,6 +332,10 @@ static NSDictionary *NWGenerateFingerprint(void) {
         @"memGB": @(NWMemGBForMachine(fake)),
         @"cpu": @(NWCpuCountForMachine(fake)),
         @"sysVer": sysVer,
+        @"deviceId": [[NSUUID UUID] UUIDString],
+        @"fdid": [[NSUUID UUID] UUIDString],
+        @"mid": [[NSUUID UUID] UUIDString],
+        @"midHeader": [[NSUUID UUID] UUIDString],
     };
 }
 
@@ -388,7 +416,10 @@ static NSUUID *NWHook_idfv(id self, SEL _cmd) {
     // IDFV = cle d'inscription Instagram : appele pendant la creation de
     // compte -> protege (jamais d'exception non catchee).
     @try {
-        NSString *s = NWFPStr(@"idfv");
+        // 1) pin device identity global (vague 7), 2) empreinte du conteneur.
+        NSString *s = NWDevMaskOn() ? NWDevGetStr(NWDevKeyDevID) : nil;
+        if (!s) s = NWFPStr(@"deviceId");          // device id epingle par conteneur
+        if (!s) s = NWFPStr(@"idfv");
         if (s) {
             NSUUID *u = [[NSUUID alloc] initWithUUIDString:s];
             if (u) return u;
@@ -819,79 +850,120 @@ static int NWHook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, 
     return r;
 }
 
-// Scanne le __got du binaire principal et remplace les pointeurs cibles.
-static void NWRebindGOT(void) {
-    const struct mach_header *mh = _dyld_get_image_header(0);
-    if (!mh || mh->magic != MH_MAGIC_64) { NWLog("header principal invalide"); return; }
+// ---------------------------------------------------------------------------
+// Rebinding GOT == fishhook maison TOUTES IMAGES.
+// MOTATIF (architecture shim evidente chez eux, reecrite ici) : Instagram
+// appelle SecItemAdd/CopyMatching/Update/Delete en C DIRECT avec
+// kSecAttrAccessGroup force -> nos hooks ObjC (accessGroup) ne couvrent PAS
+// ce chemin. Solution : remplacer les pointeurs cibles dans les sections
+// __got / __auth_got / __la_symbol_ptr / __nl_symbol_ptr de TOUTES les
+// images chargees. Notre image est exclue (dladdr) : les externes de Peter
+// restent reels (sinon nos hooks se rebindent eux-memes -> recursion).
+// Les images chargees PLUS TARD sont couvertes par
+// _dyld_register_func_for_add_image : dyld declenche le callback deja pour
+// chaque image chargee (la passe initiale est couverte), puis a chaque
+// ajout -> une seule logique, pas de doublon.
+//
+// Prototypes des hooks SecItem (corps definis dans la section Sideload
+// v2 en aval, apres NWLoadAccessGroupReal) :
+static OSStatus NWHook_SecItemAdd(CFDictionaryRef q, CFTypeRef *r);
+static OSStatus NWHook_SecItemCopyMatching(CFDictionaryRef q, CFTypeRef *r);
+static OSStatus NWHook_SecItemUpdate(CFDictionaryRef q, CFDictionaryRef attrs, CFTypeRef *r);
+static OSStatus NWHook_SecItemDelete(CFDictionaryRef q);
+// Pointeurs reels (tentative ici, assignes par le rebinding ; la definition
+// suit dans la section Sideload v2) :
+static OSStatus (*NWSecReal_Add)(CFDictionaryRef, CFTypeRef *);
+static OSStatus (*NWSecReal_CopyMatching)(CFDictionaryRef, CFTypeRef *);
+static OSStatus (*NWSecReal_Update)(CFDictionaryRef, CFDictionaryRef, CFTypeRef *);
+static OSStatus (*NWSecReal_Delete)(CFDictionaryRef);
+
+typedef struct { const char *name; void *want; void *repl; void **orig; } NWRebindTarget;
+
+static NWRebindTarget NWRbTargets[7];
+static int NWRbTargetsCount = 0;
+
+static void NWRbFillTargets(void) {
+    if (NWRbTargetsCount) return;
+    static const char *n7[7] = { "uname", "sysctlbyname", "sysctl",
+                                 "SecItemAdd", "SecItemCopyMatching",
+                                 "SecItemUpdate", "SecItemDelete" };
+    static void *r7[7] = { (void *)NWHook_uname, (void *)NWHook_sysctlbyname, (void *)NWHook_sysctl,
+                           (void *)NWHook_SecItemAdd, (void *)NWHook_SecItemCopyMatching,
+                           (void *)NWHook_SecItemUpdate, (void *)NWHook_SecItemDelete };
+    static void **o7[7] = { (void **)&NWOrig_uname, (void **)&NWOrig_sysctlbyname, (void **)&NWOrig_sysctl,
+                            (void **)&NWSecReal_Add, (void **)&NWSecReal_CopyMatching,
+                            (void **)&NWSecReal_Update, (void **)&NWSecReal_Delete };
+    for (int i = 0; i < 7; i++) {
+        NWRbTargets[i].name = n7[i];
+        NWRbTargets[i].want = dlsym(RTLD_DEFAULT, n7[i]);
+        NWRbTargets[i].repl = r7[i];
+        NWRbTargets[i].orig = o7[i];
+        if (!NWRbTargets[i].want) NWLog("rebind: symbole absent = %s", n7[i]);
+    }
+    NWRbTargetsCount = 7;
+}
+
+// Hook d'ajout d'image donne par dyld. Recurrence = idempotent : un slot
+// deja rebindé (valeur == notre repl) est sauté.
+static void NWRbImage(const struct mach_header *mh, intptr_t slide) {
+    if (!mh || mh->magic != MH_MAGIC_64) return;
+    Dl_info di;
+    void *selfBase = NULL;
+    if (dladdr((void *)&NWRbImage, &di)) selfBase = di.dli_fbase;
+    if ((const void *)mh == selfBase) return;   // notre image : JAMAIS rebind
     const struct mach_header_64 *mh64 = (const struct mach_header_64 *)mh;
-    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
-
-    const struct symtab_command *symtab = NULL;
-    const struct dysymtab_command *dysym = NULL;
-    const struct segment_command_64 *gotSeg = NULL;
-    const struct section_64 *gotSec = NULL;
-
+    int patched = 0;
     const uint8_t *cmd = (const uint8_t *)(mh64 + 1);
     for (uint32_t i = 0; i < mh64->ncmds; i++) {
         const struct load_command *lc = (const struct load_command *)cmd;
-        if (lc->cmd == LC_SYMTAB) symtab = (const struct symtab_command *)lc;
-        else if (lc->cmd == LC_DYSYMTAB) dysym = (const struct dysymtab_command *)lc;
-        else if (lc->cmd == LC_SEGMENT_64) {
+        if (lc->cmd == LC_SEGMENT_64) {
             const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
             const struct section_64 *sec = (const struct section_64 *)(sg + 1);
             for (uint32_t s = 0; s < sg->nsects; s++) {
-                if (strncmp(sec[s].sectname, "__got", 5) == 0 ||
-                    strncmp(sec[s].sectname, "__auth_got", 10) == 0) {
-                    gotSeg = sg; gotSec = &sec[s];
+                if (strncmp(sec[s].sectname, "__got", 5) != 0 &&
+                    strncmp(sec[s].sectname, "__auth_got", 10) != 0 &&
+                    strncmp(sec[s].sectname, "__la_symbol_ptr", 15) != 0 &&
+                    strncmp(sec[s].sectname, "__nl_symbol_ptr", 15) != 0) continue;
+                void **slots = (void **)(slide + sec[s].addr);
+                uint64_t n = sec[s].size / sizeof(void *);
+                if (!slots || !n) continue;
+                for (uint64_t j = 0; j < n; j++) {
+                    if (!slots[j]) continue;
+                    for (int t = 0; t < NWRbTargetsCount; t++) {
+                        if (!NWRbTargets[t].want) continue;
+                        if (slots[j] != NWRbTargets[t].want) continue;
+                        // __DATA_CONST est passee en lecture seule apres
+                        // binding. Pages iOS = 16 Ko -> alignement 0x4000.
+                        // Si vm_protect refuse : on SAUTE (ecrire dans une
+                        // page protegee = SIGSEGV au lancement = crash).
+                        vm_address_t page = (vm_address_t)((uintptr_t)&slots[j] & ~(uintptr_t)0x3FFF);
+                        kern_return_t kr = vm_protect(mach_task_self(), page, (vm_size_t)0x4000, 0,
+                                                      VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                        if (kr != KERN_SUCCESS) {
+                            NWLog("rebind: vm_protect refuse (%d) pour %s", kr, NWRbTargets[t].name);
+                            continue;
+                        }
+                        *(NWRbTargets[t].orig) = NWRbTargets[t].want;
+                        slots[j] = NWRbTargets[t].repl;
+                        patched++;
+                        NWLog("rebind %s", NWRbTargets[t].name);
+                    }
                 }
             }
         }
         cmd += lc->cmdsize;
     }
-    if (!symtab || !dysym || !gotSec) { NWLog("got/symtab introuvable"); return; }
-    (void)symtab; (void)dysym;   // requis pour la localisation du got
-    // Les offsets du symtab sont des offsets fichier -> on rebind par VA :
-    // on resout les symboles via dlsym et on compare les valeurs dans le got.
-    void *targets[3];
-    const char *names[3] = { "uname", "sysctlbyname", "sysctl" };
-    void *repls[3];
-    void **origs[3];
-    for (int t = 0; t < 3; t++) {
-        targets[t] = dlsym(RTLD_DEFAULT, names[t]);
-        repls[t] = (t == 0) ? (void *)NWHook_uname : (t == 1 ? (void *)NWHook_sysctlbyname : (void *)NWHook_sysctl);
-        origs[t] = (t == 0) ? (void **)&NWOrig_uname : (t == 1 ? (void **)&NWOrig_sysctlbyname : (void **)&NWOrig_sysctl);
-    }
+    (void)patched;
+}
 
-    uint64_t va = gotSec->addr;
-    uint64_t size = gotSec->size;
-    uint64_t count = size / 8;
-    // Adresse reelle = slide + vmaddr (l'entete est deja slide+0 pour l'image 0,
-    // mais on passe par la VA section pour rester generique).
-    void **slots = (void **)(slide + va);
-    int patched = 0;
-    for (uint64_t i = 0; i < count; i++) {
-        for (int t = 0; t < 3; t++) {
-            if (!targets[t]) continue;
-            if (slots[i] == targets[t]) {
-                // ecriture : __DATA_CONST,__got est passe en lecture seule apres
-                // binding. Pages iOS = 16 Ko -> alignement sur 0x4000.
-                // SI vm_protect echoue, on saute : ecrire dans une page
-                // protegee = SIGSEGV au lancer (crash).
-                vm_address_t page = (vm_address_t)((uintptr_t)&slots[i] & ~(uintptr_t)0x3FFF);
-                kern_return_t kr = vm_protect(mach_task_self(), page, (vm_size_t)0x4000, 0,
-                                              VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-                if (kr != KERN_SUCCESS) {
-                    NWLog("GOT: vm_protect refuse (%d) pour %s", kr, names[t]);
-                    continue;
-                }
-                *(origs[t]) = targets[t];
-                slots[i] = repls[t];
-                patched++;
-                NWLog("GOT rebinding: %s", names[t]);
-            }
-        }
-    }
-    NWLog("GOT: %d pointeur(s) remplace(s) dans %s,%s", patched, gotSeg->segname, gotSec->sectname);
+// Point d'entree historique (cree au demarrage).
+static void NWRebindGOT(void) {
+    NWRbFillTargets();
+    static BOOL armed = NO;
+    if (armed) return;
+    armed = YES;
+    _dyld_register_func_for_add_image(NWRbImage);
+    NWLog("rebind global arme : 7 cibles SecItem*/sysctl/uname, toutes images");
 }
 
 #pragma mark - Fake GPS (localisation par conteneur)
@@ -3167,6 +3239,64 @@ static void NWInstallFloatingButton(void) {
     y = MAX(18, MIN(y, s.height - 56 - 8));
     NWMenuButton.frame = CGRectMake(x, y, 56, 56);
     NWLog("bouton flottant installe (%.0f, %.0f)", x, y);
+
+    // Pill "Device identity" (vague 7) : petit bouton flottant complementaire,
+    // visible tant que l'app est ouverte (sauf safe-mode / masquage).
+    NWEnsureDevPill(root);
+}
+
+// ---------------------------------------------------------------------------
+// Pill "Device identity" (vague 7) — bouton flottant en haut a droite qui
+// ouvre le module Device identity. Visible par defaut ; masquable via le
+// module ("Hide button until relaunch" = one-shot consomme au boot) ou via
+// le safe-mode.
+// ---------------------------------------------------------------------------
+static UIButton *NWDevicePillButton = nil;
+
+static BOOL NWDevPillEnabled(void) {
+    @try {
+        id v = [[NSUserDefaults standardUserDefaults] objectForKey:NWDevKeyPill];
+        if (v == nil) return YES;    // defaut : le pill est visible
+        return [v boolValue];
+    } @catch (NSException *e) { return YES; }
+}
+
+static void NWEnsureDevPill(UIView *root) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ NWEnsureDevPill(root); });
+        return;
+    }
+    if (NWSafeModeOn() || NWDevPillHiddenNow || !NWDevPillEnabled()) {
+        NWDevicePillButton.hidden = YES;
+        return;
+    }
+    if (!NWDevicePillButton) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+        [b setTitle:NWL(@"dev_pill", @"Device identity", @"Identite", @"Identidad")
+          forState:UIControlStateNormal];
+        [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        b.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+        b.backgroundColor = [UIColor colorWithWhite:1 alpha:0.13];
+        b.layer.cornerRadius = 14;
+        if (@available(iOS 13.0, *)) b.layer.cornerCurve = kCACornerCurveContinuous;
+        b.layer.borderWidth = 1.0;
+        b.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.22].CGColor;
+        b.layer.shadowColor = UIColor.blackColor.CGColor;
+        b.layer.shadowOpacity = 0.45;
+        b.layer.shadowRadius = 10;
+        b.layer.shadowOffset = CGSizeMake(0, 3);
+        b.contentEdgeInsets = UIEdgeInsetsMake(5, 12, 5, 12);
+        b.accessibilityLabel = @"Device identity";
+        NWBind(b, ^(id s){ NWOpenDeviceIdentity(); });
+        NWDevicePillButton = b;
+    }
+    if (NWDevicePillButton.superview != root) [root addSubview:NWDevicePillButton];
+    NWDevicePillButton.hidden = NO;
+    CGSize s = root.bounds.size;
+    CGSize fit = [NWDevicePillButton sizeThatFits:CGSizeMake(CGFLOAT_MAX, 28)];
+    CGFloat w = MAX(96.0, fit.width);
+    CGFloat h = 28.0;
+    NWDevicePillButton.frame = CGRectMake(s.width - w - 14, 54, w, h);
 }
 
 
@@ -4049,6 +4179,8 @@ static void NWInstallFloatingButton(void) {
         [self buildChangelog];
     } else if ([self.module isEqualToString:@"support"]) {
         [self buildSupport];
+    } else if ([self.module isEqualToString:@"deviceid"]) {
+        [self buildDeviceIdentity];
     } else if ([self.module isEqualToString:@"reset"]) {
         [self buildReset];
     }
@@ -4061,6 +4193,7 @@ static void NWInstallFloatingButton(void) {
         @"ghost": @"Ghost", @"containers": @"Containers",
         @"proxy": @"Proxy", @"changelog": @"Changelog",
         @"support": @"Support", @"reset": @"Reset",
+        @"deviceid": @"Device identity",
     };
     return titles[self.module] ?: @"nine9wham";
 }
@@ -5680,6 +5813,18 @@ static void NWStartSpin(UIImageView *v) {
 // --- Changelog / Support / Reset -----------------------------------------
 
 - (void)buildChangelog {
+    [self addSection:@"Version 1.3.0 · 04/11/2026"];
+    UIStackView *v4 = [self addPaddedCard];
+    UILabel *b4 = NWLabelMake(
+        @"• Device identity floating button: device ID, family ID, machine ID\n"
+         "• Mask everything & relaunch, roll a new fingerprint, manual IDs\n"
+         "• Block Apple attestation (DeviceCheck / App Attest), off by default\n"
+         "• Keychain C calls (SecItem*) now get the real access group\n"
+         "• Group containers + CloudKit entitlements repaired for sideload\n"
+         "• Safe mode: disable all tweaks & relaunch (Support → Crash log)",
+        12.5, [UIColor colorWithWhite:0.85 alpha:1], UIFontWeightRegular);
+    [v4 addArrangedSubview:b4];
+
     [self addSection:@"Version 1.2.1 · 03/11/2026"];
     UIStackView *v3 = [self addPaddedCard];
     UILabel *b3 = NWLabelMake(
@@ -5710,7 +5855,7 @@ static void NWStartSpin(UIImageView *v) {
          "• Immediate fake GPS + world search\n"
          "• Ghost: model, iOS, RAM, locale, timezone, IDFV / IDFA\n"
          "• Containers: create, rename, switch, delete\n"
-         "• Instagram 453.0 base cleaned (no RyukGram / FLEX)",
+         "• Instagram 453.0 base cleaned (no injected extras)",
         12.5, [UIColor colorWithWhite:0.85 alpha:1], UIFontWeightRegular);
     [card addArrangedSubview:body];
 
@@ -5719,6 +5864,198 @@ static void NWStartSpin(UIImageView *v) {
     UILabel *o = NWLabelMake(@"• First release: containers, fingerprint, fake GPS, keychain vault.",
                              12.5, NWDim(), UIFontWeightRegular);
     [old addArrangedSubview:o];
+}
+
+// ---------------------------------------------------------------------------
+// Module "Device identity" (vague 7) — items exactement ceux du menu
+// flottant : Real • <court>, Machine ID / No machine ID yet, Mask
+// everything & relaunch, Roll a new fingerprint, Enter ID manually...,
+// Enter machine ID manually..., Copy current ID, Copy machine ID, Block
+// Apple attestation: Off/On, Relaunch now, Hide button until relaunch.
+// ---------------------------------------------------------------------------
+- (void)buildDeviceIdentity {
+    __weak typeof(self) weakSelf = self;
+
+    [self addSection:NWL(@"dev_title", @"Device identity",
+                         @"Identite de l'appareil",
+                         @"Identidad del dispositivo")];
+    UIStackView *c = [self addRowsCard];
+
+    NSString *curID = NWDevDevIDCurrent();
+    NSString *curMid = NWDevMidCurrent();
+
+    // Real • <5 derniers caracteres de l'identite courante>
+    [self addRow:c icon:@"fingerprint"
+            title:NWL(@"dev_real", @"Real •", @"Reel •", @"Real •")
+            value:curID.length ? NWDevShort(curID) : @"—"
+           action:nil];
+
+    // Machine ID (= mid) : "No machine ID yet" tant que non pose.
+    [self addRow:c icon:@"number"
+            title:NWL(@"dev_mid", @"Machine ID", @"ID machine", @"ID de maquina")
+            value:curMid.length ? curMid
+ : NWL(@"dev_no_mid", @"No machine ID yet", @"Aucun ID machine", @"Sin ID de maquina")
+           action:nil];
+
+    // Mask everything & relaunch
+    [self addRow:c icon:@"theatermasks"
+            title:NWL(@"dev_mask", @"Mask everything & relaunch",
+                      @"Tout masquer & relancer",
+                      @"Enmascarar todo y reiniciar")
+            value:nil
+           action:^{
+        NWDevRollIdentity(YES);
+        NWAlert(NWL(@"dev_masked", @"Masked", @"Masque", @"Enmascarado"),
+                NWL(@"dev_masked2", @"New device identity. Relaunching...",
+                    @"Nouvelle identite d'appareil. Relance...",
+                    @"Nueva identidad. Reiniciando..."));
+        NWAskRelaunchLater(@"Instagram");
+    }];
+
+    // Roll a new fingerprint
+    [self addRow:c icon:@"dice"
+            title:NWL(@"dev_roll", @"Roll a new fingerprint",
+                      @"Nouvelle empreinte", @"Nueva huella")
+            value:nil
+           action:^{
+        NWDevRollIdentity(NO);
+        [weakSelf rebuild];
+        NWAlert(NWL(@"dev_rolled", @"Rolled", @"Renouvelee", @"Renovada"),
+                NWL(@"dev_rolled2", @"Fresh device identity generated.",
+                    @"Nouvelle identite d'appareil generee.",
+                    @"Nueva identidad de dispositivo generada."));
+    }];
+
+    // Enter ID manually...
+    [self addRow:c icon:@"square.and.pencil"
+            title:NWL(@"dev_enter_id", @"Enter ID manually...",
+                      @"Entrer l'ID manuellement...",
+                      @"Introducir ID manualmente...")
+            value:nil
+           action:^{
+        UIAlertController *a = [UIAlertController
+            alertControllerWithTitle:NWL(@"dev_enter_id", @"Enter ID manually...",
+                                         @"Entrer l'ID manuellement...",
+                                         @"Introducir ID manualmente...")
+                             message:nil
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+            tf.placeholder = @"E4E47...";
+            tf.text = NWDevGetStr(NWDevKeyDevID);
+            tf.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
+            tf.autocorrectionType = UITextAutocorrectionTypeNo;
+        }];
+        [a addAction:[UIAlertAction actionWithTitle:NWL(@"dev_set", @"Set", @"Definir", @"Establecer")
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *act) {
+            NSString *v = a.textFields.firstObject.text;
+            if (v.length) {
+                NWDevSetStr(NWDevKeyDevID, v);
+                [[NSUserDefaults standardUserDefaults] setObject:@YES forKey:NWDevKeyOn];
+                [[NSUserDefaults standardUserDefaults] synchronize];
+                [weakSelf rebuild];
+            }
+        }]];
+        [a addAction:[UIAlertAction actionWithTitle:NWL(@"cancel", @"Cancel", @"Annuler", @"Cancelar")
+                                              style:UIAlertActionStyleCancel handler:nil]];
+        [weakSelf presentViewController:a animated:YES completion:nil];
+    }];
+
+    // Enter machine ID manually...
+    [self addRow:c icon:@"number.circle"
+            title:NWL(@"dev_enter_mid", @"Enter machine ID manually...",
+                      @"Entrer l'ID machine manuellement...",
+                      @"Introducir ID de maquina manualmente...")
+            value:nil
+           action:^{
+        UIAlertController *a = [UIAlertController
+            alertControllerWithTitle:NWL(@"dev_enter_mid", @"Enter machine ID manually...",
+                                         @"Entrer l'ID machine manuellement...",
+                                         @"Introducir ID de maquina manualmente...")
+                             message:nil
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+            tf.placeholder = @"687C4B6F-...";
+            tf.text = NWDevGetStr(NWDevKeyMid);
+            tf.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
+            tf.autocorrectionType = UITextAutocorrectionTypeNo;
+        }];
+        [a addAction:[UIAlertAction actionWithTitle:NWL(@"dev_set", @"Set", @"Definir", @"Establecer")
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *act) {
+            NSString *v = a.textFields.firstObject.text;
+            if (v.length) {
+                NWDevSetStr(NWDevKeyMid, v);
+                [[NSUserDefaults standardUserDefaults] setObject:@YES forKey:NWDevKeyOn];
+                [[NSUserDefaults standardUserDefaults] synchronize];
+                [weakSelf rebuild];
+            }
+        }]];
+        [a addAction:[UIAlertAction actionWithTitle:NWL(@"cancel", @"Cancel", @"Annuler", @"Cancelar")
+                                              style:UIAlertActionStyleCancel handler:nil]];
+        [weakSelf presentViewController:a animated:YES completion:nil];
+    }];
+
+    // Copy current ID
+    [self addRow:c icon:@"doc.on.doc"
+            title:NWL(@"dev_copy_id", @"Copy current ID", @"Copier l'ID actuel", @"Copiar ID actual")
+            value:nil
+           action:^{
+        NSString *v = NWDevDevIDCurrent();
+        UIPasteboard.generalPasteboard.string = v ?: @"";
+        NWAlert(NWL(@"dev_copy_id", @"Copy current ID", @"Copier l'ID actuel", @"Copiar ID actual"),
+                v.length ? v : NWL(@"dev_none", @"Nothing to copy", @"Rien a copier", @"Nada que copiar"));
+    }];
+
+    // Copy machine ID
+    [self addRow:c icon:@"doc.on.doc.fill"
+            title:NWL(@"dev_copy_mid", @"Copy machine ID", @"Copier l'ID machine", @"Copiar ID de maquina")
+            value:nil
+           action:^{
+        NSString *v = NWDevMidCurrent();
+        UIPasteboard.generalPasteboard.string = v ?: @"";
+        NWAlert(NWL(@"dev_copy_mid", @"Copy machine ID", @"Copier l'ID machine", @"Copiar ID de maquina"),
+                v.length ? v : NWL(@"dev_no_mid", @"No machine ID yet", @"Aucun ID machine", @"Sin ID de maquina"));
+    }];
+
+    // Block Apple attestation: Off / On (defaut Off)
+    [self addRow:c icon:@"shield.slash"
+            title:[NSString stringWithFormat:
+                    NWL(@"dev_attest", @"Block Apple attestation: %@",
+                        @"Bloquer l'attestation Apple : %@",
+                        @"Bloquear atestacion Apple: %@"),
+                    NWBlockAttest() ? NWL(@"dev_on", @"On", @"Oui", @"Si")
+                                    : NWL(@"dev_off", @"Off", @"Non", @"No")]
+           action:^{
+        BOOL cur = NWBlockAttest();
+        [[NSUserDefaults standardUserDefaults] setObject:(cur ? @NO : @YES) forKey:NWDevKeyAttBlock];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        [weakSelf rebuild];
+    }];
+
+    // Relaunch now
+    [self addRow:c icon:@"arrow.triangle.2.circlepath"
+            title:NWL(@"dev_relaunch", @"Relaunch now", @"Relancer maintenant", @"Reiniciar ahora")
+            value:nil
+           action:^{
+        NWAskRelaunchLater(@"Instagram");
+    }];
+
+    // Hide button until relaunch (one-shot : consomme au boot suivant)
+    [self addRow:c icon:@"eye.slash"
+            title:NWL(@"dev_hide", @"Hide button until relaunch",
+                      @"Masquer le bouton jusqu'au relancement",
+                      @"Ocultar el boton hasta reiniciar")
+            value:nil
+           action:^{
+        [[NSUserDefaults standardUserDefaults] setObject:@YES forKey:NWDevKeyHidePill];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        NWDevicePillButton.hidden = YES;
+        NWAlert(NWL(@"dev_hidden", @"Hidden", @"Masque", @"Oculto"),
+                NWL(@"dev_hidden2", @"The Device identity button is hidden until the next relaunch.",
+                    @"Le bouton Device identity est masque jusqu'au prochain relancement.",
+                    @"El boton Device identity esta oculto hasta el proximo reinicio."));
+    }];
 }
 
 - (void)buildSupport {
@@ -5784,6 +6121,37 @@ static void NWStartSpin(UIImageView *v) {
         }]];
         [a addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];
         [weakSelf presentViewController:a animated:YES completion:nil];
+    }];
+
+    // Safe mode (vague 7) : coupe TOUS les hooks au prochain lancement. En
+    // cas de doute sur un plantage, c'est le diagnostic de base.
+    [self addRow:info icon:@"power"
+            title:NWL(@"safe_off", @"Disable all tweaks & relaunch",
+                      @"Desactiver tous les tweaks & relancer",
+                      @"Desactivar todos los ajustes y reiniciar")
+            value:NWL(@"safe_off_v", @"Safe mode on next launch",
+                      @"Mode securise au prochain lancement",
+                      @"Modo seguro en el proximo arranque")
+           action:^{
+        [[NSUserDefaults standardUserDefaults] setObject:@YES forKey:NWSafeModeKey];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        NWAskRelaunchLater(@"Instagram");
+    }];
+
+    // Entree directe vers le module Device identity (le pill flottant
+    // disparait si l'utilisateur a choisi « Hide button until relaunch »).
+    [self addRow:info icon:@"fingerprint"
+            title:NWL(@"dev_open", @"Device identity",
+                      @"Identite de l'appareil", @"Identidad del dispositivo")
+            value:NWL(@"dev_open_v", @"IDs, machine ID, attestation",
+                      @"IDs, ID machine, attestation",
+                      @"IDs, ID de maquina, atestacion")
+           action:^{
+        NWCloseMenu();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            NWOpenDeviceIdentity();
+        });
     }];
 
     UILabel *foot = NWLabelMake(@"Instagram modified · isolated containers · fake GPS · ghost fingerprint",
@@ -5961,14 +6329,16 @@ static void NWStartSpin(UIImageView *v) {
 // Ouverture / fermeture du dashboard
 // ---------------------------------------------------------------------------
 
-static void NWOpenMenu(void) {
+// Ouverture d'un module du dashboard. Les appels historiques passent par
+// NWOpenMenu (Containers) ; le pill Device identity ouvre "deviceid".
+static void NWOpenModuleMenu(NSString *module) {
     if (NWDashInstance) return;
     if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
     NWInstallFloatingButton();
     NWDashboardViewController *d = [[NWDashboardViewController alloc] init];
     // Copy Blaze : le bouton flottant ouvre directement la liste Containers
     // (grille Dashboard accessible via le chevron en haut a gauche).
-    d.module = @"containers";
+    d.module = module.length ? module : @"containers";
     d.modalPresentationStyle = UIModalPresentationOverFullScreen;
     d.modalTransitionStyle = UIModalTransitionStyleCoverVertical;
     NWDashInstance = d;
@@ -5978,8 +6348,12 @@ static void NWOpenMenu(void) {
         return;
     }
     [top presentViewController:d animated:YES completion:nil];
-    NWLog("dashboard ouvert");
+    NWLog("dashboard ouvert (%@)", d.module);
 }
+
+static void NWOpenMenu(void) { NWOpenModuleMenu(@"containers"); }
+
+static void NWOpenDeviceIdentity(void) { NWOpenModuleMenu(@"deviceid"); }
 
 static void NWCloseMenu(void) {
     UIViewController *d = NWDashInstance;
@@ -6049,23 +6423,25 @@ static id NWHook_defaultSessionCfg(id self, SEL _cmd) {
 }
 
 // ---------------------------------------------------------------------------
-// Sideload fix — IGSideloadFix (opa334) reecrit ici, sans Theos
+// Sideload fix v2 — conteneurs de groupe + keychain en trois couches
 // ---------------------------------------------------------------------------
-// PREUVE (deux projets independants qui fonctionnent) :
+// PREUVE (projets independants qui fonctionnent) :
 //   - IGSideloadFix : "Fix crash on login when Instagram is installed via
 //     sideloading" -> hook NSFileManager (conteneur de groupe) + accessGroup
-//     keychain (FBSDKKeychainStore / FBKeychainItemController / UICKeyChainStore) ;
-//   - RyukGram (IPA qui marche) : hook identique de
-//     -[NSFileManager containerURLForSecurityApplicationGroupIdentifier:]
-//     visible dans son __objc_methname.
+//     keychain (FBSDKKeychainStore / FBKeychainItemController / UICKeyChainStore).
 // MECANISME : en sideloading le certificat personnel n'a PAS l'entitlement
 //   com.apple.security.application-groups -> la methode renvoie nil (et
 //   l'access group keychain reel n'est pas celui qu'Instagram demande ->
 //   errSecMissingEntitlement). Instagram plante a l'inscription sur ce nil.
-// REPLI 1 : conteneur de groupe FACTICE dans Documents/FakeGroupContainers
+// COUCHE 1 : conteneur de groupe FACTICE dans Documents/FakeGroupContainers
 //           (creer les dossiers, comme IGSideloadFix).
-// REPLI 2 : accessGroup = le VRAI groupe du certificat, obtenu en posant un
+// COUCHE 2 : accessGroup = le VRAI groupe du certificat, obtenu en posant un
 //           item bidon dans le keychain (puis supprime).
+// COUCHE 3 (vague 7) : le chemin C — Instagram appelle SecItem* en C avec
+//           kSecAttrAccessGroup en dur -> reecriture du groupe dans les
+//           wrappers SecItemAdd/CopyMatching/Update/Delete (rebinding de
+//           toutes les images), LSBundleProxy.groupContainerURLs (merge) et
+//           CKEntitlements (entitlements CloudKit).
 // Note : InstagramAppCoreFramework est ABSENT des bases 453/454 (compile en
 //   statique) -> le dlopen d'IGSideloadFix est inutile ici.
 
@@ -6116,22 +6492,163 @@ static void NWLoadAccessGroupReal(void) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Antidetection v2 : CHAPITRE C (le vrai cap manquant).
+// Instagram va au keychain en C DIRECT : SecItemAdd/CopyMatching/Update/
+// Delete avec kSecAttrAccessGroup pose en dur. Les wrappers ci-dessous sont
+// installes par le rebinding global (NWRbFillTargets) : chaque requete
+// portant un access group dont l'app n'a pas le droit est re-ecrite vers le
+// vrai groupe du certificat (NWAccessGroupReal, sonde SecItemParams).
+// ---------------------------------------------------------------------------
+
+// Reels (remplis par le rebinding global) :
+static OSStatus (*NWSecReal_Add)(CFDictionaryRef, CFTypeRef *);
+static OSStatus (*NWSecReal_CopyMatching)(CFDictionaryRef, CFTypeRef *);
+static OSStatus (*NWSecReal_Update)(CFDictionaryRef, CFDictionaryRef, CFTypeRef *);
+static OSStatus (*NWSecReal_Delete)(CFDictionaryRef);
+
+// Copie mutable de la requete avec kSecAttrAccessGroup remplace par le VRAI
+// groupe du certificat. Retour : +1 CFDictionaryRef ou NULL (rien a changer).
+static CFDictionaryRef NWKeychainRemapAccessGroup(CFDictionaryRef q) {
+    @try {
+        if (!q || CFGetTypeID(q) != CFDictionaryGetTypeID()) return NULL;
+        CFTypeRef g = CFDictionaryGetValue(q, kSecAttrAccessGroup);
+        if (!g) return NULL;
+        NWLoadAccessGroupReal();
+        if (NWAccessGroupReal.length == 0) return NULL;
+        // Groupe present mais DIFFERENT -> re-ecriture.
+        if (CFGetTypeID(g) == CFStringGetTypeID()) {
+            if ([(__bridge NSString *)g isEqualToString:NWAccessGroupReal]) return NULL;
+            NSMutableDictionary *m = [(__bridge NSDictionary *)q mutableCopy];
+            m[(__bridge id)kSecAttrAccessGroup] = NWAccessGroupReal;
+            return CFBridgingRetain(m);
+        }
+        // kSecAttrAccessGroup peut arriver en liste (plusieurs groupes).
+        if (CFGetTypeID(g) == CFArrayGetTypeID()) {
+            NSMutableArray *gs = [(__bridge NSArray *)g mutableCopy];
+            BOOL chg = NO;
+            for (NSInteger i = (NSInteger)gs.count - 1; i >= 0; i--) {
+                id e = gs[i];
+                if ([e isKindOfClass:[NSString class]] &&
+                    ![(NSString *)e isEqualToString:NWAccessGroupReal]) {
+                    gs[i] = NWAccessGroupReal; chg = YES;
+                }
+            }
+            if (!chg) return NULL;
+            NSMutableDictionary *m = [(__bridge NSDictionary *)q mutableCopy];
+            m[(__bridge id)kSecAttrAccessGroup] = gs;
+            return CFBridgingRetain(m);
+        }
+        return NULL;
+    } @catch (NSException *e) {
+        NWLog("remap accessGroup: %@", e.reason);
+        return NULL;
+    }
+}
+
+// Conteneur de groupe FACTICE (dossier dans Documents) : utilise a la fois
+// par le hook NSFileManager (REPLI 1, historique) et par LSBundleProxy.
+static NSURL *NWFakeGroupContainerURL(NSString *gid) {
+    if (![gid isKindOfClass:[NSString class]] || !gid.length) return nil;
+    NSString *root = [NWDocumentsDir() stringByAppendingPathComponent:@"FakeGroupContainers"];
+    NSURL *u = [NSURL fileURLWithPath:[root stringByAppendingPathComponent:gid] isDirectory:YES];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *sub in @[@"", @"Library", @"Library/Caches"]) {
+        NSString *p = [u.path stringByAppendingPathComponent:sub];
+        if (![fm fileExistsAtPath:p]) {
+            [fm createDirectoryAtPath:p withIntermediateDirectories:YES attributes:nil error:nil];
+        }
+    }
+    return u;
+}
+
+// LSBundleProxy : SDK Meta lit les URLs de conteneurs via le bundle proxy
+// (chemin secondaire, pas NSFileManager). On ajoute notre gp a la table
+// retournee, en gardant les entrees deja presentes (motif 'merge').
+static NSDictionary *(*NWOrig_groupContainers)(id, SEL);
+static NSDictionary *NWHook_groupContainers(id self, SEL _cmd) {
+    @try {
+        NSDictionary *real = NWOrig_groupContainers ? NWOrig_groupContainers(self, _cmd) : nil;
+        NSMutableDictionary *m = [real isKindOfClass:[NSDictionary class]]
+            ? [real mutableCopy] : [NSMutableDictionary dictionary];
+        NSString *gid = @"group.com.burbn.instagram";
+        if (!m[gid]) {
+            NSURL *u = NWFakeGroupContainerURL(gid);
+            if (u) {
+                m[gid] = u;
+                NWLog("lsbundle: appGroup resolved %@ -> %@ (sandbox fallback)", gid, u.path);
+            }
+        }
+        return m;
+    } @catch (NSException *e) {
+        NWLog("lsbundle groupContainerURLs: %@", e.reason);
+        return NWOrig_groupContainers ? NWOrig_groupContainers(self, _cmd) : nil;
+    }
+}
+
+// CloudKit : CKEntitlements checke com.apple.security.application-groups
+// pour valider les conteneurs. On ajoute notre groupe au dict passe a
+// -initWithEntitlementsDict: (les autres initialisateurs CSP restent
+// spread sans scrim: leur signature precise est inconnue, ne pas casser
+// l'ABI en devinant).
+static id (*NWOrig_ckEnt)(id, SEL, NSDictionary *);
+static id NWHook_ckEnt(id self, SEL _cmd, NSDictionary *d) {
+    @try {
+        NSMutableDictionary *m = [d isKindOfClass:[NSDictionary class]]
+            ? [d mutableCopy] : [NSMutableDictionary dictionary];
+        NSString *key = @"com.apple.security.application-groups";
+        NSMutableArray *gs = [m[key] isKindOfClass:[NSArray class]]
+            ? [m[key] mutableCopy] : [NSMutableArray array];
+        if (![gs containsObject:@"group.com.burbn.instagram"]) {
+            [gs addObject:@"group.com.burbn.instagram"];
+        }
+        m[key] = gs;
+        return NWOrig_ckEnt(self, _cmd, m);
+    } @catch (NSException *e) {
+        NWLog("ckEntitlements: %@", e.reason);
+        return NWOrig_ckEnt(self, _cmd, d);
+    }
+}
+
+static OSStatus NWHook_SecItemAdd(CFDictionaryRef q, CFTypeRef *r) {
+    CFDictionaryRef qq = NWKeychainRemapAccessGroup(q);
+    OSStatus st = NWSecReal_Add ? NWSecReal_Add(qq ? qq : q, r)
+                                : SecItemAdd(qq ? qq : q, r);
+    if (qq) CFRelease(qq);
+    return st;
+}
+
+static OSStatus NWHook_SecItemCopyMatching(CFDictionaryRef q, CFTypeRef *r) {
+    CFDictionaryRef qq = NWKeychainRemapAccessGroup(q);
+    OSStatus st = NWSecReal_CopyMatching ? NWSecReal_CopyMatching(qq ? qq : q, r)
+                                         : SecItemCopyMatching(qq ? qq : q, r);
+    if (qq) CFRelease(qq);
+    return st;
+}
+
+static OSStatus NWHook_SecItemUpdate(CFDictionaryRef q, CFDictionaryRef attrs, CFTypeRef *r) {
+    CFDictionaryRef qq = NWKeychainRemapAccessGroup(q);
+    OSStatus st = NWSecReal_Update ? NWSecReal_Update(qq ? qq : q, attrs, r)
+                                   : SecItemUpdate(qq ? qq : q, attrs, r);
+    if (qq) CFRelease(qq);
+    return st;
+}
+
+static OSStatus NWHook_SecItemDelete(CFDictionaryRef q) {
+    CFDictionaryRef qq = NWKeychainRemapAccessGroup(q);
+    OSStatus st = NWSecReal_Delete ? NWSecReal_Delete(qq ? qq : q)
+                                   : SecItemDelete(qq ? qq : q);
+    if (qq) CFRelease(qq);
+    return st;
+}
+
 // REPLI 1 : au lieu de nil, Instagram recoit un URL de conteneur valide.
 static NSURL *NWHook_containerURL(id self, SEL _cmd, NSString *gid) {
     @try {
         NSURL *real = NWOrig_containerURL ? NWOrig_containerURL(self, _cmd, gid) : nil;
         if (real) return real;                 // comportement d'origine si dispo
-        if (![gid isKindOfClass:[NSString class]] || !gid.length) return nil;
-        NSString *root = [NWDocumentsDir() stringByAppendingPathComponent:@"FakeGroupContainers"];
-        NSURL *u = [NSURL fileURLWithPath:[root stringByAppendingPathComponent:gid] isDirectory:YES];
-        NSFileManager *fm = [NSFileManager defaultManager];
-        for (NSString *sub in @[@"", @"Library", @"Library/Caches"]) {
-            NSString *p = [u.path stringByAppendingPathComponent:sub];
-            if (![fm fileExistsAtPath:p]) {
-                [fm createDirectoryAtPath:p withIntermediateDirectories:YES attributes:nil error:nil];
-            }
-        }
-        NWLog("sideload: conteneur de groupe factice -> %@", gid);
+        NSURL *u = NWFakeGroupContainerURL(gid);
+        if (u) NWLog("sideload: conteneur de groupe factice -> %@", gid);
         return u;
     } @catch (NSException *e) {
         NWLog("sideload containerURL: %@", e.reason);
@@ -6175,6 +6692,22 @@ static void NWInstallSideloadFix(void) {
     c = NSClassFromString(@"FBSDKKeychainStore");
     if (c) { NWSwizzle(c, @selector(accessGroup), (IMP)NWHook_acFBSDK, &NWOrig_acFBSDK); n++; }
 
+    // 3. Vernis v2 (le chemin completement fabrique chez eux, ici re-ecrit) :
+    //    LSBundleProxy.groupContainerURLs (table merge) + CKEntitlements
+    //    (com.apple.security.application-groups ajoute aux dicts Client).
+    Class lbp = NSClassFromString(@"LSBundleProxy");
+    if (lbp) {
+        NWSwizzle(lbp, @selector(groupContainerURLs),
+                  (IMP)NWHook_groupContainers, &NWOrig_groupContainers);
+        n++;
+    }
+    Class ck = NSClassFromString(@"CKEntitlements");
+    if (ck) {
+        NWSwizzle(ck, @selector(initWithEntitlementsDict:),
+                  (IMP)NWHook_ckEnt, &NWOrig_ckEnt);
+        n++;
+    }
+
     NWLoadAccessGroupReal();
     NWLog("sideload fix installe (conteneur de groupe + %d accessGroup, groupe=%@)",
           n, NWAccessGroupReal ?: @"(reel si dispo)");
@@ -6192,6 +6725,401 @@ static void NWFlushOnExit(void) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Device identity — identite PAR APPAREIL (device id, family device id,
+// vendor id, machine id = mid) + blocage de l'attestation Apple.
+// Portefeuille : les cles EPINGLEES sont les NOTRES (prefixe nw9.*) ; la
+// lecture se fait par conteneur (fp deviceId/fdid/mid) et le pin global
+// (masque manuel) gagne quand il est pose. L'attestation est OFF par defaut
+// (comme chez eux).
+// ---------------------------------------------------------------------------
+
+// Cles device identity : #define (visibles avant leur usage dans le fil) :
+#define NWDevKeyDevID    @"nw9.dev.id"
+#define NWDevKeyFDID     @"nw9.dev.fdid"
+#define NWDevKeyMid      @"nw9.dev.mid"
+#define NWDevKeyMidHdr   @"nw9.dev.midhdr"
+#define NWDevKeyAttBlock @"nw9.dev.noattest"
+#define NWDevKeyHidePill @"nw9.dev.hidepill"   // one-shot (jusqu'au relaunch)
+#define NWDevKeyPill     @"nw9.dev.pill"       // bouton flottant (defaut ON)
+#define NWDevKeyOn       @"nw9.dev.on"         // masque global
+#define NWSafeModeKey    @"nw9.safe.mode"      // safe-mode one-shot
+
+static BOOL NWDevPillHiddenNow = NO;
+
+static NSString *NWDevGetStr(NSString *k) {
+    @try {
+        NSString *v = [[NSUserDefaults standardUserDefaults] stringForKey:k];
+        return (v && v.length) ? v : nil;
+    } @catch (NSException *e) { NWLog("devGetStr: %@", e.reason); return nil; }
+}
+
+static void NWDevSetStr(NSString *k, NSString *v) {
+    @try {
+        NSUserDefaults *u = [NSUserDefaults standardUserDefaults];
+        if (v && v.length) [u setObject:v forKey:k];
+        else [u removeObjectForKey:k];
+        if (v && v.length) [u synchronize];
+    } @catch (NSException *e) { NWLog("devSetStr: %@", e.reason); }
+}
+
+static BOOL NWDevBool(NSString *k) {
+    @try {
+        return [[[NSUserDefaults standardUserDefaults] objectForKey:k] boolValue];
+    } @catch (NSException *e) { return NO; }
+}
+
+static BOOL NWDevMaskOn(void)   { return NWDevBool(NWDevKeyOn); }
+static BOOL NWBlockAttest(void) { return NWDevBool(NWDevKeyAttBlock); }
+static BOOL NWSafeModeOn(void)  { return NWDevBool(NWSafeModeKey); }
+
+// Valeur activee : pin global > empreinte du conteneur > nil.
+static NSString *NWDevDevIDCurrent(void) {
+    if (NWDevMaskOn()) {
+        NSString *g = NWDevGetStr(NWDevKeyDevID);
+        if (g) return g;
+    }
+    return NWFPStr(@"deviceId");
+}
+static NSString *NWDevFDIDCurrent(void) {
+    if (NWDevMaskOn()) {
+        NSString *g = NWDevGetStr(NWDevKeyFDID);
+        if (g) return g;
+    }
+    return NWFPStr(@"fdid");
+}
+static NSString *NWDevMidCurrent(void) {
+    if (NWDevMaskOn()) {
+        NSString *g = NWDevGetStr(NWDevKeyMid);
+        if (g) return g;
+    }
+    return NWFPStr(@"mid");
+}
+static NSString *NWDevMidHdrCurrent(void) {
+    if (NWDevMaskOn()) {
+        NSString *g = NWDevGetStr(NWDevKeyMidHdr);
+        if (g) return g;
+    }
+    return NWFPStr(@"midHeader");
+}
+
+// Suffixe court (5 caracteres) affiche a cote de « Real • ».
+static NSString *NWDevShort(NSString *s) {
+    NSString *t = s ?: @"";
+    if (t.length < 5) return t;
+    return [t substringFromIndex:t.length - 5];
+}
+
+// (Re)genere l'empreinte du conteneur actif + les valeurs epinglees globales.
+static void NWDevRollIdentity(BOOL makeMask) {
+    @try {
+        if (NWActiveID) {
+            NSDictionary *nfp = NWGenerateFingerprint();
+            if (nfp) { NWActiveFP = nfp; NWUpdateActiveFP(nfp); }
+        }
+        NSUserDefaults *u = [NSUserDefaults standardUserDefaults];
+        [u setObject:[[NSUUID UUID] UUIDString] forKey:NWDevKeyDevID];
+        [u setObject:[[NSUUID UUID] UUIDString] forKey:NWDevKeyFDID];
+        [u setObject:[[NSUUID UUID] UUIDString] forKey:NWDevKeyMid];
+        [u setObject:[[NSUUID UUID] UUIDString] forKey:NWDevKeyMidHdr];
+        if (makeMask) [u setObject:@YES forKey:NWDevKeyOn];
+        [u synchronize];
+    } @catch (NSException *e) { NWLog("devRoll: %@", e.reason); }
+}
+
+// — getDeviceId : scan GLOBAL des classes, uniqueseaux des classes qui
+// definite le selector avec un retour objet ('@'). Chaque implementation
+// unique est hookiee une fois ; l'implementation reelle est garde par classe.
+static NSMutableDictionary<NSString *, NSValue *> *NWGetIdOrigMap = nil;
+
+static id NWHook_getDeviceId(id self, SEL _cmd) {
+    @try {
+        NSString *p = NWDevMaskOn() ? NWDevDevIDCurrent() : nil;
+        if (p) return p;
+        NSValue *v = nil;
+        Class c = object_getClass(self);
+        while (c && !v) {
+            v = NWGetIdOrigMap[NSStringFromClass(c)];
+            c = c.superclass;
+        }
+        IMP old = v ? (IMP)v.pointerValue : NULL;
+        if (old) return ((id (*)(id, SEL))old)(self, _cmd);
+        return nil;
+    } @catch (NSException *e) {
+        NWLog("getDeviceId: %@", e.reason);
+        return nil;
+    }
+}
+
+static void NWInstall_getDeviceId(void) {
+    SEL sel = sel_getUid("getDeviceId");
+    unsigned int cn = 0;
+    Class *classes = objc_copyClassList(&cn);
+    if (!classes) return;
+    NSMutableArray<NSValue *> *seen = [NSMutableArray array];
+    NSMutableArray<Class *> *targets = [NSMutableArray array];
+    for (unsigned int i = 0; i < cn; i++) {
+        Class c = classes[i];
+        Method m = class_getInstanceMethod(c, sel);
+        if (!m) continue;
+        char *rt = method_copyReturnType(m);
+        if (!rt) continue;
+        BOOL isObj = (rt[0] == '@');
+        free(rt);
+        if (!isObj) continue;
+        // classe reelement DEFINISSANTE : on remonte tant que la
+        // superclass a la meme implementation.
+        Class def = c;
+        IMP imp = method_getImplementation(m);
+        Class up = class_getSuperclass(c);
+        while (up) {
+            Method mu = class_getInstanceMethod(up, sel);
+            if (!mu || method_getImplementation(mu) != imp) break;
+            def = up;
+            up = class_getSuperclass(up);
+        }
+        NSValue *iv = [NSValue valueWithPointer:imp];
+        if ([seen containsObject:iv]) continue;   // inherited alike
+        [seen addObject:iv];
+        [targets addObject:def];
+    }
+    free(classes);
+    if (!NWGetIdOrigMap) NWGetIdOrigMap = [NSMutableDictionary dictionary];
+    for (Class c in targets) {
+        Method m = class_getInstanceMethod(c, sel);
+        if (!m) continue;
+        IMP old = method_getImplementation(m);
+        NWGetIdOrigMap[NSStringFromClass(c)] = [NSValue valueWithPointer:old];
+        method_setImplementation(m, (IMP)NWHook_getDeviceId);
+        NWLog("device id : getDeviceId hook (%s)", class_getName(c));
+    }
+}
+
+// — FBFamilyDeviceID : familyDeviceIDWith...SourceFile/SourceLine (local).
+// Methodes de classe (FB style) OU d'instance, selon le charge reel.
+static IMP NWOrig_fdid = NULL;
+static IMP NWOrig_fdidCached = NULL;
+
+static id NWHook_fdid(id self, SEL _cmd, id cfg, id file, int line) {
+    @try {
+        NSString *p = NWDevMaskOn() ? NWDevFDIDCurrent() : nil;
+        if (p) return p;
+        if (NWOrig_fdid) return ((id (*)(id, SEL, id, id, int))NWOrig_fdid)(self, _cmd, cfg, file, line);
+        return nil;
+    } @catch (NSException *e) { NWLog("fdid: %@", e.reason); return nil; }
+}
+
+static id NWHook_fdidCached(id self, SEL _cmd, id cfg, id file, int line) {
+    @try {
+        NSString *p = NWDevMaskOn() ? NWDevFDIDCurrent() : nil;
+        if (p) return p;
+        if (NWOrig_fdidCached) return ((id (*)(id, SEL, id, id, int))NWOrig_fdidCached)(self, _cmd, cfg, file, line);
+        return nil;
+    } @catch (NSException *e) { NWLog("fdidCached: %@", e.reason); return nil; }
+}
+
+static void NWInstall_FBFamilyDeviceID(void) {
+    Class c = NSClassFromString(@"FBFamilyDeviceID");
+    if (!c) { NWLog("device id : FBFamilyDeviceID absent"); return; }
+    SEL s1 = sel_getUid("familyDeviceIDWithConfiguration:SourceFile:SourceLine:");
+    SEL s2 = sel_getUid("cachedFamilyDeviceIDWithConfiguration:SourceFile:SourceLine:");
+    Method m1 = class_getClassMethod(c, s1);
+    Method i1 = class_getInstanceMethod(c, s1);
+    Method m2 = class_getClassMethod(c, s2);
+    Method i2 = class_getInstanceMethod(c, s2);
+    if (m1)      { NWOrig_fdid = method_getImplementation(m1); method_setImplementation(m1, (IMP)NWHook_fdid); }
+    else if (i1) { NWOrig_fdid = method_getImplementation(i1); method_setImplementation(i1, (IMP)NWHook_fdid); }
+    if (m2)      { NWOrig_fdidCached = method_getImplementation(m2); method_setImplementation(m2, (IMP)NWHook_fdidCached); }
+    else if (i2) { NWOrig_fdidCached = method_getImplementation(i2); method_setImplementation(i2, (IMP)NWHook_fdidCached); }
+    if (NWOrig_fdid || NWOrig_fdidCached) NWLog("device id : FBFamilyDeviceID hook pose");
+}
+
+// — machine ID (mid) : les 2 cles prefrees d'Instagram
+//   instagram.mid / com.instagram.device.midheader. Lecture TOMBEE sur la
+//   valeur epinglee quand le mask est pose ; écriture serveur bloque tant
+//   que le pin existe (motif "pinned machine ID").
+static void (*NWOrig_udsSet)(id, SEL, id, id);
+static void (*NWOrig_udsRemove)(id, SEL, id);
+
+// Garde de reentrance (TLS) : nos propres lectures (NWDevMaskOn ->
+// objectForKey:) repassent par ce hook. Sans garde = recursion infinie.
+static __thread BOOL NWUdsInHook = NO;
+
+static BOOL NWDevIsMidKey(id key) {
+    if (![key isKindOfClass:[NSString class]]) return NO;
+    return ([key isEqualToString:@"instagram.mid"] ||
+            [key isEqualToString:@"com.instagram.device.midheader"]);
+}
+
+static id (*NWOrig_udsObject)(id, SEL, id);
+static id NWHook_udsObject(id self, SEL _cmd, id key) {
+    if (NWUdsInHook) {
+        return NWOrig_udsObject ? NWOrig_udsObject(self, _cmd, key) : nil;
+    }
+    NWUdsInHook = YES;
+    id result = nil;
+    @try {
+        if (NWDevMaskOn() && NWDevIsMidKey(key)) {
+            // mid et midheader ont chacun leur valeur epinglee (repli : mid).
+            NSString *p = [key isEqualToString:@"com.instagram.device.midheader"]
+                ? NWDevMidHdrCurrent() : NWDevMidCurrent();
+            if (p) { result = p; NWUdsInHook = NO; return result; }
+        }
+        result = NWOrig_udsObject ? NWOrig_udsObject(self, _cmd, key) : nil;
+    } @catch (NSException *e) {
+        result = NWOrig_udsObject ? NWOrig_udsObject(self, _cmd, key) : nil;
+    }
+    NWUdsInHook = NO;
+    return result;
+}
+
+static void NWHook_udsSet(id self, SEL _cmd, id value, id key) {
+    if (NWUdsInHook) {
+        if (NWOrig_udsSet) NWOrig_udsSet(self, _cmd, value, key);
+        return;
+    }
+    NWUdsInHook = YES;
+    @try {
+        if (NWDevMaskOn() && NWDevIsMidKey(key)) {
+            NWLog("mid : ecriture serveur bloquee (machine id epingle)");
+            NWUdsInHook = NO;
+            return;
+        }
+    } @catch (NSException *e) { NWLog("udsSet: %@", e.reason); }
+    NWUdsInHook = NO;
+    if (NWOrig_udsSet) NWOrig_udsSet(self, _cmd, value, key);
+}
+
+static void NWHook_udsRemove(id self, SEL _cmd, id key) {
+    if (NWUdsInHook) {
+        if (NWOrig_udsRemove) NWOrig_udsRemove(self, _cmd, key);
+        return;
+    }
+    NWUdsInHook = YES;
+    @try {
+        if (NWDevMaskOn() && NWDevIsMidKey(key)) {
+            NWLog("mid : suppression serveur bloquee (machine id epingle)");
+            NWUdsInHook = NO;
+            return;
+        }
+    } @catch (NSException *e) { NWLog("udsRemove: %@", e.reason); }
+    NWUdsInHook = NO;
+    if (NWOrig_udsRemove) NWOrig_udsRemove(self, _cmd, key);
+}
+
+static void NWInstall_UdsHooks(void) {
+    NWSwizzle([NSUserDefaults class], @selector(objectForKey:),
+              (IMP)NWHook_udsObject, &NWOrig_udsObject);
+    NWSwizzle([NSUserDefaults class], @selector(setObject:forKey:),
+              (IMP)NWHook_udsSet, &NWOrig_udsSet);
+    NWSwizzle([NSUserDefaults class], @selector(removeObjectForKey:),
+              (IMP)NWHook_udsRemove, &NWOrig_udsRemove);
+    NWLog("device id : hooks NSUserDefaults (mid) poses");
+}
+
+// — atestation Apple : DCDevice (DeviceCheck) + DCAppAttestService.
+// Requete : handler(nil, error) quand le blocage est actif. OFF par defaut.
+static void (*NWOrig_dcToken)(id, SEL, void (^)(NSData *, NSError *));
+static void NWHook_dcToken(id self, SEL _cmd, void (^h)(NSData *, NSError *)) {
+    @try {
+        if (NWBlockAttest()) {
+            NWLog("attestation (DeviceCheck) bloquee");
+            if (h) {
+                NSError *err = [NSError errorWithDomain:@"nine9wham.device" code:9001
+                                                userInfo:@{ NSLocalizedDescriptionKey:
+                        NWL(@"att_block", @"Apple attestation blocked by user",
+                            @"Attestation Apple bloquee par l'utilisateur",
+                            @"Atestacion Apple bloqueada por el usuario") }];
+                h(nil, err);
+            }
+            return;
+        }
+    } @catch (NSException *e) { NWLog("dcToken: %@", e.reason); }
+    if (NWOrig_dcToken) NWOrig_dcToken(self, _cmd, h);
+}
+
+static void (*NWOrig_attest)(id, SEL, NSString *, NSData *, void (^)(id, NSError *));
+static void NWHook_attest(id self, SEL _cmd, NSString *keyID, NSData *dataHash,
+                          void (^h)(id, NSError *)) {
+    @try {
+        if (NWBlockAttest()) {
+            NWLog("attestation (AppAttest) bloquee");
+            if (h) {
+                NSError *err = [NSError errorWithDomain:@"nine9wham.device" code:9001
+                                                userInfo:@{ NSLocalizedDescriptionKey:
+                        NWL(@"att_block", @"Apple attestation blocked by user",
+                            @"Attestation Apple bloquee par l'utilisateur",
+                            @"Atestacion Apple bloqueada por el usuario") }];
+                h(nil, err);
+            }
+            return;
+        }
+    } @catch (NSException *e) { NWLog("attest: %@", e.reason); }
+    if (NWOrig_attest) NWOrig_attest(self, _cmd, keyID, dataHash, h);
+}
+
+static void NWInstallAttestation(void) {
+    Class dc = NSClassFromString(@"DCDevice");
+    if (dc) {
+        NWSwizzle(dc, @selector(generateTokenWithCompletionHandler:),
+                  (IMP)NWHook_dcToken, &NWOrig_dcToken);
+        NWLog("attestation : DCDevice hook pose");
+    } else {
+        NWLog("attestation : DCDevice absent");
+    }
+    Class aa = NSClassFromString(@"DCAppAttestService");
+    if (aa) {
+        NWSwizzle(aa, @selector(attestKey:clientDataHash:completionHandler:),
+                  (IMP)NWHook_attest, &NWOrig_attest);
+        NWLog("attestation : DCAppAttestService hook pose");
+    } else {
+        NWLog("attestation : DCAppAttestService absent");
+    }
+}
+
+// Installation centrale + truncature du flag one-shot du bouton flottant.
+static void NWInstallDeviceIdentity(void) {
+    @try {
+        NSUserDefaults *u = [NSUserDefaults standardUserDefaults];
+        NWDevPillHiddenNow = ([u objectForKey:NWDevKeyHidePill] != nil);
+        if (NWDevPillHiddenNow) [u removeObjectForKey:NWDevKeyHidePill];
+
+        NWInstall_getDeviceId();
+        NWInstall_FBFamilyDeviceID();
+        NWInstall_UdsHooks();
+        NWInstallAttestation();
+    } @catch (NSException *e) {
+        NWLog("device identity install: %@", e.reason);
+    }
+}
+
+// Interface Safe mode : une UIAlertAction + presentation depuis le top VC.
+static void NWPresentSafeModeUI(void) {
+    UIViewController *top = NWTopVC();
+    if (!top) return;
+    if (top.presentedViewController) return;
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:NWL(@"safe_t", @"Safe mode", @"Mode securise", @"Modo seguro")
+                         message:NWL(@"safe_m",
+                             @"All nine9wham tweaks are OFF. If animations/clicks look odd, tap re-enable to turn everything back on.",
+                             @"Tous les tweaks nine9wham sont OFF. Si l'appli est etrange, appuyez sur re-activer pour tout remettre.",
+                             @"Todos los cambios de nine9wham estan desactivados. Si la app es extrana, toca reactivar.")
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:
+        NWL(@"safe_re", @"Re-enable & relaunch", @"Re-activer & relancer", @"Reactivar y reiniciar")
+        style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+            [[NSUserDefaults standardUserDefaults] removeObjectForKey:NWSafeModeKey];
+            [[NSUserDefaults standardUserDefaults] synchronize];
+            NWAskRelaunchLater(@"Instagram");
+        }]];
+    [a addAction:[UIAlertAction actionWithTitle:
+        NWL(@"safe_keep", @"Keep safe mode", @"Rester en mode securise", @"Mantener modo seguro")
+        style:UIAlertActionStyleCancel handler:nil]];
+    @try {
+        [top presentViewController:a animated:YES completion:nil];
+    } @catch (NSException *e) { NWLog("safe mode UI: %@", e.reason); }
+}
+
 __attribute__((constructor))
 static void NWInit(void) {
     @autoreleasepool {
@@ -6203,6 +7131,26 @@ static void NWInit(void) {
         //    Sans cela Instagram plante a l'inscription en sideloading
         //    (certificat personnel sans entitlement de groupe).
         NWInstallSideloadFix();
+
+        // 0 ter. SAFE MODE (vague 7) : si l'utilisateur a demande la coupe
+        //    totale (Support -> "Disable all tweaks & relaunch"), on
+        //    n'installe AUCUN hook empreinte/GPS/rebind/proxy/UI et on
+        //    propose la reactivation. Le fix sideload + le rapporteur de
+        //    crash restent actifs : sans eux l'app ne peut pas demarrer.
+        if (NWSafeModeOn()) {
+            NWLog("SAFE MODE : hooks empreinte/GPS/rebind/UI non installes");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                @try { NWPresentSafeModeUI(); } @catch (NSException *e) { NWLog("safe: %@", e.reason); }
+            });
+            return;
+        }
+
+        // 0 quater. Device identity (vague 7) : hooks getDeviceId (scan
+        //    global des classes), FBFamilyDeviceID, machine ID (mid via
+        //    NSUserDefaults) et attestation Apple. Consomme aussi le flag
+        //    one-shot « Hide button until relaunch » du pill.
+        NWInstallDeviceIdentity();
 
         NWLog("demarrage — Instagram %@", UIDevice.currentDevice.systemVersion);
 

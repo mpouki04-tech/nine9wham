@@ -73,11 +73,29 @@ def main():
         raise SystemExit(f"ERREUR: pas un Mach-O 64-bit LE (magic=0x{magic:08X})")
 
     cmds = []
+    already = set()
+    off = 32
+    # Idempotence : la base v7 reference deja @rpath/Peter.dylib en LC faible
+    # (re-ecrit in-place dans la base vide sideload_clean). Si TOUTES les
+    # commandes demandees sont presentes, il n'y a rien a injecter.
+    for _c in range(ncmds):
+        cmd, cmdsize = struct.unpack_from("<II", data, off)
+        if cmd in (LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB):
+            po = struct.unpack_from("<I", data, off + 8)[0]
+            end = data.index(b"\0", off + po)
+            already.add(data[off + po : end].decode("ascii", "replace"))
+        off += cmdsize
     for install in names:
         if not install.startswith("@rpath/") and not install.startswith("@"):
             install = "@rpath/" + install
+        if install in already:
+            print(f"Deja lie : {install} -> no-op")
+            continue
         cmds.append(build_weak_dylib_cmd(install.encode("ascii")))
         print(f"Prepare: {install}")
+    if not cmds:
+        print("OK: rien a injecter, le binaire reference deja Peter.dylib")
+        return
     total_new = sum(len(c) for c in cmds)
 
     insert_at = 32 + sizeofcmds
