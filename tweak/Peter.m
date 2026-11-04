@@ -3297,7 +3297,12 @@ static void NWEnsureDevPill(UIView *root) {
         b.layer.shadowOpacity = 0.45;
         b.layer.shadowRadius = 10;
         b.layer.shadowOffset = CGSizeMake(0, 3);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        // Meme empreinte que l'autre bouton : warning deprecation deja
+        // present ailleurs, on n'ajoute pas un 14e warning a la CI.
         b.contentEdgeInsets = UIEdgeInsetsMake(5, 12, 5, 12);
+#pragma clang diagnostic pop
         b.accessibilityLabel = @"Device identity";
         NWBind(b, ^(id s){ NWOpenDeviceIdentity(); });
         NWDevicePillButton = b;
