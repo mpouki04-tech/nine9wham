@@ -53,7 +53,7 @@ Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). San
 - **Anti-crash création de compte** : hook proxy (`NSURLSessionConfiguration`) rendu inerte (`NSNull`/mauvais types = exception fatale au moment de la vérification du pseudo) et **repli `ephemeralSessionConfiguration` si l’original lève** (retourner `nil` planterait `sessionWithConfiguration:`) ; `@try` sur **tous** les hooks `NSLocale` / `NSCalendar` / `preferredLanguages` ; identifiants de locale **validés** (ISO2 + langue 2-3 lettres → repli `en_US` / `en`) ; tags `AppleLanguages` en **BCP-47 strict** (plus d’underscore) ; `setDelegate:` CLLocation **encapsulé** (anti-exception) ; `vm_protect` du rebinding GOT **vérifié** (échec = pas d’écriture → pas de SIGSEGV).
 - **UI 100 % anglaise** : les dernières chaînes françaises (Backup & Restore : export/import, mot de passe, *Cancel*) passées par `NWL(...)` → EN / FR / ES à chaud.
 
-### Vague 5 (build actuel)
+### Vague 5
 
 - **X et chevron réellement touchables** : les `leftSlot` / `rightSlot` de la barre étaient des `UIView` **sans hauteur intrinsèque** dans une stack centrée → hauteur 0 → les boutons 32 × 32 tombaient **hors des `bounds`** et `hitTest` renvoyait `nil` (visibles, mais intouchables). **Fix** : hauteur explicite **44 pt** sur les deux slots.
 - **`@nine9wham` centré au point près** : padding de **26 pt** en tête du groupe central (`[pad, badge, titles, lang]`) + contrainte `spacerR.width == spacerL.width` → le couple pastille + titre tombe **exactement** au centre de la barre (sans ce padding, il restait ~17 pt sur la gauche).
@@ -63,28 +63,38 @@ Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). San
 ### Vague 6a — fix d'inscription + base 454
 
 - **Cause du crash à la création de compte identifiée** : ce n'est **pas** le fichier de base — c'est le **sideloading lui-même**. Un IPA décrypté « pur » installé avec un certificat personnel **n'a pas l'entitlement** `com.apple.security.application-groups` → `-[NSFileManager containerURLForSecurityApplicationGroupIdentifier:]` renvoie **nil**, et l'*access group* keychain réel n'est pas celui qu'Instagram demande (`errSecMissingEntitlement`). Instagram plante sur ce `nil` à l'inscription/connexion.
-- **Preuve par deux projets indépendants qui fonctionnent** : `IGSideloadFix` (opa334) — *« Fix crash on login when Instagram is installed via sideloading »* — et **RyukGram**, dont l'IPA qui marche contient le **hook identique** de `containerURLForSecurityApplicationGroupIdentifier:` (visible dans son `__objc_methname`).
+- **Preuve par deux projets indépendants qui fonctionnent** : `IGSideloadFix` (opa334) — *« Fix crash on login when Instagram is installed via sideloading »* — et une **IPA modifiée qui marche**, dont l'`__objc_methname` contient le **hook identique** de `containerURLForSecurityApplicationGroupIdentifier:`.
 - **Correctif intégré au `Peter.dylib`** (option « compiler soi-même », sans Theos, fidèle à IGSideloadFix) :
   - **repli 1** — le hook de conteneur de groupe renvoie un **faux conteneur** `Documents/FakeGroupContainers/<gid>` (avec `Library` + `Library/Caches`) au lieu de `nil` ; l'original est conservé s'il répond ;
   - **repli 2** — `accessGroup` de `FBKeychainItemController` / `UICKeyChainStore` (et `FBSDKKeychainStore` si présent) renvoie le **vrai** groupe du certificat, obtenu avec un item bidon posé puis supprimé du keychain ;
   - classes absentes **ignorées** (`FBSDKKeychainStore` n'existe plus en 453/454), tout est sous `@try`, 3 tentatives maximum, `@try` sur chaque hook.
   - `InstagramAppCoreFramework` est **absent** des bases 453/454 (compilé en statique) → le `dlopen` d'IGSideloadFix est inutile ici (vérifié dans le binaire).
-- **Base passée de 453.0.0 à 454.0.0** : la nouvelle base (`com.burbn.instagram_v454.0.0_und3fined.ipa`, 3647 entrées, `cryptid=0`, rpath présent, sans dylib) est vérifiée en local puis téléversée dans la release `base` ; le CI publie désormais `nine9wham_instagram_454.ipa`.
+- **Base passée de 453.0.0 à 454.0.0** puis **nettoyée** : la base (`com.burbn.instagram_v454.0.0_sideload_clean.ipa`, `cryptid=0`, rpath présent, **aucun dylib**) est vérifiée en local puis téléversée dans la release `base` ; le CI publie désormais `nine9wham_instagram_454.ipa`.
 - **Rapporteur de crash toujours actif** : si un plantage subsistait, **Support → « Crash log »** donne le nom, la raison et la pile — envoyez-la moi.
 
-### Vague 6b (build actuel) — langue PAR CONTENEUR + pays → langue/fuseau
+### Vague 6b — langue PAR CONTENEUR + pays → langue/fuseau
 
 - **Langue du téléphone = celle du conteneur, pas du menu.** `NWEffectiveLocale()` est réécrit : il lit **d'abord** la locale du conteneur actif (`fp["locale"]`, ex. `es_ES`) et n'utilise la langue du menu que comme repli. Avant : conteneur Espagne + menu anglais donnait `en_ES` → Instagram ne détectait **jamais** la langue du conteneur. Maintenant chaque conteneur est vu comme un appareil séparé dont la langue est celle de sa locale.
 - **Deux chemins de détection MANQUAIENT** et sont maintenant hookés (empreinte complète) : `+[NSLocale autoupdatingCurrentLocale]` (2ᵉ lecture de la « langue du téléphone » par les SDK Meta, avec cache) et `-[NSBundle preferredLocalizations]` (bundle principal uniquement — c'est par là que la langue de l'UI d'Instagram passe). Avant, `currentLocale` + `preferredLanguages` étaient couverts ; avec ces 2 nouveaux, les 4 chemins de détection de langue sont fermés.
 - **Le pays choisi suit tout** : nouvelle table de 48 pays `[code, langue, fuseau]` (`NWCountryRows`). Quand un lieu est choisi (goulot `NWApplyLocation` = carte du monde, cellule conteneur, sheet « New Container »), le **nom du pays en fin de label** est reconnu (reverse geocoding Nominatim, ex. *"…, United States"*) → le conteneur adopte **langue + fuseau + locale** du pays (`NWSetContainerLocale` écrit `fp["locale"]` + `fp["tz"]`, persistés). Choisir États-Unis → l'anglais (`en_US`, `America/New_York`) est appliqué au conteneur, immédiat pour l'actif + écrit dans `AppleLanguages`/`AppleLocale` pour le restart.
 - **Le menu ne pilote plus la langue du téléphone** : il ne change que l'UI du dashboard (traduits à chaud FR/EN/ES via `NWL`). La langue du téléphone est dérivée du conteneur actif uniquement (règle inchangée : pas d'écriture iOS quand le Ghost est OFF).
 
+### Vague 7 (build actuel) — architecture anti-détection + Device identity
+
+- **Base propre** : `com.burbn.instagram_v454.0.0_sideload_clean.ipa` — les résiduels d'un autre tweak (bundle, dylib, dylib d'injection) ont été retirés de l'archive et les 2 `LC_LOAD_WEAK_DYLIB` réécrits vers `@rpath/Peter.dylib` ; `cryptid=0`, **minOS 15.0**, zéro résidu (strings + Info.plist).
+- **Rebinding de toutes les images** : le rebind GOT (`uname` / `sysctl` / `sysctlbyname` + **`SecItemAdd/CopyMatching/Update/Delete`**) parcourt **toutes** les sections `__got` / `__auth_got` / `__la_symbol_ptr` / `__nl_symbol_ptr` de **toutes les images** déjà chargées **et** de celles chargées ensuite (`_dyld_register_func_for_add_image`), avec exclusion propre de notre image (`dladdr`) et `vm_protect VM_PROT_COPY`.
+- **Keychain en C** : les appels `SecItem*` faits en C par Instagram passent par des **wrappers** qui réécrivent `kSecAttrAccessGroup` vers le **vrai** groupe du certificat (item bidon → groupe réel) — repli direct vers l'API si pas encore rebindé.
+- **Conteneurs v2** : `-[LSBundleProxy groupContainerURLs]` (merge du faux conteneur) et `-[CKEntitlements initWithEntitlementsDict:]` (entitlement `com.apple.security.application-groups` injecté pour CloudKit), en plus du hook `NSFileManager` d'origine.
+- **Module « Device identity »** (bouton pill flottant haut-droite + ligne dans Support) : `Real • <ID court>`, `Machine ID` / `No machine ID yet`, **Mask everything & relaunch**, **Roll a new fingerprint**, saisie manuelle ID et machine ID, copie des deux, **Block Apple attestation** (DeviceCheck / App Attest, **Off** par défaut), **Relaunch now**, **Hide button until relaunch**. Les hooks couvrent `getDeviceId` (scan global des classes), `FBFamilyDeviceID`, `instagram.mid` / `com.instagram.device.midheader` (NSUserDefaults, écriture serveur bloquée) et l'IDFV (pin conteneur > valeur d'origine).
+- **Safe mode** : *Support → « Disable all tweaks & relaunch »* coupe **tous** les hooks au prochain lancement (seuls le rapporteur de crash et le fix sideload restent actifs) ; l'UI de réactivation propose *Re-enable & relaunch* / *Keep*.
+- **`inject_dylib.py` idempotent** : si le `LC_LOAD_WEAK_DYLIB` est déjà présent, le script ne fait rien (rebuild local sûr).
+
 ---
 
 ## Installer
 
 1. Télécharger l'IPA : **[Release `nine9wham`](https://github.com/mpouki04-tech/nine9wham/releases/download/nine9wham/nine9wham_instagram_454.ipa)**
-   sha256 : `df157b7afcb5eafb1a16667c82404537325d08af90eb77fba4eedcbdd378c5ce` (346 750 027 octets)
+   sha256 : `5111e22086e8c65312a3cf497f9650e1e43ba908853f12460240e0677f2ff62e` (344 232 530 octets)
 2. Ouvrir **Sideloadly** → sélectionner l'IPA → Install (certificat 7 jours, même Apple ID). Sideloadly est ici **uniquement** l'outil d'installation : aucune licence Blaze/Bumble n'est incluse.
 3. Lancer Instagram → le bouton **carré translucide (4 carrés)** apparaît **centré en bas**.
 
@@ -116,7 +126,7 @@ nine9wham/
 └── .github/workflows/build.yml   # CI macOS : compile → injecte → repack → release
 ```
 
-**Méthode d'injection** (reprise de RyukGram) : `LC_LOAD_WEAK_DYLIB` `@rpath/Peter.dylib` + `LC_RPATH @executable_path/Frameworks` (déjà présent dans la base 454). Aucun `LC_LOAD_DYLIB` fort → l'app démarre même si le dylib manque.
+**Méthode d'injection** : `LC_LOAD_WEAK_DYLIB` `@rpath/Peter.dylib` + `LC_RPATH @executable_path/Frameworks` (déjà présent dans la base 454). Aucun `LC_LOAD_DYLIB` fort → l'app démarre même si le dylib manque.
 
 **Hooks** :
 - ObjC : `UIDevice` (name/model/idfv), `NSProcessInfo` (mémoire/CPU, **gated par le switch Ghost** — OFF = valeurs réelles), `NSLocale`, `NSTimeZone`, `ASIdentifierManager` (IDFA).
@@ -134,14 +144,14 @@ nine9wham/
 
 ## Choix de la base
 
-La consigne initiale visait la base **449** (celle de RyukGram). La base utilisée est **454.0.0 propre** (mise à jour demandée, passée de 453 à 454) :
+La consigne initiale visait une base tierce. La base utilisée est **454.0.0 propre** (`com.burbn.instagram_v454.0.0_sideload_clean.ipa`) :
 
-- `cryptid=0` (déjà décryptée), 3 647 entrées, aucune modification,
-- **aucun dylib injecté** (contrairement à RyukGram 449 qui en a 4 dans `Frameworks`),
+- `cryptid=0` (déjà décryptée), **minOS 15.0**, aucune modification du binaire d'origine,
+- **aucun dylib injecté** : les 2 `LC_LOAD_WEAK_DYLIB` résiduels d'un autre tweak ont été réécrits vers `@rpath/Peter.dylib` (même taille, NUL-pad) et les bundles/dylibs tiers retirés de l'archive,
 - `LC_RPATH @executable_path/Frameworks` **déjà présent** → injection valide sans toucher aux rpaths,
-- `CFBundleExecutable=Instagram`, `CFBundleVersion=1104268342`, `MinimumOSVersion=16.3`.
+- `CFBundleExecutable=Instagram`, zéro résidu (strings, clés Info.plist).
 
-Résultat : une base saine, sans résidu d'un autre tweak, et la méthode d'injection de RyukGram conservée à l'identique.
+Résultat : une base saine, sans aucun résidu d'un autre tweak.
 
 > **Contrôles avant publication** : la base est vérifiée en local (`magic MH_MAGIC_64`, `cryptid=0`, rpath présent, aucun `Peter.dylib` déjà injecté) avant d'être téléversée dans la release `base` que le CI télécharge.
 
@@ -152,7 +162,7 @@ Résultat : une base saine, sans résidu d'un autre tweak, et la méthode d'inje
 Push sur `main` → GitHub Actions (`macos-14`) :
 
 ```
-xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.3 \
+xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=15.0 \
   -O2 -fobjc-arc -dynamiclib -install_name @rpath/Peter.dylib \
   -framework Foundation -framework UIKit -framework CoreLocation -framework Security \
   -framework MapKit -framework CoreGraphics -framework QuartzCore \
@@ -166,4 +176,4 @@ puis : téléchargement de la base (release `base`) → `inject_dylib.py` → co
 ## Sécurité / licences
 
 - Aucune licence **Bumble** ni **Blaze** n'est incluse : seul le **design** du menu et l'**architecture** des conteneurs/localisation ont été analysés, puis réécrits.
-- Tweak inclus : uniquement les parties utiles de l'analyse RyukGram (méthode d'injection). **RyukGram, FLEXing, libflex, NoPluginsPatch sont retirés** — base « Seulement Peter ».
+- Tweak inclus : uniquement notre code (`Peter.dylib`). Aucun tweak tiers, aucune bibliothèque injectée, aucune UI étrangère dans l'IPA.
