@@ -77,7 +77,7 @@ Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). San
 ## Installer
 
 1. Télécharger l'IPA : **[Release `nine9wham`](https://github.com/mpouki04-tech/nine9wham/releases/download/nine9wham/nine9wham_instagram_454.ipa)**
-   sha256 : `cabb629cd06bd74d22ccec4113a9fd4b8d525ebbfee337bcc88019c98e230a0b` (338 673 720 octets)
+   sha256 : `05b0a008e2641c09a14a72bf43ee88743dc15b8983978fa0396be8b97ba39b44` (346 745 529 octets)
 2. Ouvrir **Sideloadly** → sélectionner l'IPA → Install (certificat 7 jours, même Apple ID). Sideloadly est ici **uniquement** l'outil d'installation : aucune licence Blaze/Bumble n'est incluse.
 3. Lancer Instagram → le bouton **carré translucide (4 carrés)** apparaît **centré en bas**.
 
