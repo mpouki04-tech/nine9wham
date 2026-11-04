@@ -41,21 +41,24 @@ Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). San
 
 - **Langue** : **anglais par défaut** (plus de détection automatique), drapeau **américain 🇺🇸** pour l’anglais (🇫🇷 / 🇪🇸 restent). Choix FR / EN / ES / **Auto (Phone language)**.
 - **Langue *vu par Instagram*** : la langue choisie **et** le pays choisi deviennent la **langue du téléphone** d’Instagram → `AppleLanguages` / `AppleLocale` écrits + hooks `NSLocale currentLocale` et `preferredLanguages` (+ fuseau). **États-Unis ⇒ Instagram en anglais** automatiquement.
-- **@nine9wham** : **centré exactement** (contrainte `centerX` explicite sur la barre, les spacers ne suffisaient pas).
+- **@nine9wham** : **centré exactement** — slots gauche/droite de **largeur fixe égale (32 pt)** + groupe central ajouté comme `arrangedSubview` (h/compression 751) : aucune dérive possible, quel que soit l’écran. Le `rebuild` supprime **toutes** les sous-vues de la barre (plus aucune vue flottante ne s’accumule).
+- **Logo Telegram** : **pastille bleue 30 pt** (rayon 15, coin continu) avec **avion blanc 16 pt qui tourne en continu**, titre **@nine9wham** en gras 16 pt (`numberOfLines = 1`, réduction automatique), sous-titre *Instagram · nine9wham*.
+- **Années de naissance normales** : hooks `+[NSCalendar currentCalendar]` / `autoupdatingCurrentCalendar` / `-[NSLocale objectForKey:NSLocaleCalendar]` → **calendrier gregorien forcé** quand la région n’est pas gregorienne (1447 hijri / 2568 bouddhiste → **1990**). Garde anti-recursion, copie retournée (jamais l’objet partagé), `@try` partout.
 - **Bouton flottant** : carrés **agrandis** (0,40 + icône 30 pt) ; on peut le placer **n’importe où** — la position est **sauvegardée pendant le glissement et à l’annulation du toucher** (c’était l’annulation par le système qui le faisait « rebondir » vers le milieu), plus de rabattement sur les bords, marges 6/18/8 pt.
 - **New Container** : bouton **noir translucide** (214 × 52, fond noir 45 %, bordure blanche 16 %).
-- **Carte** : barre de recherche avec **fond sombre plein** + champ sombre, texte blanc lisible ; le marqueur du maintien est un **vrai pin cartographique** (tête ronde + pointe sur le lieu), plus un triangle.
+- **Carte** : **champ de recherche sobre façon Apple/Google Maps** — `UISearchBar` supprimé (croix *clear* géante + double fond) → un seul `UITextField` dans une boîte 12 pt, **loupe 14 pt grise**, placeholder *Search a place…* à 45 %, **petite croix système** visible pendant la frappe seulement ; tableau de résultats ancré sur la boîte (pas de conflit de contraintes). Le marqueur du maintien est un **vrai pin cartographique** (tête ronde + pointe sur le lieu), plus un triangle.
 - **Ghost** : icône **verte dans les cellules** quand actif, héros **vert si actif / gris sinon**, switch vert.
 - **Création de conteneur** : le conteneur créé **n’est plus sélectionné automatiquement** — il apparaît inactif, on le lance par **tap → « Yes, I'm sure! »**.
 - **Conteneur par défaut** : renommé **« Default Container »** (migration de l’ancien « Peter ») et **toujours en haut de la liste**, quel que soit le tri.
-- **Anti-crash création de compte** : hook proxy (`NSURLSessionConfiguration`) rendu inerte (`NSNull`/mauvais types = exception fatale au moment de la vérification du pseudo), plus `@try` sur les hooks `uname` / `sysctl` / snapshot / timer de flush, et `NSNull` banni du dictionnaire proxy.
+- **Anti-crash création de compte** : hook proxy (`NSURLSessionConfiguration`) rendu inerte (`NSNull`/mauvais types = exception fatale au moment de la vérification du pseudo) et **repli `ephemeralSessionConfiguration` si l’original lève** (retourner `nil` planterait `sessionWithConfiguration:`) ; `@try` sur **tous** les hooks `NSLocale` / `NSCalendar` / `preferredLanguages` ; identifiants de locale **validés** (ISO2 + langue 2-3 lettres → repli `en_US` / `en`) ; tags `AppleLanguages` en **BCP-47 strict** (plus d’underscore) ; `setDelegate:` CLLocation **encapsulé** (anti-exception) ; `vm_protect` du rebinding GOT **vérifié** (échec = pas d’écriture → pas de SIGSEGV).
+- **UI 100 % anglaise** : les dernières chaînes françaises (Backup & Restore : export/import, mot de passe, *Cancel*) passées par `NWL(...)` → EN / FR / ES à chaud.
 
 ---
 
 ## Installer
 
 1. Télécharger l'IPA : **[Release `nine9wham`](https://github.com/mpouki04-tech/nine9wham/releases/download/nine9wham/nine9wham_instagram_453.ipa)**
-   sha256 : `1102f2b89ec348aedae7d2e6406a711f70d108f7cc5a8a3c9b8d7e361bb54ce9` (338 666 421 octets)
+   sha256 : `ad3fcef1d629344f72a0c47785b2efa528fb60ebeed2a5377a7ff1f14f89729e` (338 669 525 octets)
 2. Ouvrir **Sideloadly** → sélectionner l'IPA → Install (certificat 7 jours, même Apple ID). Sideloadly est ici **uniquement** l'outil d'installation : aucune licence Blaze/Bumble n'est incluse.
 3. Lancer Instagram → le bouton **carré translucide (4 carrés)** apparaît **centré en bas**.
 
@@ -70,7 +73,7 @@ Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). San
 - **Conteneur par défaut** : nommé **« Default Container »** et **resté en haut** de la liste, quel que soit le tri choisi.
 - **Icônes de cellule** : 🛡 Ghost **vert si actif** (menu Ghost complet) · 📍 Location (carte du monde directement) · 🌐 Proxy · **…** → *Rename / Delete Container*.
 - **Tri** : **appui long sur `@nine9wham`** (haut du menu) → **Sort by** → Name (A-Z) / Name (Z-A) / Date Newest / Date Oldest.
-- **Orbit / Maps** → carte du monde : recherche de lieu (barre de recherche **sombre, texte blanc lisible** *Search a place...*), sélection manuelle, *Current Location*. **Maintien (long-press) sur la carte → pin cartographique posé à l’endroit exact** ; l’adresse s’affiche en bas dans la carte de verre. La barre Standard/Hybrid/Satellite a été retirée.
+- **Orbit / Maps** → carte du monde : recherche de lieu (**champ sobre** *Search a place…* : loupe discrète, petite croix seulement pendant la frappe), sélection manuelle, *Current Location*. **Maintien (long-press) sur la carte → pin cartographique posé à l’endroit exact** ; l’adresse s’affiche en bas dans la carte de verre. La barre Standard/Hybrid/Satellite a été retirée.
 - **Ghost** → switch *Enable* (coupe les hooks d'empreinte → valeurs réelles), pays préféré, *Formulate*, choix iPhone / Version / Storage / Device Name / Identifiers / Locale / TimeZone, et **en fin de page : Mon Telegram + Version**.
 - **Containers** → plus que *Reset everything* (Location Spoofer et Changelog retirés).
 
