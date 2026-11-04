@@ -262,7 +262,7 @@ static NSDictionary *NWGenerateFingerprint(void) {
     NSString *idfa = [[NSUUID UUID] UUIDString];
 
     // Nom de l'appareil aleatoire
-    NSArray *names = @[@"iPhone de Peter", @"Armel's iPhone", @"nine9 iPhone", @"Peter iPhone",
+    NSArray *names = @[@"Armel's iPhone", @"nine9 iPhone", @"nine9 Phone",
                        @"Mon iPhone", @"iPhone (nine9)"];
     NSString *devName = names[arc4random_uniform((uint32_t)names.count)];
 
@@ -311,7 +311,9 @@ static NSString *NWFPStr(NSString *key) {
 static NSString *(*NWOrig_deviceName)(id, SEL);
 static NSString *NWHook_deviceName(id self, SEL _cmd) {
     NSString *v = NWFPStr(@"deviceName");
-    return v ?: NWOrig_deviceName(self, _cmd);
+    if (v) return v;
+    NSString *o = NWOrig_deviceName ? NWOrig_deviceName(self, _cmd) : nil;
+    return o.length ? o : @"iPhone";
 }
 
 static NSString *(*NWOrig_model)(id, SEL);
@@ -325,7 +327,8 @@ static NSString *(*NWOrig_systemVersion)(id, SEL);
 static NSString *NWHook_systemVersion(id self, SEL _cmd) {
     NSString *v = NWFPStr(@"sysVer");
     if (v.length) return v;
-    return NWOrig_systemVersion(self, _cmd);
+    NSString *o = NWOrig_systemVersion ? NWOrig_systemVersion(self, _cmd) : nil;
+    return o.length ? o : @"18.0";
 }
 
 static NSOperatingSystemVersion NWParseOSVersion(NSString *v) {
@@ -341,21 +344,22 @@ static NSOperatingSystemVersion (*NWOrig_osVersion)(id, SEL);
 static NSOperatingSystemVersion NWHook_osVersion(id self, SEL _cmd) {
     NSString *v = NWFPStr(@"sysVer");
     if (v.length) return NWParseOSVersion(v);
-    return NWOrig_osVersion(self, _cmd);
+    return NWOrig_osVersion ? NWOrig_osVersion(self, _cmd) : NWParseOSVersion(@"18.0");
 }
 
 static NSOperatingSystemVersion (*NWOrig_procOSVersion)(id, SEL);
 static NSOperatingSystemVersion NWHook_procOSVersion(id self, SEL _cmd) {
     NSString *v = NWFPStr(@"sysVer");
     if (v.length) return NWParseOSVersion(v);
-    return NWOrig_procOSVersion(self, _cmd);
+    return NWOrig_procOSVersion ? NWOrig_procOSVersion(self, _cmd) : NWParseOSVersion(@"18.0");
 }
 
 static NSString *(*NWOrig_osVersionString)(id, SEL);
 static NSString *NWHook_osVersionString(id self, SEL _cmd) {
     NSString *v = NWFPStr(@"sysVer");
-    if (v.length) return [NSString stringWithFormat:@"Version %@ (Build 99A000)", v];
-    return NWOrig_osVersionString(self, _cmd);
+    if (v.length) return [NSString stringWithFormat:@"Version %@ (Build 22A3354)", v];
+    return NWOrig_osVersionString ? NWOrig_osVersionString(self, _cmd)
+                                  : @"Version 18.0 (Build 22A3354)";
 }
 
 // Version iOS reelle (avant spoof), pour l'ecran App & Device.
@@ -373,7 +377,7 @@ static NSUUID *NWHook_idfv(id self, SEL _cmd) {
         NSUUID *u = [[NSUUID alloc] initWithUUIDString:s];
         if (u) return u;
     }
-    return NWOrig_idfv(self, _cmd);
+    return NWOrig_idfv ? NWOrig_idfv(self, _cmd) : nil;
 }
 
 // NSProcessInfo -----------------------------------------------------------
@@ -385,7 +389,7 @@ static unsigned long long NWHook_physMem(id self, SEL _cmd) {
             return gb.unsignedLongLongValue * 1024ULL * 1024ULL * 1024ULL;
         }
     }
-    return NWOrig_physMem(self, _cmd);
+    return NWOrig_physMem ? NWOrig_physMem(self, _cmd) : (4ULL << 30);
 }
 
 static NSUInteger (*NWOrig_cpuCount)(id, SEL);
@@ -410,15 +414,43 @@ static NSUInteger NWHook_activeCpuCount(id self, SEL _cmd) {
     return NWOrig_activeCpuCount ? NWOrig_activeCpuCount(self, _cmd) : 6;
 }
 
+// Helpers de locale definis plus bas (section "Locale telephone").
+static NSString *NWEffectiveLocale(void);
+static NSArray<NSString *> *NWPreferredLanguageTags(void);
+static void NWApplySystemLanguage(void);
+
 // NSLocale ----------------------------------------------------------------
+// LA langue/pays que voit Instagram : elle suit la langue choisie dans le
+// menu ET le pays choisi (Etats-Unis -> anglais), pas juste le fichier fp.
 static id (*NWOrig_currentLocale)(id, SEL);
 static id NWHook_currentLocale(id self, SEL _cmd) {
-    NSString *loc = NWFPStr(@"locale");
-    if (loc) {
-        NSLocale *l = [[NSLocale alloc] initWithLocaleIdentifier:loc];
-        if (l) return l;
+    if (NWGhostEnabled()) {
+        static NSLocale *cached = nil;
+        static NSString *cachedId = nil;
+        NSString *eff = NWEffectiveLocale();
+        @synchronized ([NSLocale class]) {
+            if (!cached || ![cachedId isEqualToString:eff]) {
+                NSLocale *l = nil;
+                @try { l = [[NSLocale alloc] initWithLocaleIdentifier:eff]; }
+                @catch (NSException *e) { l = nil; }
+                if (l) { cached = l; cachedId = eff; }
+            }
+            if (cached) return cached;
+        }
     }
-    return NWOrig_currentLocale(self, _cmd);
+    return NWOrig_currentLocale ? NWOrig_currentLocale(self, _cmd)
+                                : [NSLocale localeWithLocaleIdentifier:@"en_US"];
+}
+
+// +[NSLocale preferredLanguages] : Instagram / le clavier lisent cette liste
+// pour determiner la langue du "telephone".
+static id (*NWOrig_prefLangs)(id, SEL);
+static id NWHook_preferredLanguages(id self, SEL _cmd) {
+    if (NWGhostEnabled()) {
+        NSArray *tags = NWPreferredLanguageTags();
+        if (tags.count) return tags;
+    }
+    return NWOrig_prefLangs ? NWOrig_prefLangs(self, _cmd) : @[@"en-US"];
 }
 
 // NSTimeZone --------------------------------------------------------------
@@ -426,20 +458,24 @@ static id (*NWOrig_localTZ)(id, SEL);
 static id NWHook_localTZ(id self, SEL _cmd) {
     NSString *tz = NWFPStr(@"tz");
     if (tz) {
-        NSTimeZone *z = [NSTimeZone timeZoneWithName:tz];
+        NSTimeZone *z = nil;
+        @try { z = [NSTimeZone timeZoneWithName:tz]; }
+        @catch (NSException *e) { z = nil; }
         if (z) return z;
     }
-    return NWOrig_localTZ(self, _cmd);
+    return NWOrig_localTZ ? NWOrig_localTZ(self, _cmd) : [NSTimeZone timeZoneForSecondsFromGMT:0];
 }
 
 static id (*NWOrig_sysTZ)(id, SEL);
 static id NWHook_sysTZ(id self, SEL _cmd) {
     NSString *tz = NWFPStr(@"tz");
     if (tz) {
-        NSTimeZone *z = [NSTimeZone timeZoneWithName:tz];
+        NSTimeZone *z = nil;
+        @try { z = [NSTimeZone timeZoneWithName:tz]; }
+        @catch (NSException *e) { z = nil; }
         if (z) return z;
     }
-    return NWOrig_sysTZ(self, _cmd);
+    return NWOrig_sysTZ ? NWOrig_sysTZ(self, _cmd) : [NSTimeZone timeZoneForSecondsFromGMT:0];
 }
 
 // IDFA (AdSupport charge a la demande) ------------------------------------
@@ -450,7 +486,7 @@ static NSUUID *NWHook_idfa(id self, SEL _cmd) {
         NSUUID *u = [[NSUUID alloc] initWithUUIDString:s];
         if (u) return u;
     }
-    return NWOrig_idfa(self, _cmd);
+    return NWOrig_idfa ? NWOrig_idfa(self, _cmd) : nil;
 }
 
 static void NWSwizzle(Class cls, SEL sel, IMP replacement, void *origStorage) {
@@ -473,8 +509,12 @@ static void NWInstallFingerprintHooks(void) {
     NWSwizzle([NSProcessInfo class], @selector(processorCount), (IMP)NWHook_cpuCount, &NWOrig_cpuCount);
     NWSwizzle([NSProcessInfo class], @selector(activeProcessorCount), (IMP)NWHook_activeCpuCount, &NWOrig_activeCpuCount);
     NWSwizzle(object_getClass([NSLocale class]), @selector(currentLocale), (IMP)NWHook_currentLocale, &NWOrig_currentLocale);
+    NWSwizzle(object_getClass([NSLocale class]), @selector(preferredLanguages), (IMP)NWHook_preferredLanguages, &NWOrig_prefLangs);
     NWSwizzle(object_getClass([NSTimeZone class]), @selector(localTimeZone), (IMP)NWHook_localTZ, &NWOrig_localTZ);
     NWSwizzle(object_getClass([NSTimeZone class]), @selector(systemTimeZone), (IMP)NWHook_sysTZ, &NWOrig_sysTZ);
+
+    // Langue du telephone = langue/pays choisis (point 10).
+    NWApplySystemLanguage();
 
     // IDFA : AdSupport peut ne pas etre charge -> on le charge explicitement.
     dlopen("/System/Library/Frameworks/AdSupport.framework/AdSupport", RTLD_LAZY);
@@ -494,12 +534,14 @@ static void NWInstallFingerprintHooks(void) {
 static int (*NWOrig_uname)(struct utsname *);
 static int NWHook_uname(struct utsname *u) {
     int r = NWOrig_uname ? NWOrig_uname(u) : uname(u);
-    if (r == 0) {
-        NSString *m = NWFPStr(@"model");
-        if (m) {
-            strncpy(u->machine, m.UTF8String, sizeof(u->machine) - 1);
-            u->machine[sizeof(u->machine) - 1] = '\0';
-        }
+    if (r == 0 && u) {
+        @try {
+            NSString *m = NWFPStr(@"model");
+            if (m) {
+                strncpy(u->machine, m.UTF8String, sizeof(u->machine) - 1);
+                u->machine[sizeof(u->machine) - 1] = '\0';
+            }
+        } @catch (NSException *e) { NWLog("uname: %@", e.reason); }
     }
     return r;
 }
@@ -508,17 +550,19 @@ static int (*NWOrig_sysctlbyname)(const char *, void *, size_t *, void *, size_t
 static int NWHook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     int r = NWOrig_sysctlbyname ? NWOrig_sysctlbyname(name, oldp, oldlenp, newp, newlen)
                                 : sysctlbyname(name, oldp, oldlenp, newp, newlen);
-    if (r == 0 && oldp && name) {
-        NSString *m = NWFPStr(@"model");
-        if (m && (strcmp(name, "hw.machine") == 0 || strcmp(name, "hw.model") == 0)) {
-            const char *fm = m.UTF8String;
-            size_t need = strlen(fm) + 1;
-            if (oldlenp && *oldlenp >= need) {
-                memset(oldp, 0, *oldlenp);
-                memcpy(oldp, fm, need);
+    @try {
+        if (r == 0 && oldp && name) {
+            NSString *m = NWFPStr(@"model");
+            if (m && (strcmp(name, "hw.machine") == 0 || strcmp(name, "hw.model") == 0)) {
+                const char *fm = m.UTF8String;
+                size_t need = strlen(fm) + 1;
+                if (oldlenp && *oldlenp >= need) {
+                    memset(oldp, 0, *oldlenp);
+                    memcpy(oldp, fm, need);
+                }
             }
         }
-    }
+    } @catch (NSException *e) { NWLog("sysctlbyname: %@", e.reason); }
     return r;
 }
 
@@ -526,18 +570,20 @@ static int (*NWOrig_sysctl)(int *, u_int, void *, size_t *, void *, size_t);
 static int NWHook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     int r = NWOrig_sysctl ? NWOrig_sysctl(name, namelen, oldp, oldlenp, newp, newlen)
                           : sysctl(name, namelen, oldp, oldlenp, newp, newlen);
-    // CTL_HW = 6, HW_MACHINE = 1, HW_MODEL = 6
-    if (r == 0 && oldp && namelen >= 2 && name[0] == 6 && (name[1] == 1 || name[1] == 6)) {
-        NSString *m = NWFPStr(@"model");
-        if (m) {
-            const char *fm = m.UTF8String;
-            size_t need = strlen(fm) + 1;
-            if (oldlenp && *oldlenp >= need) {
-                memset(oldp, 0, *oldlenp);
-                memcpy(oldp, fm, need);
+    @try {
+        // CTL_HW = 6, HW_MACHINE = 1, HW_MODEL = 6
+        if (r == 0 && oldp && name && namelen >= 2 && name[0] == 6 && (name[1] == 1 || name[1] == 6)) {
+            NSString *m = NWFPStr(@"model");
+            if (m) {
+                const char *fm = m.UTF8String;
+                size_t need = strlen(fm) + 1;
+                if (oldlenp && *oldlenp >= need) {
+                    memset(oldp, 0, *oldlenp);
+                    memcpy(oldp, fm, need);
+                }
             }
         }
-    }
+    } @catch (NSException *e) { NWLog("sysctl: %@", e.reason); }
     return r;
 }
 
@@ -1079,7 +1125,8 @@ static NSString *NWBundleID(void) {
 static void NWSnapshotActive(void) {
     if (!NWActiveID) return;
     NSString *dir = NWContainerDir(NWActiveID);
-
+    // Jamais d'exception : ce tour est appele en tache de fond (timer 15 s).
+    @try {
     // 1. NSUserDefaults du bundle (com.instagram.* / com.burbn.*)
     NSDictionary *dom = [NSUserDefaults.standardUserDefaults persistentDomainForName:NWBundleID()];
     if (dom) [dom writeToFile:[dir stringByAppendingPathComponent:@"prefs.plist"] atomically:YES];
@@ -1095,6 +1142,9 @@ static void NWSnapshotActive(void) {
 
     NWLog("snapshot conteneur %@ (%lu prefs, %lu cookies)", NWActiveID,
           (unsigned long)dom.count, (unsigned long)arr.count);
+    } @catch (NSException *e) {
+        NWLog("snapshot echec: %@", e.reason);
+    }
 }
 
 // Restaure prefs + cookies depuis le conteneur cid (sans changer l'etat).
@@ -1133,6 +1183,7 @@ static void NWPersistState(void) {
 // Retourne l'identifiant (ex: "c3").
 // locOpt : position fake choisie sur la carte a la creation (ou nil).
 // ghostOn : "Random data with Ghost?" (copy Blaze) -> NO = valeurs reelles.
+static void NWSwitchContainer(NSString *cid);   // forward (defini plus bas)
 static NSString *NWCreateContainerWithLocGhost(NSString *name, NSDictionary *locOpt, BOOL ghostOn) {
     // 1. Sauvegarde du conteneur courant (s'il existe)
     if (NWActiveID) NWSnapshotActive();
@@ -1176,16 +1227,13 @@ static NSString *NWCreateContainerWithLocGhost(NSString *name, NSDictionary *loc
 
     NSMutableDictionary *newSt = [st mutableCopy] ?: [NSMutableDictionary dictionary];
     newSt[@"containers"] = containers;
-    newSt[@"activeContainer"] = cid;
+    // PAS d'activation automatique (demande explicite) : le nouveau conteneur
+    // apparait dans la liste inactif. Il ne devient actif qu'apres un tap
+    // sur la cellule + confirmation "Yes, I'm sure!".
     NWSaveState(newSt);
     NWPersistState();
 
-    NWActiveID = cid;
-    NWActiveFP = fp;
-    NWActiveLoc = containers[cid][@"loc"];
-    NWRestoreContainer(cid);   // applique le dossier vierge (prefs = rien)
-
-    NWLog("conteneur cree: %@ (modele fictif=%@)", cid, fp[@"model"]);
+    NWLog("conteneur cree: %@ (modele fictif=%@, inactif)", cid, fp[@"model"]);
     return cid;
 }
 
@@ -1195,7 +1243,10 @@ static NSString *NWCreateContainerWithLoc(NSString *name, NSDictionary *locOpt) 
 }
 
 static NSString *NWCreateContainer(NSString *name) {
-    return NWCreateContainerWithLoc(name, nil);
+    // Conteneur par defaut (premier lancement) : c'est lui qui devient actif.
+    NSString *cid = NWCreateContainerWithLoc(name, nil);
+    NWSwitchContainer(cid);
+    return cid;
 }
 
 // Bascule vers un conteneur : snapshot du courant + restauration de la cible.
@@ -1260,9 +1311,31 @@ static void NWBootstrapState(void) {
     if (!st[@"containers"]) {
         // Premier lancement : conteneur par defaut = telephone reel.
         NWSaveState(@{@"containers": @{}, @"activeContainer": [NSNull null]});
-        NSString *cid = NWCreateContainer(@"Peter");
+        NSString *cid = NWCreateContainer(@"Default Container");
         NWLog("premier lancement, conteneur par defaut: %@", cid);
         return;
+    }
+    // Migration : l'ancien conteneur par defaut s'appelait "Peter".
+    NSDictionary *rawC = st[@"containers"];
+    if ([rawC isKindOfClass:[NSDictionary class]]) {
+        BOOL changed = NO;
+        NSMutableDictionary *cs = [rawC mutableCopy];
+        for (NSString *k in cs.allKeys) {
+            id c = cs[k];
+            if ([c isKindOfClass:[NSDictionary class]] &&
+                [((NSDictionary *)c)[@"name"] isEqualToString:@"Peter"]) {
+                NSMutableDictionary *mc = [((NSDictionary *)c) mutableCopy];
+                mc[@"name"] = @"Default Container";
+                cs[k] = mc;
+                changed = YES;
+            }
+        }
+        if (changed) {
+            NSMutableDictionary *ns = [st mutableCopy] ?: [NSMutableDictionary dictionary];
+            ns[@"containers"] = cs;
+            st = ns;
+            NWLog("conteneur par defaut renomme en 'Default Container'");
+        }
     }
     NWSaveState(st);
     NSString *aid = st[@"activeContainer"];
@@ -1300,11 +1373,10 @@ static NSString *NWLanguage(void) {
     // 2. Ancien emplacement (compatibilite).
     id legacy = st[@"uiLanguage"];
     if ([legacy isKindOfClass:[NSString class]] && ((NSString *)legacy).length) return legacy;
-    // 3. Sinon : langue detectee automatiquement sur le telephone.
-    NSString *dev = NSLocale.currentLocale.languageCode;
-    if (dev.length) return [dev lowercaseString];
+    // 3. Defaut : l'anglais (demande explicite). Le menu propose Auto.
     return @"en";
 }
+static void NWApplySystemLanguage(void);   // forward (defini plus bas)
 static void NWSetLanguage(NSString *lang) {
     NSDictionary *st = NWState ?: @{};
     NSMutableDictionary *ui = [st[@"ui"] mutableCopy] ?: [NSMutableDictionary dictionary];
@@ -1313,6 +1385,9 @@ static void NWSetLanguage(NSString *lang) {
     newSt[@"ui"] = ui;
     newSt[@"uiLanguage"] = lang;
     NWSaveState(newSt);
+    // La langue choisie devient aussi la langue du "telephone" vue par
+    // Instagram (AppleLanguages / AppleLocale + hooks NSLocale).
+    NWApplySystemLanguage();
 }
 
 // Traduction simple : retourne la chaine selon la langue active.
@@ -1329,7 +1404,7 @@ static NSString *NWLanguageFlag(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         map = @{
-            @"fr": @"🇫🇷", @"en": @"🇬🇧", @"es": @"🇪🇸", @"de": @"🇩🇪",
+            @"fr": @"🇫🇷", @"en": @"🇺🇸", @"es": @"🇪🇸", @"de": @"🇩🇪",
             @"it": @"🇮🇹", @"pt": @"🇧🇷", @"ar": @"🇸🇦", @"ja": @"🇯🇵",
             @"nl": @"🇳🇱", @"ru": @"🇷🇺", @"tr": @"🇹🇷", @"ko": @"🇰🇷",
             @"zh": @"🇨🇳", @"pl": @"🇵🇱", @"sv": @"🇸🇪", @"hi": @"🇮🇳",
@@ -1343,7 +1418,62 @@ static NSString *NWLanguageFlag(void) {
         f = map[[lang substringToIndex:2]];
         if (f) return f;
     }
-    return @"🇬🇧";
+    return @"🇺🇸";
+}
+
+// --- Locale "telephone" vue par Instagram (points 10 et 11) ---------------
+// Code pays (ISO2) du conteneur actif, ex "US". Defaut "US".
+static NSString *NWCountryCode(void) {
+    NSString *locId = NWActiveFP[@"locale"];
+    if (![locId isKindOfClass:[NSString class]] || locId.length < 2) return @"US";
+    NSString *cc = [[locId substringFromIndex:locId.length - 2] uppercaseString];
+    if (cc.length != 2) return @"US";
+    return cc;
+}
+
+// Identifiant de locale EFFECTIF : c'est la "langue du telephone" que voit
+// Instagram. Regle :
+//   - pays anglophone choisi (Etats-Unis, Royaume-Uni...) -> anglais ;
+//   - langue choisie dans le menu (FR / EN / ES)          -> cette langue ;
+//   - le pays sert de region (en_US, fr_FR, es_ES...).
+static NSString *NWEffectiveLocale(void) {
+    NSString *cc = NWCountryCode();
+    NSString *lang = [NWLanguage() lowercaseString];
+    if (!lang.length) lang = @"en";
+    static NSSet *english;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // CA volontairement absent : "fr_FR/CA" existe (francais du Canada).
+        english = [NSSet setWithObjects:@"US", @"GB", @"AU", @"IE", @"NZ", @"SG", nil];
+    });
+    if ([english containsObject:cc]) lang = @"en";
+    return [NSString stringWithFormat:@"%@_%@", lang, cc];
+}
+
+// Preference de langue "systeme" : "en-US" / "fr-FR" ...
+static NSArray<NSString *> *NWPreferredLanguageTags(void) {
+    NSString *eff = NWEffectiveLocale();
+    NSString *lang = [eff componentsSeparatedByString:@"_"].firstObject ?: @"en";
+    NSString *cc = NWCountryCode();
+    return @[[NSString stringWithFormat:@"%@-%@", lang, cc], eff, lang];
+}
+
+// Pousse la locale dans NSUserDefaults : Instagram lit AppleLanguages /
+// AppleLocale pour choisir la langue du "telephone". Combine aux hooks
+// NSLocale, la langue/pays choisis deviennent ceux qu'Instagram detecte.
+static void NWApplySystemLanguage(void) {
+    if (!NWGhostEnabled()) return;
+    NSString *eff = NWEffectiveLocale();
+    NSArray *tags = NWPreferredLanguageTags();
+    if (!eff.length || !tags.count) return;
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    @try {
+        [ud setObject:tags forKey:@"AppleLanguages"];
+        [ud setObject:eff forKey:@"AppleLocale"];
+        [ud synchronize];
+    } @catch (NSException *e) {
+        NWLog("AppleLanguages non ecrit: %@", e.reason);
+    }
 }
 
 static UIImage *NWSymbol(NSString *name, CGFloat pt) {
@@ -1374,9 +1504,9 @@ static UILabel *NWLabelMake(NSString *text, CGFloat size, UIColor *color, UIFont
 
 // Icone "4 petits carres" (menu Blaze) : dessinee pour rester nette a toute taille.
 static UIImage *NWGridIcon(CGFloat side, UIColor *color) {
-    // Padding interne : 5% de marge de chaque cote, carres GENEREUX (0.37).
-    CGFloat sq = side * 0.37;          // carre de la grille
-    CGFloat gap = side * 0.14;         // espacement au centre
+    // Padding interne : 4% de marge de chaque cote, carres GENEREUX (0.40).
+    CGFloat sq = side * 0.40;          // carre de la grille
+    CGFloat gap = side * 0.12;         // espacement au centre
     UIGraphicsImageRenderer *r =
         [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(side, side)];
     UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
@@ -1562,7 +1692,14 @@ static void NWUpdateProxyKey(NSString *key, id value) {
     NSMutableDictionary *c = [containers[NWActiveID] mutableCopy];
     if (!c) return;
     NSMutableDictionary *p = [c[@"proxy"] mutableCopy] ?: [NSMutableDictionary dictionary];
-    p[key] = value ?: [NSNull null];
+    // JAMAIS de NSNull : [NSNull length] / [NSNull boolValue] plantent l'app.
+    if (value && value != [NSNull null]) {
+        p[key] = value;
+    } else if ([key isEqualToString:@"on"] || [key isEqualToString:@"auth"]) {
+        p[key] = @NO;
+    } else {
+        p[key] = @"";
+    }
     c[@"proxy"] = p;
     containers[NWActiveID] = c;
     NSMutableDictionary *newSt = [st mutableCopy] ?: [NSMutableDictionary dictionary];
@@ -1574,6 +1711,8 @@ static void NWUpdateProxyKey(NSString *key, id value) {
 static void NWReloadAfterStateChange(void) {
     NSDictionary *st = NWLoadState();
     if (st[@"containers"]) NWSaveState(st);
+    // Garantit que la locale du telephone suit langue + pays a chaque changement.
+    NWApplySystemLanguage();
 }
 
 static void NWVaultDelete(void) {
@@ -1732,8 +1871,17 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
     lp.minimumPressDuration = 0.35;
     [_map addGestureRecognizer:lp];
 
-    // Barre de recherche : champ SOLIDE sombre (sinon texte blanc invisible
-    // au-dessus d'une carte claire).
+    // Barre de recherche : fond SOLIDE sombre. Sans ca, UISearchBar reste
+    // blanche (style Minimal) et le texte blanc devient invisible.
+    UIView *searchBox = [[UIView alloc] init];
+    searchBox.translatesAutoresizingMaskIntoConstraints = NO;
+    searchBox.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.97];
+    searchBox.layer.cornerRadius = 14;
+    if (@available(iOS 13.0, *)) searchBox.layer.cornerCurve = kCACornerCurveContinuous;
+    searchBox.layer.borderWidth = 1;
+    searchBox.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.14].CGColor;
+    [self.view addSubview:searchBox];
+
     _search = [[UISearchBar alloc] initWithFrame:CGRectZero];
     _search.translatesAutoresizingMaskIntoConstraints = NO;
     _search.delegate = self;
@@ -1742,16 +1890,15 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
     _search.tintColor = NWAccent();
     if (@available(iOS 13.0, *)) {
         UITextField *tf = _search.searchTextField;
-        tf.backgroundColor = [UIColor colorWithWhite:1 alpha:0.10];
+        tf.backgroundColor = [UIColor colorWithWhite:0.12 alpha:1.0];
         tf.textColor = UIColor.whiteColor;
         tf.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
-        tf.layer.cornerRadius = 14;
+        tf.layer.cornerRadius = 12;
         tf.layer.masksToBounds = YES;
-        tf.layer.borderWidth = 1;
-        tf.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.14].CGColor;
+        tf.layer.borderWidth = 0;
         tf.attributedPlaceholder = [[NSAttributedString alloc]
             initWithString:@"Search a place..."
-                attributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.50]}];
+                attributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.60]}];
     } else {
         _search.placeholder = @"Search a place...";
     }
@@ -1796,6 +1943,11 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
         [_map.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [_map.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
         [_map.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+
+        [searchBox.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8],
+        [searchBox.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+        [searchBox.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+        [searchBox.heightAnchor constraintEqualToConstant:44],
 
         [_search.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8],
         [_search.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
@@ -1863,31 +2015,43 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
     if (!v) {
         v = [[MKAnnotationView alloc] initWithAnnotation:annotation reuseIdentifier:rid];
         v.canShowCallout = NO;
-        v.bounds = CGRectMake(0, 0, 28, 28);
+        v.bounds = CGRectMake(0, 0, 34, 36);
 
-        // Epingle pointee (triangle) avec pointe vers le bas
-        UIView *badge = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 28, 28)];
+        // Vrai pin cartographique (tete ronde + pointe en bas), pas un triangle.
+        UIView *badge = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 34, 36)];
         CAShapeLayer *shape = [CAShapeLayer layer];
         UIBezierPath *path = [UIBezierPath bezierPath];
-        [path moveToPoint:CGPointMake(14, 0)];
-        [path addLineToPoint:CGPointMake(0, 18)];
-        [path addLineToPoint:CGPointMake(28, 18)];
+        // Pointe : posee exactement sur le coordonnee choisie.
+        [path moveToPoint:CGPointMake(17, 35)];
+        [path addCurveToPoint:CGPointMake(5, 16)
+               controlPoint1:CGPointMake(10, 26)
+               controlPoint2:CGPointMake(5, 21)];
+        // Demi-cercle de la tete (rayon 12 autour de 17,16).
+        [path addArcWithCenter:CGPointMake(17, 16) radius:12
+                    startAngle:M_PI endAngle:0 clockwise:YES];
+        [path addCurveToPoint:CGPointMake(17, 35)
+               controlPoint1:CGPointMake(29, 21)
+               controlPoint2:CGPointMake(24, 26)];
         [path closePath];
         shape.path = path.CGPath;
         shape.fillColor = NWAccent().CGColor;
+        shape.strokeColor = [UIColor colorWithWhite:1 alpha:0.9].CGColor;
+        shape.lineWidth = 1.5;
         shape.shadowColor = UIColor.blackColor.CGColor;
         shape.shadowOpacity = 0.55;
         shape.shadowRadius = 4;
         shape.shadowOffset = CGSizeMake(0, 2);
         [badge.layer addSublayer:shape];
 
-        // Petit pin blanc au centre
-        UIView *pin = [[UIView alloc] initWithFrame:CGRectMake(11, 11, 6, 6)];
+        // Trou blanc au centre de la tete.
+        UIView *pin = [[UIView alloc] initWithFrame:CGRectMake(12, 11, 10, 10)];
         pin.backgroundColor = UIColor.whiteColor;
-        pin.layer.cornerRadius = 3;
+        pin.layer.cornerRadius = 5;
         [badge addSubview:pin];
 
-        v.centerOffset = CGPointMake(0, -14);
+        // La pointe (bas du badge) tombe sur le coordonnee : le centre du
+        // badge est a 17 pt au-dessus de la pointe (hauteur 36 -> centre 18).
+        v.centerOffset = CGPointMake(0, -17);
         [v addSubview:badge];
     }
     v.annotation = annotation;
@@ -2221,6 +2385,7 @@ static void NWTogglePanel(void);   // declare avant NWFloatingButton
 @interface NWFloatingButton : UIButton
 @property (nonatomic, assign) CGPoint touchStart;
 @property (nonatomic, assign) BOOL dragging;
+@property (nonatomic, assign) BOOL touched;   // doigt en cours (glisser ou non)
 @end
 
 @implementation NWFloatingButton
@@ -2240,8 +2405,24 @@ static void NWTogglePanel(void);   // declare avant NWFloatingButton
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     self.touchStart = [touches.anyObject locationInView:self.superview];
     self.dragging = NO;
+    self.touched = YES;
     [self pressIn];
     [super touchesBegan:touches withEvent:event];
+}
+
+// Persiste la position courante (fichier etat). Le timer de 2 s relit cet
+// etat : si on ne l'ecrit pas a chaque glisser, le bouton revient au milieu.
+- (void)nwSavePosition {
+    UIView *v = self.superview;
+    if (!v) return;
+    CGSize sz = self.bounds.size;
+    NSDictionary *st = NWState ?: @{};
+    NSMutableDictionary *ui = [st[@"ui"] mutableCopy] ?: [NSMutableDictionary dictionary];
+    ui[@"x"] = @(self.center.x - sz.width / 2.0);
+    ui[@"y"] = @(self.center.y - sz.height / 2.0);
+    NSMutableDictionary *newSt = [st mutableCopy] ?: [NSMutableDictionary dictionary];
+    newSt[@"ui"] = ui;
+    NWSaveState(newSt);
 }
 
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
@@ -2249,53 +2430,69 @@ static void NWTogglePanel(void);   // declare avant NWFloatingButton
     CGFloat dx = p.x - self.touchStart.x, dy = p.y - self.touchStart.y;
     if (!self.dragging && (fabs(dx) > 4 || fabs(dy) > 4)) self.dragging = YES;
     if (self.dragging) {
+        UIView *v = self.superview;
+        CGSize sz = self.bounds.size;
         CGPoint c = self.center;
         c.x += dx; c.y += dy;
+        // Menage tres large : le bouton peut aller partout, y compris dans
+        // les coins, mais il reste dans la fenetre (sinon le toucher est
+        // annule par le systeme et la position est perdue).
+        c.x = MIN(MAX(c.x, sz.width / 2.0 + 6),
+                  v.bounds.size.width - sz.width / 2.0 - 6);
+        c.y = MIN(MAX(c.y, sz.height / 2.0 + 18),
+                  v.bounds.size.height - sz.height / 2.0 - 8);
         self.center = c;
         self.touchStart = p;
+
+        // Ecriture filtree (au plus 4 fois par seconde : evite un disque a
+        // chaque pointe de doigt tout en gardant la position en memoire).
+        static CFTimeInterval lastSave = 0;
+        CFTimeInterval now = CACurrentMediaTime();
+        if (now - lastSave > 0.25) { lastSave = now; [self nwSavePosition]; }
     }
     [super touchesMoved:touches withEvent:event];
 }
 
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     [super touchesEnded:touches withEvent:event];
+    self.touched = NO;
     if (!self.dragging) {
         [self pressOut];
         NWTogglePanel();
         return;
     }
-    // bounds/center sont stables meme avec un transform non nulle :
-    // ne jamais ecrire frame pendant que l'echelle animee tourne.
+    // On garde EXACTEMENT l'endroit ou on a lache (pas de rabattement sur
+    // un bord ni vers le centre) : "placer le bouton n'importe ou".
     UIView *v = self.superview;
     CGSize sz = self.bounds.size;
-    CGFloat mid = v.bounds.size.width / 2;
-    CGFloat tx = (self.center.x < mid) ? 8 + sz.width / 2
-                                       : v.bounds.size.width - sz.width - 8 - sz.width / 2;
-    // Limites larges : coins haut et bas accessibles (50 pt sous le haut,
-    // 44 pt au-dessus du bas = zone home).
-    CGFloat ty = MIN(MAX(self.center.y, 50 + sz.height / 2),
-                     v.bounds.size.height - sz.height - 44 + sz.height / 2);
-    CGPoint target = CGPointMake(tx, ty);
+    CGPoint target = self.center;
+    target.x = MIN(MAX(target.x, sz.width / 2.0 + 6),
+                   v.bounds.size.width - sz.width / 2.0 - 6);
+    target.y = MIN(MAX(target.y, sz.height / 2.0 + 18),
+                   v.bounds.size.height - sz.height / 2.0 - 8);
     // ease-in-out (mouvement dans la vue) + retour a l'echelle 1.
     [UIView animateWithDuration:0.2 delay:0 options:UIViewAnimationOptionCurveEaseInOut
                      animations:^{
         self.transform = CGAffineTransformIdentity;
         self.center = target;
     } completion:nil];
-    NSDictionary *st = NWState ?: @{};
-    NSMutableDictionary *ui = [st[@"ui"] mutableCopy] ?: [NSMutableDictionary dictionary];
-    ui[@"x"] = @(target.x - sz.width / 2);
-    ui[@"y"] = @(target.y - sz.height / 2);
-    NSMutableDictionary *newSt = [st mutableCopy] ?: [NSMutableDictionary dictionary];
-    newSt[@"ui"] = ui;
-    NWSaveState(newSt);
+    [self nwSavePosition];
     NWPersistState();
 }
 
 - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     [super touchesCancelled:touches withEvent:event];
+    // Le systeme annule le toucher (doigt dans la barre d'etat / geste
+    // systeme). On garde la position atteinte : sinon le timer de 2 s
+    // remettait le bouton a l'ancienne place = "il revient au milieu".
+    BOOL wasDragging = self.dragging;
     self.dragging = NO;
+    self.touched = NO;
     [self pressOut];
+    if (wasDragging) {
+        [self nwSavePosition];
+        NWPersistState();
+    }
 }
 
 @end
@@ -2324,7 +2521,7 @@ static void NWInstallFloatingButton(void) {
         b.layer.shadowOpacity = 0.50;
         b.layer.shadowRadius = 12;
         b.layer.shadowOffset = CGSizeMake(0, 4);
-        [b setImage:NWGridIcon(28, [UIColor colorWithWhite:1 alpha:0.95]) forState:UIControlStateNormal];
+        [b setImage:NWGridIcon(30, [UIColor colorWithWhite:1 alpha:0.95]) forState:UIControlStateNormal];
         b.imageView.contentMode = UIViewContentModeCenter;
         b.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
         b.contentVerticalAlignment = UIControlContentVerticalAlignmentCenter;
@@ -2348,10 +2545,11 @@ static void NWInstallFloatingButton(void) {
     // Ajout au besoin AVANT toute garde : le bouton doit toujours etre present.
     if (NWMenuButton.superview != root) [root addSubview:NWMenuButton];
 
-    // Ne JAMAIS repositionner pendant un glisser ou pendant une animation :
-    // le timer de 2 s remettait le bouton a sa position sauvegardee en plein
-    // drag, ce qui empechait d'aller au coin de l'ecran.
+    // Ne JAMAIS repositionner pendant un glisser, pendant une animation ou
+    // tant que le doigt est sur le bouton : le timer de 2 s remettait le
+    // bouton a sa position sauvegardee en plein drag (retour au milieu).
     if (((NWFloatingButton *)NWMenuButton).dragging) return;
+    if (((NWFloatingButton *)NWMenuButton).touched) return;
     if (NWMenuButton.layer.animationKeys.count > 0) return;
 
     NSDictionary *ui = (NWState ?: @{})[@"ui"];
@@ -2361,9 +2559,9 @@ static void NWInstallFloatingButton(void) {
     // Position par defaut : centre horizontalement, en bas, au-dessus du footer.
     CGFloat x = ux ? ux.doubleValue : (s.width / 2.0 - 28);
     CGFloat y = uy ? uy.doubleValue : (s.height - 56 - 96);
-    // Limites larges : le bouton doit pouvoir atteindre les coins de l'ecran.
-    x = MAX(8, MIN(x, s.width - 56 - 8));
-    y = MAX(50, MIN(y, s.height - 56 - 44));
+    // Limites larges : coins de l'ecran accessibles (meme marges que le drag).
+    x = MAX(6, MIN(x, s.width - 56 - 6));
+    y = MAX(18, MIN(y, s.height - 56 - 8));
     NWMenuButton.frame = CGRectMake(x, y, 56, 56);
     NWLog("bouton flottant installe (%.0f, %.0f)", x, y);
 }
@@ -3336,7 +3534,16 @@ static void NWStartSpin(UIImageView *v) {
     [center addArrangedSubview:tg];
     [center addArrangedSubview:titles];
     [center addArrangedSubview:lang];
-    [self.bar addArrangedSubview:center];
+    // Centre EXACT : contrainte centerX explicite sur la barre. Les spacers
+    // du stack ne garantissaient pas le centre (le groupe derivait).
+    center.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.bar addSubview:center];
+    [NSLayoutConstraint activateConstraints:@[
+        [center.centerXAnchor constraintEqualToAnchor:self.bar.centerXAnchor],
+        [center.centerYAnchor constraintEqualToAnchor:self.bar.centerYAnchor],
+        [center.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.bar.leadingAnchor constant:46],
+        [center.trailingAnchor constraintLessThanOrEqualToAnchor:self.bar.trailingAnchor constant:-46],
+    ]];
 
     // Appui long sur @nine9wham = menu "Sort by" (les 3 points ont ete retires).
     if (isLanding) {
@@ -3397,7 +3604,7 @@ static void NWStartSpin(UIImageView *v) {
         [self rebuild];
         NWAlert(@"Language", @"Auto");
     }]];
-    [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"🇬🇧  English"]
+    [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"🇺🇸  English"]
                                          style:UIAlertActionStyleDefault
                                        handler:^(UIAlertAction * _Nonnull act) {
         NWSetLanguage(@"en");
@@ -3495,11 +3702,12 @@ static void NWStartSpin(UIImageView *v) {
     // Bouton RECTANGLE arrondi, semi-transparent : icone + libelle dedans,
     // parfaitement centres (le libelle n'est plus une vue orpheline).
     UIButton *pill = [UIButton buttonWithType:UIButtonTypeCustom];
-    pill.backgroundColor = [UIColor colorWithWhite:1 alpha:0.10];
+    // Noir translucide (demande explicite) : lisible sur n'importe quel fond.
+    pill.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45];
     pill.layer.cornerRadius = 16;
     if (@available(iOS 13.0, *)) pill.layer.cornerCurve = kCACornerCurveContinuous;
     pill.layer.borderWidth = 1;
-    pill.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.20].CGColor;
+    pill.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.16].CGColor;
     pill.layer.shadowColor = UIColor.blackColor.CGColor;
     pill.layer.shadowOpacity = 0.35;
     pill.layer.shadowRadius = 10;
@@ -3933,11 +4141,14 @@ static void NWStartSpin(UIImageView *v) {
     [self addRow:actions icon:@"antenna.radiowaves.left.and.right" title:@"Load"
            value:@"Location from your proxy I.P" action:^{
         NSDictionary *p = NWActiveProxy() ?: @{};
-        if (![p[@"on"] boolValue] || ![p[@"host"] length]) {
+        id onV = p[@"on"], hostV = p[@"host"];
+        BOOL onP = [onV isKindOfClass:[NSNumber class]] && [onV boolValue];
+        NSString *hostS = [hostV isKindOfClass:[NSString class]] ? hostV : nil;
+        if (!onP || !hostS.length) {
             NWAlert(@"Load", @"Unable to load coordinates from the proxy");
             return;
         }
-        [weakSelf lookupProxyIP:p[@"host"]];
+        [weakSelf lookupProxyIP:hostS];
     }];
     [self addRow:actions icon:@"magnifyingglass" title:@"Search..."
            value:@"Country, place, restaurant..." action:^{
@@ -4146,8 +4357,9 @@ static void NWStartSpin(UIImageView *v) {
     __weak typeof(self) weakSelf = self;
 
     // --- Hero unifie "Ghost" (sans badge "Spoof ON" : demande explicite) ----
+    // VERT quand Ghost est actif, gris sinon.
     [self addHeroIcon:@"private:emoji.ghost"
-                tint:NWGreen()
+                tint:(ghostOn ? NWGreen() : NWDim())
               kicker:nil
                title:@"Ghost"
             subtitle:@"Device Fingerprint Spoofer"
@@ -4322,6 +4534,7 @@ static void NWStartSpin(UIImageView *v) {
                     pick:^(NSDictionary *opt) {
         NWUpdateActiveFPKey(@"locale", opt[@"value"]);
         if (opt[@"tz"]) NWUpdateActiveFPKey(@"tz", opt[@"tz"]);
+        NWApplySystemLanguage();   // pays -> langue du telephone (US = anglais)
         NWReloadAfterStateChange();
         [weakSelf rebuild];
     }];
@@ -4399,6 +4612,7 @@ static void NWStartSpin(UIImageView *v) {
     [self presentOptions:opts selected:(NWActiveFP[@"locale"] ?: @"") heading:@"Choose Locale & Language" pick:^(NSDictionary *opt) {
         NWUpdateActiveFPKey(@"locale", opt[@"value"]);
         if (opt[@"tz"]) NWUpdateActiveFPKey(@"tz", opt[@"tz"]);
+        NWApplySystemLanguage();   // locale -> langue du telephone
         [weakSelf rebuild];
     }];
 }
@@ -4438,8 +4652,21 @@ static void NWStartSpin(UIImageView *v) {
 
     // Tri (copy Blaze : menu "Sort by")
     NSString *sort = [self currentSort];
+    // Le conteneur par defaut (le plus ancien) reste TOUJOURS en haut.
+    NSString *firstId = nil;
+    double firstT = 0;
+    for (NSString *cid in containers) {
+        id c = containers[cid];
+        if (![c isKindOfClass:[NSDictionary class]]) continue;
+        double t = [((NSDictionary *)c)[@"createdAt"] doubleValue];
+        if (!firstId || t < firstT) { firstId = cid; firstT = t; }
+    }
     NSArray *ids = containers.allKeys;
     ids = [ids sortedArrayUsingComparator:^NSComparisonResult(id objA, id objB) {
+        if (firstId) {
+            if ([objA isEqualToString:firstId]) return NSOrderedAscending;
+            if ([objB isEqualToString:firstId]) return NSOrderedDescending;
+        }
         NSString *a = objA, *b = objB;
         NSDictionary *ca = [containers[a] isKindOfClass:[NSDictionary class]] ? containers[a] : @{};
         NSDictionary *cb = [containers[b] isKindOfClass:[NSDictionary class]] ? containers[b] : @{};
@@ -4494,7 +4721,7 @@ static void NWStartSpin(UIImageView *v) {
             cell.layer.borderWidth = 1.3;
             cell.layer.borderColor = [NWAccent() colorWithAlphaComponent:0.9].CGColor;
         }
-        cell.ghostBtn.tintColor = ghostOn ? [UIColor colorWithWhite:1 alpha:0.9]
+        cell.ghostBtn.tintColor = ghostOn ? NWGreen()
                                           : [UIColor colorWithWhite:1 alpha:0.25];
         cell.locBtn.tintColor = gpsOn ? NWGreen() : [UIColor colorWithWhite:1 alpha:0.25];
         cell.proxyBtn.tintColor = proxyOn ? NWAccent() : [UIColor colorWithWhite:1 alpha:0.25];
@@ -4570,7 +4797,11 @@ static void NWStartSpin(UIImageView *v) {
     sheet.onCreate = ^(NSString *name, NSDictionary *loc, BOOL ghostOn) {
         NSString *cid = NWCreateContainerWithLocGhost(name, loc ? loc : locOpt, ghostOn);
         [weakSelf rebuild];
-        NWAskRelaunch([NSString stringWithFormat:@"The container %@", name.length ? name : cid]);
+        // Pas d'activation ni de redemarrage automatique : le conteneur reste
+        // inactif dans la liste, l'utilisateur le lance en tapant dessus.
+        NWAlert(@"New Container",
+                [NSString stringWithFormat:@"%@ created. Tap it to launch.",
+                 name.length ? name : (cid ?: @"Container")]);
     };
     sheet.modalPresentationStyle = UIModalPresentationOverFullScreen;
     sheet.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
@@ -4637,7 +4868,8 @@ static void NWStartSpin(UIImageView *v) {
 
 - (void)buildProxy {
     NSDictionary *p = NWActiveProxy() ?: @{};
-    BOOL on = [p[@"on"] boolValue];
+    id onV = p[@"on"];
+    BOOL on = [onV isKindOfClass:[NSNumber class]] && [onV boolValue];
     NSString *cname = NWActiveContainerDict()[@"name"] ?: @"default";
     NSString *host = [p[@"host"] isKindOfClass:[NSString class]] ? p[@"host"] : @"";
     NSString *port = [p[@"port"] isKindOfClass:[NSString class]] ? p[@"port"] : @"";
@@ -4702,7 +4934,9 @@ static void NWStartSpin(UIImageView *v) {
     UIStackView *auth = [self addRowsCard];
     [self addRow:auth icon:@"lock.fill" title:@"Authentication with credentials"
            value:(user.length ? @"Enabled" : @"Disabled") action:^{
-        NWUpdateProxyKey(@"auth", @(![p[@"auth"] boolValue]));
+        id authV = p[@"auth"];
+        BOOL authOn = [authV isKindOfClass:[NSNumber class]] && [authV boolValue];
+        NWUpdateProxyKey(@"auth", @(!authOn));
         [weakSelf rebuild];
     }];
     [self addRow:auth icon:@"person" title:@"Username"
@@ -5047,17 +5281,33 @@ static void NWTogglePanel(void) {
 
 static id (*NWOrig_defaultSessionCfg)(id, SEL);
 static id NWHook_defaultSessionCfg(id self, SEL _cmd) {
-    id cfg = NWOrig_defaultSessionCfg(self, _cmd);
-    NSDictionary *p = NWActiveProxy();
-    if ([p[@"on"] boolValue] && [p[@"host"] length] && [p[@"port"] length]) {
-        NSMutableDictionary *proxy = [NSMutableDictionary dictionary];
-        proxy[@"HTTPSEnable"] = @YES;
-        proxy[@"HTTPSProxy"] = p[@"host"];
-        proxy[@"HTTPSPort"] = @([p[@"port"] integerValue]);
-        proxy[@"HTTPEnable"] = @YES;
-        proxy[@"HTTPProxy"] = p[@"host"];
-        proxy[@"HTTPPort"] = @([p[@"port"] integerValue]);
-        [cfg setConnectionProxyDictionary:proxy];
+    // Securise : la moindre exception ici tue l'app au moment ou Instagram
+    // ouvre une session (verification du nom de compte = creation de compte).
+    id cfg = nil;
+    @try {
+        cfg = NWOrig_defaultSessionCfg ? NWOrig_defaultSessionCfg(self, _cmd) : nil;
+    } @catch (NSException *e) {
+        NWLog("defaultSessionConfiguration: %@", e.reason);
+    }
+    @try {
+        NSDictionary *p = NWActiveProxy();
+        if (![p isKindOfClass:[NSDictionary class]]) return cfg;
+        id on = p[@"on"], host = p[@"host"], port = p[@"port"];
+        BOOL enabled = [on isKindOfClass:[NSNumber class]] && [on boolValue];
+        NSString *h = [host isKindOfClass:[NSString class]] ? host : nil;
+        NSString *po = [port isKindOfClass:[NSString class]] ? port : nil;
+        if (enabled && h.length && po.length && cfg) {
+            NSMutableDictionary *proxy = [NSMutableDictionary dictionary];
+            proxy[@"HTTPSEnable"] = @YES;
+            proxy[@"HTTPSProxy"] = h;
+            proxy[@"HTTPSPort"] = @([po integerValue]);
+            proxy[@"HTTPEnable"] = @YES;
+            proxy[@"HTTPProxy"] = h;
+            proxy[@"HTTPPort"] = @([po integerValue]);
+            [cfg setConnectionProxyDictionary:proxy];
+        }
+    } @catch (NSException *e) {
+        NWLog("proxy ignore: %@", e.reason);
     }
     return cfg;
 }
@@ -5117,7 +5367,9 @@ static void NWInit(void) {
                                   15ull * NSEC_PER_SEC, 3ull * NSEC_PER_SEC);
         dispatch_source_set_event_handler(flushTimer, ^{
             @autoreleasepool {
-                if (NWActiveID) { NWSnapshotActive(); NWPersistState(); }
+                @try {
+                    if (NWActiveID) { NWSnapshotActive(); NWPersistState(); }
+                } @catch (NSException *e) { NWLog("flush: %@", e.reason); }
             }
         });
         dispatch_resume(flushTimer);
