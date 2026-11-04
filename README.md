@@ -37,12 +37,23 @@ Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). San
 
 ---
 
+## Dernier build (interface)
+
+- **Bouton flottant refait** : 56 × 56 exacts (bouton = flou = rayon), icône 4 carrés **avec marge intérieure** (elle était collée aux bords), icône recentrée par UIKit, position par défaut **centrée en bas**.
+- **Barre du haut** : logo **Telegram bleu qui tourne en continu** + **@nine9wham bien centré**, icône **langue 🌐 juste à côté** (FR / EN / ES, traduction à chaud). Le mot **« Containers »** et les **3 points** ont été retirés → appui long sur `@nine9wham` = menu *Sort by*.
+- **Ancien menu supprimé** : la grille d’accueil Ghost/Orbit n’apparaît plus. Le retour (chevron) ramène toujours à **Containers** (landing). *Location Spoofer*, *Version*, *Changelog*, *Mon Telegram* et *Reset everything* sont maintenant en bas de l’écran Containers.
+- **Switches** : **vert quand activé** (Localisation, Ghost, Proxy), icône dans une **tuile ronde**, hauteur 64 pt, switch légèrement réduit. Hero **Ghost sans badge « Spoof ON »**.
+- **Localisation** : héros **vert quand le GPS est actif** (au lieu de bleu), icône 📍 des cellules en vert.
+- **Options** : sélection en **pastille arrondie verte** (plus de carré plat), cartes plus arrondies (18–20 pt).
+
+---
+
 ## Installer
 
 1. Télécharger l'IPA : **[Release `nine9wham`](https://github.com/mpouki04-tech/nine9wham/releases/download/nine9wham/nine9wham_instagram_453.ipa)**
-   sha256 : `314d27ce3199e84c572f4815bfeebfaa4abea8fc15f62cab849411865c57d23e` (338 658 928 octets)
+   sha256 : `c4e849948fc5a36f1de4c9b9e9984b158a092c2e4bbefe8afa5d8013e1747e1e` (338 660 815 octets)
 2. Ouvrir **Sideloadly** → sélectionner l'IPA → Install (certificat 7 jours, même Apple ID). Sideloadly est ici **uniquement** l'outil d'installation : aucune licence Blaze/Bumble n'est incluse.
-3. Lancer Instagram → le bouton **carré translucide (4 carrés)** apparaît à droite.
+3. Lancer Instagram → le bouton **carré translucide (4 carrés)** apparaît **centré en bas**.
 
 > Après 7 jours : relancer Sideloadly avec la **même Apple ID** → les conteneurs reviennent (vault keychain).
 
