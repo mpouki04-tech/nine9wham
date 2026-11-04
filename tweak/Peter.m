@@ -41,6 +41,18 @@
 
 #define NWLog(fmt, ...) NSLog(@"[nine9wham] " fmt, ##__VA_ARGS__)
 
+// ---- Cles device identity / safe-mode (vague 7) : #define en TETE du
+// fichier car utilisees des la ligne 420 (pin IDFV) et dans l'UI.
+#define NWDevKeyDevID    @"nw9.dev.id"
+#define NWDevKeyFDID     @"nw9.dev.fdid"
+#define NWDevKeyMid      @"nw9.dev.mid"
+#define NWDevKeyMidHdr   @"nw9.dev.midhdr"
+#define NWDevKeyAttBlock @"nw9.dev.noattest"
+#define NWDevKeyHidePill @"nw9.dev.hidepill"   // one-shot (jusqu'au relaunch)
+#define NWDevKeyPill     @"nw9.dev.pill"       // bouton flottant (defaut ON)
+#define NWDevKeyOn       @"nw9.dev.on"         // masque global
+#define NWSafeModeKey    @"nw9.safe.mode"      // safe-mode one-shot
+
 // ---- v7 : declarations avancees (corps definis dans la section Device
 // identity, en aval). Les cles ci-dessus + ces protos rendent l'ordre du
 // fil sans surprise (hooks idfv, dashboard, overlay pill, safe-mode).
@@ -6026,6 +6038,7 @@ static void NWStartSpin(UIImageView *v) {
                         @"Bloquear atestacion Apple: %@"),
                     NWBlockAttest() ? NWL(@"dev_on", @"On", @"Oui", @"Si")
                                     : NWL(@"dev_off", @"Off", @"Non", @"No")]
+            value:nil
            action:^{
         BOOL cur = NWBlockAttest();
         [[NSUserDefaults standardUserDefaults] setObject:(cur ? @NO : @YES) forKey:NWDevKeyAttBlock];
@@ -6628,8 +6641,10 @@ static OSStatus NWHook_SecItemCopyMatching(CFDictionaryRef q, CFTypeRef *r) {
 
 static OSStatus NWHook_SecItemUpdate(CFDictionaryRef q, CFDictionaryRef attrs, CFTypeRef *r) {
     CFDictionaryRef qq = NWKeychainRemapAccessGroup(q);
+    // SecItemUpdate n'a que 2 parametres (query, attrsToUpdate) : r sert
+    // uniquement au pointeur reel (l'API C n'en prend pas).
     OSStatus st = NWSecReal_Update ? NWSecReal_Update(qq ? qq : q, attrs, r)
-                                   : SecItemUpdate(qq ? qq : q, attrs, r);
+                                   : SecItemUpdate(qq ? qq : q, attrs);
     if (qq) CFRelease(qq);
     return st;
 }
@@ -6734,16 +6749,8 @@ static void NWFlushOnExit(void) {
 // (comme chez eux).
 // ---------------------------------------------------------------------------
 
-// Cles device identity : #define (visibles avant leur usage dans le fil) :
-#define NWDevKeyDevID    @"nw9.dev.id"
-#define NWDevKeyFDID     @"nw9.dev.fdid"
-#define NWDevKeyMid      @"nw9.dev.mid"
-#define NWDevKeyMidHdr   @"nw9.dev.midhdr"
-#define NWDevKeyAttBlock @"nw9.dev.noattest"
-#define NWDevKeyHidePill @"nw9.dev.hidepill"   // one-shot (jusqu'au relaunch)
-#define NWDevKeyPill     @"nw9.dev.pill"       // bouton flottant (defaut ON)
-#define NWDevKeyOn       @"nw9.dev.on"         // masque global
-#define NWSafeModeKey    @"nw9.safe.mode"      // safe-mode one-shot
+// Cles device identity : #define en TETE de fichier (au-dessus) pour etre
+// visibles avant leur premier usage dans le fil.
 
 static BOOL NWDevPillHiddenNow = NO;
 
@@ -6840,7 +6847,7 @@ static id NWHook_getDeviceId(id self, SEL _cmd) {
         Class c = object_getClass(self);
         while (c && !v) {
             v = NWGetIdOrigMap[NSStringFromClass(c)];
-            c = c.superclass;
+            c = class_getSuperclass(c);
         }
         IMP old = v ? (IMP)v.pointerValue : NULL;
         if (old) return ((id (*)(id, SEL))old)(self, _cmd);
@@ -6857,7 +6864,7 @@ static void NWInstall_getDeviceId(void) {
     Class *classes = objc_copyClassList(&cn);
     if (!classes) return;
     NSMutableArray<NSValue *> *seen = [NSMutableArray array];
-    NSMutableArray<Class *> *targets = [NSMutableArray array];
+    NSMutableArray *targets = [NSMutableArray array];
     for (unsigned int i = 0; i < cn; i++) {
         Class c = classes[i];
         Method m = class_getInstanceMethod(c, sel);
@@ -6885,7 +6892,8 @@ static void NWInstall_getDeviceId(void) {
     }
     free(classes);
     if (!NWGetIdOrigMap) NWGetIdOrigMap = [NSMutableDictionary dictionary];
-    for (Class c in targets) {
+    for (id obj in targets) {
+        Class c = (Class)obj;
         Method m = class_getInstanceMethod(c, sel);
         if (!m) continue;
         IMP old = method_getImplementation(m);
