@@ -424,33 +424,51 @@ static void NWApplySystemLanguage(void);
 // menu ET le pays choisi (Etats-Unis -> anglais), pas juste le fichier fp.
 static id (*NWOrig_currentLocale)(id, SEL);
 static id NWHook_currentLocale(id self, SEL _cmd) {
-    if (NWGhostEnabled()) {
-        static NSLocale *cached = nil;
-        static NSString *cachedId = nil;
-        NSString *eff = NWEffectiveLocale();
-        @synchronized ([NSLocale class]) {
-            if (!cached || ![cachedId isEqualToString:eff]) {
-                NSLocale *l = nil;
-                @try { l = [[NSLocale alloc] initWithLocaleIdentifier:eff]; }
-                @catch (NSException *e) { l = nil; }
-                if (l) { cached = l; cachedId = eff; }
+    @try {
+        if (NWGhostEnabled()) {
+            static NSLocale *cached = nil;
+            static NSString *cachedId = nil;
+            NSString *eff = NWEffectiveLocale();
+            @synchronized ([NSLocale class]) {
+                if (!cached || ![cachedId isEqualToString:eff]) {
+                    NSLocale *l = nil;
+                    @try { l = [[NSLocale alloc] initWithLocaleIdentifier:eff]; }
+                    @catch (NSException *e) { l = nil; }
+                    if (l) { cached = l; cachedId = eff; }
+                }
+                if (cached) return cached;
             }
-            if (cached) return cached;
         }
+    } @catch (NSException *e) {
+        NWLog("currentLocale: %@", e.reason);
     }
-    return NWOrig_currentLocale ? NWOrig_currentLocale(self, _cmd)
-                                : [NSLocale localeWithLocaleIdentifier:@"en_US"];
+    @try {
+        return NWOrig_currentLocale ? NWOrig_currentLocale(self, _cmd)
+                                    : [NSLocale localeWithLocaleIdentifier:@"en_US"];
+    } @catch (NSException *e) {
+        NWLog("currentLocale(orig): %@", e.reason);
+        return [NSLocale localeWithLocaleIdentifier:@"en_US"];
+    }
 }
 
 // +[NSLocale preferredLanguages] : Instagram / le clavier lisent cette liste
 // pour determiner la langue du "telephone".
 static id (*NWOrig_prefLangs)(id, SEL);
 static id NWHook_preferredLanguages(id self, SEL _cmd) {
-    if (NWGhostEnabled()) {
-        NSArray *tags = NWPreferredLanguageTags();
-        if (tags.count) return tags;
+    @try {
+        if (NWGhostEnabled()) {
+            NSArray *tags = NWPreferredLanguageTags();
+            if (tags.count) return tags;
+        }
+    } @catch (NSException *e) {
+        NWLog("preferredLanguages: %@", e.reason);
     }
-    return NWOrig_prefLangs ? NWOrig_prefLangs(self, _cmd) : @[@"en-US"];
+    @try {
+        return NWOrig_prefLangs ? NWOrig_prefLangs(self, _cmd) : @[@"en-US"];
+    } @catch (NSException *e) {
+        NWLog("preferredLanguages(orig): %@", e.reason);
+        return @[@"en-US"];
+    }
 }
 
 // NSTimeZone --------------------------------------------------------------
@@ -476,6 +494,118 @@ static id NWHook_sysTZ(id self, SEL _cmd) {
         if (z) return z;
     }
     return NWOrig_sysTZ ? NWOrig_sysTZ(self, _cmd) : [NSTimeZone timeZoneForSecondsFromGMT:0];
+}
+
+// NSCalendar --------------------------------------------------------------
+// Les annees de naissance s'affichent dans une "langue bizarre" (1447 hijri,
+// 2568 bouddhiste...) quand la region de la locale n'est pas gregorienne
+// (ex. en_SA -> calendrier Umm al-Qura). On force le calendrier GREGORIEN
+// partout quand Ghost est actif : annees normales, chiffres normaux.
+static BOOL NWCalBuilding = NO;   // garde anti-recursion (locale -> calendar)
+
+static NSCalendar *NWGregorianCalendar(void) {
+    if (NWCalBuilding) return nil;
+    NSString *eff = NWEffectiveLocale();
+    static NSCalendar *cached = nil;
+    static NSString *cachedId = nil;
+    @synchronized ([NSCalendar class]) {
+        if (!cached || ![cachedId isEqualToString:eff]) {
+            NWCalBuilding = YES;
+            NSCalendar *c = nil;
+            @try {
+                c = [[NSCalendar alloc] initWithCalendarIdentifier:NSCalendarIdentifierGregorian];
+                c.locale = [[NSLocale alloc] initWithLocaleIdentifier:eff];
+                NSString *tz = NWFPStr(@"tz");
+                if ([tz isKindOfClass:[NSString class]] && tz.length) {
+                    NSTimeZone *z = [NSTimeZone timeZoneWithName:tz];
+                    if (z) c.timeZone = z;
+                }
+            } @catch (NSException *e) {
+                NWLog("calendrier gregorien: %@", e.reason);
+                c = nil;
+            }
+            NWCalBuilding = NO;
+            if (c) { cached = c; cachedId = eff; }
+        }
+        return cached;
+    }
+}
+
+// Vrai si l'objet est un calendrier gregorien (le seul ou les annees de
+// naissance sont normales : 1990 et pas 1447 / 2568).
+static BOOL NWIsGregorian(id c) {
+    if (![c isKindOfClass:[NSCalendar class]]) return NO;
+    NSString *ident = nil;
+    @try { ident = [(NSCalendar *)c calendarIdentifier]; }
+    @catch (NSException *e) { return NO; }
+    return [ident isEqualToString:NSCalendarIdentifierGregorian];
+}
+
+static id (*NWOrig_curCal)(id, SEL);
+static id NWHook_curCal(id self, SEL _cmd) {
+    id v = nil;
+    @try {
+        v = NWOrig_curCal ? NWOrig_curCal(self, _cmd) : nil;
+    } @catch (NSException *e) {
+        NWLog("currentCalendar(orig): %@", e.reason);
+    }
+    @try {
+        if (NWGhostEnabled() && !NWIsGregorian(v)) {
+            NSCalendar *c = NWGregorianCalendar();
+            if (c) return c;
+        }
+    } @catch (NSException *e) {
+        NWLog("currentCalendar: %@", e.reason);
+    }
+    // Jamais nil : beaucoup de code fait [NSCalendar currentCalendar].x sans test.
+    return v ?: [NSCalendar calendarWithIdentifier:NSCalendarIdentifierGregorian];
+}
+
+static id (*NWOrig_autoCal)(id, SEL);
+static id NWHook_autoCal(id self, SEL _cmd) {
+    id v = nil;
+    @try {
+        v = NWOrig_autoCal ? NWOrig_autoCal(self, _cmd) : nil;
+    } @catch (NSException *e) {
+        NWLog("autoupdatingCurrentCalendar(orig): %@", e.reason);
+    }
+    @try {
+        if (NWGhostEnabled() && !NWIsGregorian(v)) {
+            NSCalendar *c = NWGregorianCalendar();
+            if (c) return c;
+        }
+    } @catch (NSException *e) {
+        NWLog("autoupdatingCurrentCalendar: %@", e.reason);
+    }
+    return v ?: [NSCalendar calendarWithIdentifier:NSCalendarIdentifierGregorian];
+}
+
+// -[NSLocale objectForKey:NSLocaleCalendar] : c'est ce que lisent NSDateFormatter
+// et les pickers de date d'Instagram (annee de naissance).
+// On ne touche QUE quand le calendrier reel n'est pas gregorien, et on rend
+// une COPIE (jamais l'objet partage) : un appelant qui le modifierait ne
+// pourra pas corrompre le cache pour tout le reste de l'app.
+static id (*NWOrig_localeCalKey)(id, SEL, id);
+static id NWHook_localeCalKey(id self, SEL _cmd, id key) {
+    id v = nil;
+    @try {
+        v = NWOrig_localeCalKey ? NWOrig_localeCalKey(self, _cmd, key) : nil;
+    } @catch (NSException *e) {
+        NWLog("locale objectForKey: %@", e.reason);
+        return nil;
+    }
+    @try {
+        if (v && key && [key isEqual:NSLocaleCalendar] && NWGhostEnabled() && !NWIsGregorian(v)) {
+            NSCalendar *c = NWGregorianCalendar();
+            if (c) {
+                NSCalendar *copy = [c copy];
+                if (copy) return copy;
+            }
+        }
+    } @catch (NSException *e) {
+        NWLog("locale calendar: %@", e.reason);
+    }
+    return v;
 }
 
 // IDFA (AdSupport charge a la demande) ------------------------------------
@@ -512,6 +642,11 @@ static void NWInstallFingerprintHooks(void) {
     NWSwizzle(object_getClass([NSLocale class]), @selector(preferredLanguages), (IMP)NWHook_preferredLanguages, &NWOrig_prefLangs);
     NWSwizzle(object_getClass([NSTimeZone class]), @selector(localTimeZone), (IMP)NWHook_localTZ, &NWOrig_localTZ);
     NWSwizzle(object_getClass([NSTimeZone class]), @selector(systemTimeZone), (IMP)NWHook_sysTZ, &NWOrig_sysTZ);
+    // Calendrier GREGORIEN force : les annees de naissance redeviennent normales
+    // (1990 et pas 1447 hijri / 2568 bouddhiste) quelle que soit la region.
+    NWSwizzle(object_getClass([NSCalendar class]), @selector(currentCalendar), (IMP)NWHook_curCal, &NWOrig_curCal);
+    NWSwizzle(object_getClass([NSCalendar class]), @selector(autoupdatingCurrentCalendar), (IMP)NWHook_autoCal, &NWOrig_autoCal);
+    NWSwizzle([NSLocale class], @selector(objectForKey:), (IMP)NWHook_localeCalKey, &NWOrig_localeCalKey);
 
     // Langue du telephone = langue/pays choisis (point 10).
     NWApplySystemLanguage();
@@ -643,9 +778,15 @@ static void NWRebindGOT(void) {
             if (slots[i] == targets[t]) {
                 // ecriture : __DATA_CONST,__got est passe en lecture seule apres
                 // binding. Pages iOS = 16 Ko -> alignement sur 0x4000.
+                // SI vm_protect echoue, on saute : ecrire dans une page
+                // protegee = SIGSEGV au lancer (crash).
                 vm_address_t page = (vm_address_t)((uintptr_t)&slots[i] & ~(uintptr_t)0x3FFF);
-                vm_protect(mach_task_self(), page, (vm_size_t)0x4000, 0,
-                           VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                kern_return_t kr = vm_protect(mach_task_self(), page, (vm_size_t)0x4000, 0,
+                                              VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                if (kr != KERN_SUCCESS) {
+                    NWLog("GOT: vm_protect refuse (%d) pour %s", kr, names[t]);
+                    continue;
+                }
                 *(origs[t]) = targets[t];
                 slots[i] = repls[t];
                 patched++;
@@ -860,7 +1001,18 @@ static void NWHookDelegateClass(Class cls) {
 static void (*NWOrig_setDelegate)(id, SEL, id);
 static void NWHook_setDelegate(id self, SEL _cmd, id delegate) {
     NWOrig_setDelegate(self, _cmd, delegate);
-    if (delegate) NWHookDelegateClass(object_getClass(delegate));
+    // Jamais d'exception dans ce hook : il est appele par Instagram pendant
+    // l'ouverture de session / la creation de compte.
+    @try {
+        if (delegate && ![(id)delegate isKindOfClass:[NSNull class]]) {
+            Class cls = object_getClass(delegate);
+            if (cls && cls != [NSObject class] && class_isMetaClass(cls) == NO) {
+                NWHookDelegateClass(cls);
+            }
+        }
+    } @catch (NSException *e) {
+        NWLog("setDelegate hook: %@", e.reason);
+    }
 }
 
 static void NWInstallLocationHooks(void) {
@@ -1423,12 +1575,16 @@ static NSString *NWLanguageFlag(void) {
 
 // --- Locale "telephone" vue par Instagram (points 10 et 11) ---------------
 // Code pays (ISO2) du conteneur actif, ex "US". Defaut "US".
+// Garde-fou : seuls les vrais codes ISO2 (2 lettres) passent, sinon
+// NSLocale/NSDateFormatter recevraient un identifiant invalide.
 static NSString *NWCountryCode(void) {
     NSString *locId = NWActiveFP[@"locale"];
     if (![locId isKindOfClass:[NSString class]] || locId.length < 2) return @"US";
     NSString *cc = [[locId substringFromIndex:locId.length - 2] uppercaseString];
     if (cc.length != 2) return @"US";
-    return cc;
+    unichar a = [cc characterAtIndex:0], b = [cc characterAtIndex:1];
+    BOOL ok = (a >= 'A' && a <= 'Z') && (b >= 'A' && b <= 'Z');
+    return ok ? cc : @"US";
 }
 
 // Identifiant de locale EFFECTIF : c'est la "langue du telephone" que voit
@@ -1439,6 +1595,15 @@ static NSString *NWCountryCode(void) {
 static NSString *NWEffectiveLocale(void) {
     NSString *cc = NWCountryCode();
     NSString *lang = [NWLanguage() lowercaseString];
+    // Langue : 2-3 lettres minuscules uniquement (repli anglais sinon).
+    BOOL langOK = (lang.length == 2 || lang.length == 3);
+    if (langOK) {
+        for (NSUInteger i = 0; i < lang.length; i++) {
+            unichar c = [lang characterAtIndex:i];
+            if (c < 'a' || c > 'z') { langOK = NO; break; }
+        }
+    }
+    if (!langOK) lang = @"en";
     if (!lang.length) lang = @"en";
     static NSSet *english;
     static dispatch_once_t once;
@@ -1451,11 +1616,14 @@ static NSString *NWEffectiveLocale(void) {
 }
 
 // Preference de langue "systeme" : "en-US" / "fr-FR" ...
+// Que des tags BCP-47 valides (tiret) : un identifiant a underscore dans
+// AppleLanguages / preferredLanguages fait dechirer certaines librairies.
 static NSArray<NSString *> *NWPreferredLanguageTags(void) {
     NSString *eff = NWEffectiveLocale();
     NSString *lang = [eff componentsSeparatedByString:@"_"].firstObject ?: @"en";
     NSString *cc = NWCountryCode();
-    return @[[NSString stringWithFormat:@"%@-%@", lang, cc], eff, lang];
+    NSString *first = [NSString stringWithFormat:@"%@-%@", lang, cc];
+    return @[first, lang];
 }
 
 // Pousse la locale dans NSUserDefaults : Instagram lit AppleLanguages /
@@ -1788,7 +1956,7 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
 // Carte plein écran façon Blaze : pin fixe au centre, la carte bouge dessous,
 // recherche par barre (Nominatim), reverse geocoding, types de carte
 // Standard / Hybrid / Satellite et bouton "Set Location".
-@interface NWMapPicker : UIViewController <MKMapViewDelegate, UISearchBarDelegate,
+@interface NWMapPicker : UIViewController <MKMapViewDelegate, UITextFieldDelegate,
                                            UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, copy) void (^onPick)(double lat, double lon, NSString *label);
 @property (nonatomic, assign) CLLocationCoordinate2D initial;
@@ -1799,7 +1967,7 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
 
 @implementation NWMapPicker {
     MKMapView *_map;
-    UISearchBar *_search;
+    UITextField *_search;
     UITableView *_results;
     UILabel *_addr;
     NSArray<NSDictionary *> *_hits;
@@ -1871,38 +2039,43 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
     lp.minimumPressDuration = 0.35;
     [_map addGestureRecognizer:lp];
 
-    // Barre de recherche : fond SOLIDE sombre. Sans ca, UISearchBar reste
-    // blanche (style Minimal) et le texte blanc devient invisible.
+    // Barre de recherche : champ sobre, facon Apple/Google Maps.
+    // UISearchBar a ete jete : sa croix "clear" geante et son double fond
+    // (searchBox + champ interne) donnaient un rendu amateuriste.
     UIView *searchBox = [[UIView alloc] init];
     searchBox.translatesAutoresizingMaskIntoConstraints = NO;
-    searchBox.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.97];
-    searchBox.layer.cornerRadius = 14;
+    searchBox.backgroundColor = [UIColor colorWithWhite:0.10 alpha:0.96];
+    searchBox.layer.cornerRadius = 12;
     if (@available(iOS 13.0, *)) searchBox.layer.cornerCurve = kCACornerCurveContinuous;
     searchBox.layer.borderWidth = 1;
-    searchBox.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.14].CGColor;
+    searchBox.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.10].CGColor;
     [self.view addSubview:searchBox];
 
-    _search = [[UISearchBar alloc] initWithFrame:CGRectZero];
+    // Loupe discrete a gauche (14 pt, gris 45 %).
+    UIImageView *glass = [[UIImageView alloc] initWithImage:NWSymbol(@"magnifyingglass", 14)];
+    glass.tintColor = [UIColor colorWithWhite:1 alpha:0.45];
+    glass.contentMode = UIViewContentModeScaleAspectFit;
+    glass.translatesAutoresizingMaskIntoConstraints = NO;
+    [searchBox addSubview:glass];
+
+    _search = [[UITextField alloc] initWithFrame:CGRectZero];
     _search.translatesAutoresizingMaskIntoConstraints = NO;
     _search.delegate = self;
-    _search.searchBarStyle = UISearchBarStyleMinimal;
     _search.backgroundColor = UIColor.clearColor;
+    _search.textColor = UIColor.whiteColor;
     _search.tintColor = NWAccent();
-    if (@available(iOS 13.0, *)) {
-        UITextField *tf = _search.searchTextField;
-        tf.backgroundColor = [UIColor colorWithWhite:0.12 alpha:1.0];
-        tf.textColor = UIColor.whiteColor;
-        tf.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
-        tf.layer.cornerRadius = 12;
-        tf.layer.masksToBounds = YES;
-        tf.layer.borderWidth = 0;
-        tf.attributedPlaceholder = [[NSAttributedString alloc]
-            initWithString:@"Search a place..."
-                attributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.60]}];
-    } else {
-        _search.placeholder = @"Search a place...";
-    }
-    [self.view addSubview:_search];
+    _search.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
+    _search.returnKeyType = UIReturnKeySearch;
+    _search.autocorrectionType = UITextAutocorrectionTypeNo;
+    // Petite croix systeme (15 pt) uniquement pendant la frappe :
+    // c'est la seule croix de l'ecran, et elle disparait toute seule.
+    _search.clearButtonMode = UITextFieldViewModeWhileEditing;
+    _search.attributedPlaceholder = [[NSAttributedString alloc]
+        initWithString:@"Search a place..."
+            attributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.45]}];
+    [searchBox addSubview:_search];
+    [_search addTarget:self action:@selector(searchChanged:)
+      forControlEvents:UIControlEventEditingChanged];
 
     // Résultats de recherche
     _results = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
@@ -1949,14 +2122,19 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
         [searchBox.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
         [searchBox.heightAnchor constraintEqualToConstant:44],
 
-        [_search.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8],
-        [_search.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [_search.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [_search.heightAnchor constraintEqualToConstant:44],
+        [glass.leadingAnchor constraintEqualToAnchor:searchBox.leadingAnchor constant:13],
+        [glass.centerYAnchor constraintEqualToAnchor:searchBox.centerYAnchor],
+        [glass.widthAnchor constraintEqualToConstant:16],
+        [glass.heightAnchor constraintEqualToConstant:16],
 
-        [_results.topAnchor constraintEqualToAnchor:_search.bottomAnchor constant:6],
-        [_results.leadingAnchor constraintEqualToAnchor:_search.leadingAnchor],
-        [_results.trailingAnchor constraintEqualToAnchor:_search.trailingAnchor],
+        [_search.leadingAnchor constraintEqualToAnchor:glass.trailingAnchor constant:9],
+        [_search.trailingAnchor constraintEqualToAnchor:searchBox.trailingAnchor constant:-12],
+        [_search.topAnchor constraintEqualToAnchor:searchBox.topAnchor],
+        [_search.bottomAnchor constraintEqualToAnchor:searchBox.bottomAnchor],
+
+        [_results.topAnchor constraintEqualToAnchor:searchBox.bottomAnchor constant:8],
+        [_results.leadingAnchor constraintEqualToAnchor:searchBox.leadingAnchor],
+        [_results.trailingAnchor constraintEqualToAnchor:searchBox.trailingAnchor],
         [_results.heightAnchor constraintEqualToConstant:210],
 
         [card.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
@@ -2128,9 +2306,8 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
 
 // --- Recherche (Nominatim) -------------------------------------------------
 
-- (void)searchBarSearchButtonClicked:(UISearchBar *)sb {
-    [sb resignFirstResponder];
-    NSString *q = [sb.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+- (void)runSearch:(NSString *)query {
+    NSString *q = [query stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
     if (q.length < 2) return;
     NSString *enc = [q stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLQueryAllowedCharacterSet];
     NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:
@@ -2166,13 +2343,20 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
     }] resume];
 }
 
-- (void)searchBarTextDidBeginEditing:(UISearchBar *)sb {
-    sb.showsCancelButton = YES;
+// Touche "Search" du clavier.
+- (BOOL)textFieldShouldReturn:(UITextField *)tf {
+    [tf resignFirstResponder];
+    [self runSearch:tf.text];
+    return NO;
 }
-- (void)searchBarCancelButtonClicked:(UISearchBar *)sb {
-    sb.showsCancelButton = NO;
-    [sb resignFirstResponder];
-    _results.hidden = YES;
+
+// Texte efface (petite croix) -> plus de resultats en suspend.
+- (void)searchChanged:(UITextField *)tf {
+    if (tf.text.length == 0) {
+        _hits = @[];
+        _results.hidden = YES;
+        [_results reloadData];
+    }
 }
 
 - (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)n { return _hits.count; }
@@ -3410,8 +3594,10 @@ static void NWInstallFloatingButton(void) {
     // L'ancien menu principal (grille Ghost/Orbit) n'est plus jamais construit.
     if (!self.module.length) self.module = @"containers";
 
-    for (UIView *v in [self.bar.arrangedSubviews copy]) {
-        [self.bar removeArrangedSubview:v];
+    // TOUTES les sous-vues (pas seulement les arranged) : les vues ajoutees
+    // hors stack s'accumulaient a chaque rebuild et le logo/@ partaient de travers.
+    for (UIView *v in [self.bar.subviews copy]) {
+        if ([self.bar.arrangedSubviews containsObject:v]) [self.bar removeArrangedSubview:v];
         [v removeFromSuperview];
     }
     for (UIView *v in [self.content.arrangedSubviews copy]) {
@@ -3480,35 +3666,59 @@ static void NWStartSpin(UIImageView *v) {
     // toute navigation part de / revient a Containers.
     BOOL isLanding = (self.module == nil || [self.module isEqualToString:@"containers"]);
 
-    if (isLanding) {
-        // Espaceur de gauche = largeur du bouton xmark de droite -> centre exact.
-        UIView *pad = [[UIView alloc] init];
-        pad.translatesAutoresizingMaskIntoConstraints = NO;
-        [pad.widthAnchor constraintEqualToConstant:32].active = YES;
-        [self.bar addArrangedSubview:pad];
-    } else {
-        [self.bar addArrangedSubview:NWIconButton(@"chevron.left", ^(id s){
+    // --- Slots lateraux de largeur FIXE et EGALE (32 pt) ------------------
+    // Les deux cotes ont exactement la meme largeur : le groupe du milieu est
+    // donc centre quoi qu'il arrive (aucune derive possible).
+    UIView *leftSlot = [[UIView alloc] init];
+    leftSlot.translatesAutoresizingMaskIntoConstraints = NO;
+    [leftSlot.widthAnchor constraintEqualToConstant:32].active = YES;
+    [self.bar addArrangedSubview:leftSlot];
+
+    if (!isLanding) {
+        UIButton *back = NWIconButton(@"chevron.left", ^(id s){
             self.module = @"containers";
             [self rebuild];
-        })];
+        });
+        [leftSlot addSubview:back];
+        [NSLayoutConstraint activateConstraints:@[
+            [back.centerXAnchor constraintEqualToAnchor:leftSlot.centerXAnchor],
+            [back.centerYAnchor constraintEqualToAnchor:leftSlot.centerYAnchor],
+        ]];
     }
 
     [self.bar addArrangedSubview:NWSpacer()];
 
-    // --- Centre : logo Telegram BLEU qui tourne + @nine9wham + drapeau ---
-    // Les deux cotes font EXACTEMENT 24 pt : le titre est donc vraiment centre.
-    UIImageView *tg = [[UIImageView alloc] initWithImage:NWSymbol(@"paperplane.fill", 24)];
-    tg.tintColor = [UIColor colorWithRed:0.165 green:0.663 blue:0.933 alpha:1.0]; // bleu Telegram
+    // --- Centre : logo Telegram (pastille bleue + avion blanc) + @nine9wham
+    UIView *badge = [[UIView alloc] init];
+    badge.translatesAutoresizingMaskIntoConstraints = NO;
+    badge.backgroundColor = [UIColor colorWithRed:0.165 green:0.663 blue:0.933 alpha:1.0];
+    badge.layer.cornerRadius = 15;
+    if (@available(iOS 13.0, *)) badge.layer.cornerCurve = kCACornerCurveContinuous;
+    badge.clipsToBounds = YES;
+    [badge.widthAnchor constraintEqualToConstant:30].active = YES;
+    [badge.heightAnchor constraintEqualToConstant:30].active = YES;
+
+    UIImageView *tg = [[UIImageView alloc] initWithImage:NWSymbol(@"paperplane.fill", 15)];
+    tg.tintColor = UIColor.whiteColor;
     tg.contentMode = UIViewContentModeScaleAspectFit;
     tg.translatesAutoresizingMaskIntoConstraints = NO;
-    [tg.widthAnchor constraintEqualToConstant:24].active = YES;
-    [tg.heightAnchor constraintEqualToConstant:24].active = YES;
+    [badge addSubview:tg];
+    [NSLayoutConstraint activateConstraints:@[
+        [tg.centerXAnchor constraintEqualToAnchor:badge.centerXAnchor],
+        [tg.centerYAnchor constraintEqualToAnchor:badge.centerYAnchor],
+        [tg.widthAnchor constraintEqualToConstant:16],
+        [tg.heightAnchor constraintEqualToConstant:16],
+    ]];
     NWStartSpin(tg);
 
-    UILabel *t = NWLabelMake(@"@nine9wham", 17, UIColor.whiteColor, UIFontWeightBold);
+    UILabel *t = NWLabelMake(@"@nine9wham", 16, UIColor.whiteColor, UIFontWeightBold);
     t.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = NWLabelMake(@"Instagram · nine9wham", 10, NWDim(), UIFontWeightRegular);
+    t.numberOfLines = 1;
+    t.adjustsFontSizeToFitWidth = YES;
+    t.minimumScaleFactor = 0.75;
+    UILabel *sub = NWLabelMake(@"Instagram · nine9wham", 9.5, NWDim(), UIFontWeightRegular);
     sub.textAlignment = NSTextAlignmentCenter;
+    sub.numberOfLines = 1;
     UIStackView *titles = [[UIStackView alloc] init];
     titles.axis = UILayoutConstraintAxisVertical;
     titles.alignment = UIStackViewAlignmentCenter;
@@ -3521,29 +3731,23 @@ static void NWStartSpin(UIImageView *v) {
     lang.textAlignment = NSTextAlignmentCenter;
     lang.translatesAutoresizingMaskIntoConstraints = NO;
     lang.userInteractionEnabled = YES;
-    [lang.widthAnchor constraintEqualToConstant:24].active = YES;
-    [lang.heightAnchor constraintEqualToConstant:24].active = YES;
+    [lang.widthAnchor constraintEqualToConstant:26].active = YES;
+    [lang.heightAnchor constraintEqualToConstant:26].active = YES;
     UITapGestureRecognizer *tapLang = [[UITapGestureRecognizer alloc]
         initWithTarget:self action:@selector(showLanguagePicker)];
     [lang addGestureRecognizer:tapLang];
 
-    UIStackView *center = [[UIStackView alloc] init];
+    UIStackView *center = [[UIStackView alloc] initWithArrangedSubviews:@[badge, titles, lang]];
     center.axis = UILayoutConstraintAxisHorizontal;
     center.alignment = UIStackViewAlignmentCenter;
     center.spacing = 8;
-    [center addArrangedSubview:tg];
-    [center addArrangedSubview:titles];
-    [center addArrangedSubview:lang];
-    // Centre EXACT : contrainte centerX explicite sur la barre. Les spacers
-    // du stack ne garantissaient pas le centre (le groupe derivait).
-    center.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.bar addSubview:center];
-    [NSLayoutConstraint activateConstraints:@[
-        [center.centerXAnchor constraintEqualToAnchor:self.bar.centerXAnchor],
-        [center.centerYAnchor constraintEqualToAnchor:self.bar.centerYAnchor],
-        [center.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.bar.leadingAnchor constant:46],
-        [center.trailingAnchor constraintLessThanOrEqualToAnchor:self.bar.trailingAnchor constant:-46],
-    ]];
+    // Le groupe du centre ne doit JAMAIS s'etirer : il garde sa largeur
+    // intrinseque et les deux spacers (hugging 250) absorbent tout l'extra
+    // a parts egales -> centre exact, quelle que soit la largeur d'ecran.
+    [center setContentHuggingPriority:UILayoutPriorityDefaultHigh + 1
+                              forAxis:UILayoutConstraintAxisHorizontal];
+    [center setContentCompressionResistancePriority:UILayoutPriorityDefaultHigh + 1
+                                            forAxis:UILayoutConstraintAxisHorizontal];
 
     // Appui long sur @nine9wham = menu "Sort by" (les 3 points ont ete retires).
     if (isLanding) {
@@ -3553,10 +3757,22 @@ static void NWStartSpin(UIImageView *v) {
         titles.userInteractionEnabled = YES;
     }
 
+    [self.bar addArrangedSubview:center];
+
     [self.bar addArrangedSubview:NWSpacer()];
-    [self.bar addArrangedSubview:NWIconButton(@"xmark", ^(id s){
+
+    UIView *rightSlot = [[UIView alloc] init];
+    rightSlot.translatesAutoresizingMaskIntoConstraints = NO;
+    [rightSlot.widthAnchor constraintEqualToConstant:32].active = YES;
+    [self.bar addArrangedSubview:rightSlot];
+    UIButton *close = NWIconButton(@"xmark", ^(id s){
         [self dismissViewControllerAnimated:YES completion:nil];
-    })];
+    });
+    [rightSlot addSubview:close];
+    [NSLayoutConstraint activateConstraints:@[
+        [close.centerXAnchor constraintEqualToAnchor:rightSlot.centerXAnchor],
+        [close.centerYAnchor constraintEqualToAnchor:rightSlot.centerYAnchor],
+    ]];
 }
 
 // Appui long sur le titre -> tri des conteneurs (remplace les 3 points).
@@ -5094,25 +5310,35 @@ static void NWStartSpin(UIImageView *v) {
     [self addSection:@"Backup & Restore"];
     UIStackView *bak = [self addRowsCard];
     [self addRow:bak icon:@"arrow.down.to.square" title:@"Export backup"
-           value:@"Sauvegarde chiffree de tous les comptes" action:^{
+           value:NWL(@"bk_exp", @"Encrypted backup of all accounts",
+                     @"Sauvegarde chiffree de tous les comptes",
+                     @"Cifrado de todas las cuentas") action:^{
         [weakSelf promptBackupPassword:YES completion:^(NSString *pw) {
             NSError *err = nil;
             NSString *path = NWBackupExport(pw, &err);
             if (path) {
-                NWAlert(@"Backup exporte", [NSString stringWithFormat:@"Fichier : %@", path.lastPathComponent]);
+                NWAlert(NWL(@"bk_done", @"Backup exported", @"Backup exporte", @"Backup exportado"),
+                        [NSString stringWithFormat:@"%@: %@", NWL(@"file", @"File", @"Fichier", @"Archivo"),
+                         path.lastPathComponent]);
             } else {
-                NWAlert(@"Erreur export", err.localizedDescription ?: @"Echec");
+                NWAlert(NWL(@"err_exp", @"Export error", @"Erreur export", @"Error de exportacion"),
+                        err.localizedDescription ?: NWL(@"fail", @"Failed", @"Echec", @"Fallo"));
             }
         }];
     }];
     [self addRow:bak icon:@"arrow.up.from.square" title:@"Import backup"
-           value:@"Restaurer les comptes depuis un fichier" action:^{
+           value:NWL(@"bk_imp", @"Restore accounts from a file",
+                     @"Restaurer les comptes depuis un fichier",
+                     @"Restaurar cuentas desde un archivo") action:^{
         NSArray *backups = NWListBackups();
         if (backups.count == 0) {
-            NWAlert(@"Aucun backup", @"Aucune sauvegarde trouvee dans Documents/nine9wham_backups/");
+            NWAlert(NWL(@"no_bk", @"No backup", @"Aucun backup", @"Sin backup"),
+                    NWL(@"no_bk2", @"No backup found in Documents/nine9wham_backups/",
+                        @"Aucune sauvegarde trouvee dans Documents/nine9wham_backups/",
+                        @"No se encontro ninguna copia en Documents/nine9wham_backups/"));
             return;
         }
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Choisir un backup"
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:NWL(@"choose_bk", @"Choose a backup", @"Choisir un backup", @"Elegir un backup")
                                                                    message:nil
                                                           preferredStyle:UIAlertControllerStyleActionSheet];
         for (NSString *f in backups) {
@@ -5123,16 +5349,21 @@ static void NWStartSpin(UIImageView *v) {
                     NSString *path = [NWBackupDir() stringByAppendingPathComponent:f];
                     NSError *err = nil;
                     if (NWBackupImport(path, pw, &err)) {
-                        NWAlert(@"Backup restaure", @"Tous les comptes ont ete restaures. Redemarrage...");
+                        NWAlert(NWL(@"bk_restored", @"Backup restored", @"Backup restaure", @"Backup restaurado"),
+                                NWL(@"bk_restored2", @"All accounts were restored. Restarting...",
+                                    @"Tous les comptes ont ete restaures. Redemarrage...",
+                                    @"Todas las cuentas fueron restauradas. Reiniciando..."));
                         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                                        dispatch_get_main_queue(), ^{ exit(0); });
                     } else {
-                        NWAlert(@"Erreur import", err.localizedDescription ?: @"Echec");
+                        NWAlert(NWL(@"err_imp", @"Import error", @"Erreur import", @"Error de importacion"),
+                                err.localizedDescription ?: NWL(@"fail", @"Failed", @"Echec", @"Fallo"));
                     }
                 }];
             }]];
         }
-        [a addAction:[UIAlertAction actionWithTitle:@"Annuler" style:UIAlertActionStyleCancel handler:nil]];
+        [a addAction:[UIAlertAction actionWithTitle:NWL(@"cancel", @"Cancel", @"Annuler", @"Cancelar")
+                                             style:UIAlertActionStyleCancel handler:nil]];
         a.popoverPresentationController.sourceView = self.view;
         a.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds),
                                                                 self.view.bounds.size.height - 80, 1, 1);
@@ -5157,19 +5388,20 @@ static void NWStartSpin(UIImageView *v) {
 
 - (void)promptBackupPassword:(BOOL)isExport completion:(void (^)(NSString *password))completion {
     UIAlertController *al = [UIAlertController alertControllerWithTitle:isExport ? @"Export backup" : @"Import backup"
-                                                                message:isExport ? @"Mot de passe pour chiffrer la sauvegarde :" : @"Mot de passe pour dechiffrer la sauvegarde :"
+                                                                message:isExport ? NWL(@"pw_exp", @"Password to encrypt the backup:", @"Mot de passe pour chiffrer la sauvegarde :", @"Contrasena para cifrar la copia :") : NWL(@"pw_imp", @"Password to decrypt the backup:", @"Mot de passe pour dechiffrer la sauvegarde :", @"Contrasena para descifrar la copia :")
                                                        preferredStyle:UIAlertControllerStyleAlert];
     [al addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = @"Mot de passe";
+        tf.placeholder = NWL(@"pw", @"Password", @"Mot de passe", @"Contrasena");
         tf.secureTextEntry = YES;
     }];
-    [al addAction:[UIAlertAction actionWithTitle:isExport ? @"Exporter" : @"Importer"
+    [al addAction:[UIAlertAction actionWithTitle:isExport ? NWL(@"export", @"Export", @"Exporter", @"Exportar")
+                                                            : NWL(@"import", @"Import", @"Importer", @"Importar")
                                          style:UIAlertActionStyleDefault
                                        handler:^(UIAlertAction * _Nonnull act) {
         NSString *pw = al.textFields.firstObject.text ?: @"";
         if (completion) completion(pw);
     }]];
-    [al addAction:[UIAlertAction actionWithTitle:@"Annuler" style:UIAlertActionStyleCancel handler:nil]];
+    [al addAction:[UIAlertAction actionWithTitle:NWL(@"cancel", @"Cancel", @"Annuler", @"Cancelar") style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:al animated:YES completion:nil];
 }
 
@@ -5288,6 +5520,13 @@ static id NWHook_defaultSessionCfg(id self, SEL _cmd) {
         cfg = NWOrig_defaultSessionCfg ? NWOrig_defaultSessionCfg(self, _cmd) : nil;
     } @catch (NSException *e) {
         NWLog("defaultSessionConfiguration: %@", e.reason);
+    }
+    // Si l'original a ete avale, on fournit quand meme une configuration
+    // valide : retourner nil ferait planter sessionWithConfiguration:.
+    if (!cfg) {
+        @try { cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration]; }
+        @catch (NSException *e) { NWLog("ephemeralSessionConfiguration: %@", e.reason); }
+        if (!cfg) return cfg;
     }
     @try {
         NSDictionary *p = NWActiveProxy();
