@@ -1339,8 +1339,10 @@ static UILabel *NWLabelMake(NSString *text, CGFloat size, UIColor *color, UIFont
 
 // Icone "4 petits carres" (menu Blaze) : dessinee pour rester nette a toute taille.
 static UIImage *NWGridIcon(CGFloat side, UIColor *color) {
-    CGFloat sq = side * 0.40;          // carre de la grille
-    CGFloat gap = side * 0.20;         // espacement au centre
+    // Padding interne : les 4 carres ne doivent JAMAIS toucher les bords
+    // (2*0.34 + 0.16 = 0.84 -> 8% de marge de chaque cote = cadrage net).
+    CGFloat sq = side * 0.34;          // carre de la grille
+    CGFloat gap = side * 0.16;         // espacement au centre
     UIGraphicsImageRenderer *r =
         [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(side, side)];
     UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
@@ -1738,7 +1740,7 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
     UIView *card = [[UIView alloc] init];
     card.translatesAutoresizingMaskIntoConstraints = NO;
     card.backgroundColor = NWCardGlass();
-    card.layer.cornerRadius = 16;
+    card.layer.cornerRadius = 18;
     card.layer.borderWidth = 1;
     card.layer.borderColor = NWLine().CGColor;
     [self.view addSubview:card];
@@ -2272,29 +2274,32 @@ static void NWInstallFloatingButton(void) {
     if (!root) return;
 
     if (!NWMenuButton) {
+        // --- Bouton flottant refait de zero : dimensions exactes et alignees ---
+        // 56x56 partout (bouton = flou = rayon), icone 24x24 centree par UIKit
+        // (aucun recalcul manuel de frame -> impossible de se decaler).
         NWFloatingButton *b = [NWFloatingButton buttonWithType:UIButtonTypeCustom];
-        // Bouton TRANSLUCIDE carre (copy Blaze) : 4 petits carres vraiment centres, plus grand et visible.
-        b.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.14];
-        b.layer.cornerRadius = 16;
+        b.frame = CGRectMake(0, 0, 56, 56);
+        b.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.13];
+        b.layer.cornerRadius = 15;
         if (@available(iOS 13.0, *)) b.layer.cornerCurve = kCACornerCurveContinuous;
-        b.layer.borderWidth = 1.2;
-        b.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.25].CGColor;
+        b.layer.borderWidth = 1.0;
+        b.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.22].CGColor;
         b.layer.shadowColor = UIColor.blackColor.CGColor;
-        b.layer.shadowOpacity = 0.55;
-        b.layer.shadowRadius = 14;
-        b.layer.shadowOffset = CGSizeMake(0, 5);
-        // Icône 4 carres bien centree, taille visible.
-        [b setImage:NWGridIcon(26, [UIColor colorWithWhite:1 alpha:0.95]) forState:UIControlStateNormal];
-        b.imageView.contentMode = UIViewContentModeScaleAspectFit;
-        b.imageView.bounds = CGRectMake(0, 0, 26, 26);
-        b.imageView.center = CGPointMake(b.bounds.size.width/2, b.bounds.size.height/2);
-        // Flou derriere l'icone (toujours au fond du bouton).
+        b.layer.shadowOpacity = 0.50;
+        b.layer.shadowRadius = 12;
+        b.layer.shadowOffset = CGSizeMake(0, 4);
+        [b setImage:NWGridIcon(24, [UIColor colorWithWhite:1 alpha:0.95]) forState:UIControlStateNormal];
+        b.imageView.contentMode = UIViewContentModeCenter;
+        b.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
+        b.contentVerticalAlignment = UIControlContentVerticalAlignmentCenter;
+        b.imageEdgeInsets = UIEdgeInsetsZero;
+        // Flou exactement de la meme taille que le bouton.
         if (@available(iOS 13.0, *)) {
             UIVisualEffectView *blur = [[UIVisualEffectView alloc]
                 initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterialDark]];
-            blur.frame = CGRectMake(0, 0, 60, 60);
+            blur.frame = CGRectMake(0, 0, 56, 56);
             blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-            blur.layer.cornerRadius = 16;
+            blur.layer.cornerRadius = 15;
             blur.clipsToBounds = YES;
             blur.userInteractionEnabled = NO;
             [b addSubview:blur];
@@ -2308,11 +2313,12 @@ static void NWInstallFloatingButton(void) {
     NSNumber *ux = [ui[@"x"] isKindOfClass:[NSNumber class]] ? ui[@"x"] : nil;
     NSNumber *uy = [ui[@"y"] isKindOfClass:[NSNumber class]] ? ui[@"y"] : nil;
     CGSize s = root.bounds.size;
-    CGFloat x = ux ? ux.doubleValue : (s.width / 2 - 30);
-    CGFloat y = uy ? uy.doubleValue : (s.height - 100);
-    x = MAX(6, MIN(x, s.width - 60 - 6));
-    y = MAX(60, MIN(y, s.height - 60 - 34));
-    NWMenuButton.frame = CGRectMake(x, y, 60, 60);
+    // Position par defaut : centre horizontalement, en bas, au-dessus du footer.
+    CGFloat x = ux ? ux.doubleValue : (s.width / 2.0 - 28);
+    CGFloat y = uy ? uy.doubleValue : (s.height - 56 - 96);
+    x = MAX(8, MIN(x, s.width - 56 - 8));
+    y = MAX(60, MIN(y, s.height - 56 - 40));
+    NWMenuButton.frame = CGRectMake(x, y, 56, 56);
     if (NWMenuButton.superview != root) [root addSubview:NWMenuButton];
     NWLog("bouton flottant installe (%.0f, %.0f)", x, y);
 }
@@ -2342,7 +2348,7 @@ static void NWInstallFloatingButton(void) {
     self = [super initWithFrame:CGRectMake(0, 0, 0, 0)];
     if (!self) return nil;
     self.backgroundColor = NWCardGlass();
-    self.layer.cornerRadius = 16;
+    self.layer.cornerRadius = 20;
     self.layer.borderWidth = 1;
     self.layer.borderColor = NWLine().CGColor;
 
@@ -2475,6 +2481,7 @@ static void NWInstallFloatingButton(void) {
 @end
 
 @interface NWSwitchRow : UIView
+@property (nonatomic, strong) UIView *tile;
 @property (nonatomic, strong) UIImageView *iconView;
 @property (nonatomic, strong) UILabel *titleLabel;
 @property (nonatomic, strong) UILabel *subLabel;
@@ -2494,12 +2501,24 @@ static void NWInstallFloatingButton(void) {
     self = [super initWithFrame:CGRectMake(0, 0, 0, 0)];
     if (!self) return nil;
 
-    _iconView = [[UIImageView alloc] initWithImage:NWSymbol(icon, 15)];
-    _iconView.tintColor = NWAccent();
+    // "Active" = VERT (Ghost / Localisation / Proxy), grise quand off.
+    UIColor *live = NWGreen();
+
+    // Tuile ronde derriere l'icone : fini le carre plat.
+    _tile = [[UIView alloc] init];
+    _tile.backgroundColor = [live colorWithAlphaComponent:on ? 0.20 : 0.08];
+    _tile.layer.cornerRadius = 15;
+    if (@available(iOS 13.0, *)) _tile.layer.cornerCurve = kCACornerCurveContinuous;
+    _tile.userInteractionEnabled = NO;
+    [self addSubview:_tile];
+
+    _iconView = [[UIImageView alloc] initWithImage:NWSymbol(icon, 16)];
+    _iconView.tintColor = on ? live : [UIColor colorWithWhite:1 alpha:0.35];
     _iconView.contentMode = UIViewContentModeScaleAspectFit;
+    _iconView.userInteractionEnabled = NO;
     [self addSubview:_iconView];
 
-    _titleLabel = NWLabelMake(title, 14.5, UIColor.whiteColor, UIFontWeightMedium);
+    _titleLabel = NWLabelMake(title, 15, UIColor.whiteColor, UIFontWeightSemibold);
     _titleLabel.numberOfLines = 1;
     [self addSubview:_titleLabel];
 
@@ -2510,13 +2529,21 @@ static void NWInstallFloatingButton(void) {
     }
 
     _toggle = [[UISwitch alloc] init];
-    _toggle.onTintColor = NWAccent();
+    _toggle.onTintColor = on ? live : [UIColor colorWithWhite:1 alpha:0.22];
+    _toggle.tintColor = [UIColor colorWithWhite:1 alpha:0.20];
     _toggle.on = on;
+    // Legere reduction : le switch standard reste trop massif a cote du texte.
+    _toggle.transform = CGAffineTransformMakeScale(0.92, 0.92);
     [self addSubview:_toggle];
 
     __weak typeof(self) weakSelf = self;
     NWBind(_toggle, ^(id sender) {
-        if (weakSelf.onChange) weakSelf.onChange(((UISwitch *)sender).isOn);
+        BOOL nowOn = ((UISwitch *)sender).isOn;
+        // Couleurs suivent l'etat immediatement (vert = active).
+        weakSelf.iconView.tintColor = nowOn ? NWGreen() : [UIColor colorWithWhite:1 alpha:0.35];
+        weakSelf.toggle.onTintColor = nowOn ? NWGreen() : [UIColor colorWithWhite:1 alpha:0.22];
+        weakSelf.tile.backgroundColor = [NWGreen() colorWithAlphaComponent:nowOn ? 0.20 : 0.08];
+        if (weakSelf.onChange) weakSelf.onChange(nowOn);
     });
     return self;
 }
@@ -2524,15 +2551,17 @@ static void NWInstallFloatingButton(void) {
 - (void)layoutSubviews {
     [super layoutSubviews];
     CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
-    CGFloat textW = w - 48 - 14 - 62;
-    _iconView.frame = CGRectMake(14, (h - 20) / 2.0, 20, 20);
+    CGFloat textW = w - 54 - 14 - 58;
+    // Tuile 30x30 + icone 16x16 parfaitement centrees dans la tuile.
+    _tile.frame = CGRectMake(12, (h - 30) / 2.0, 30, 30);
+    _iconView.frame = CGRectMake(12 + 7, (h - 16) / 2.0, 16, 16);
     _toggle.frame = CGRectMake(w - 14 - 51, (h - 31) / 2.0, 51, 31);
     if (_subLabel) {
         // SwitchListCell Blaze : titre + sous-titre empiles.
-        _titleLabel.frame = CGRectMake(48, (h - 36) / 2.0, textW, 19);
-        _subLabel.frame = CGRectMake(48, _titleLabel.frame.origin.y + 20, textW, 15);
+        _titleLabel.frame = CGRectMake(54, (h - 36) / 2.0, textW, 20);
+        _subLabel.frame = CGRectMake(54, _titleLabel.frame.origin.y + 21, textW, 15);
     } else {
-        _titleLabel.frame = CGRectMake(48, 0, textW, h);
+        _titleLabel.frame = CGRectMake(54, 0, textW, h);
     }
 }
 
@@ -2619,9 +2648,12 @@ static void NWInstallFloatingButton(void) {
         cell.textLabel.font = [UIFont systemFontOfSize:14.5 weight:UIFontWeightMedium];
         cell.detailTextLabel.textColor = NWDim();
         cell.detailTextLabel.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightRegular];
-        cell.tintColor = NWAccent();
+        cell.tintColor = NWGreen();
+        // Option selectionnee : pastille arrondie (pas de carre plat).
         UIView *sel = [[UIView alloc] init];
-        sel.backgroundColor = [UIColor colorWithWhite:1 alpha:0.05];
+        sel.backgroundColor = [NWGreen() colorWithAlphaComponent:0.16];
+        sel.layer.cornerRadius = 12;
+        if (@available(iOS 13.0, *)) sel.layer.cornerCurve = kCACornerCurveContinuous;
         cell.selectedBackgroundView = sel;
     }
     NSDictionary *opt = self.options[indexPath.row];
@@ -2740,9 +2772,10 @@ static void NWInstallFloatingButton(void) {
                                                     subtitle:@"Random data with Ghost?"
                                                           on:YES];
     ghostRow.backgroundColor = [UIColor colorWithWhite:1 alpha:0.06];
-    ghostRow.layer.cornerRadius = 14;
+    ghostRow.layer.cornerRadius = 18;
+    if (@available(iOS 13.0, *)) ghostRow.layer.cornerCurve = kCACornerCurveContinuous;
     ghostRow.translatesAutoresizingMaskIntoConstraints = NO;
-    [ghostRow.heightAnchor constraintEqualToConstant:60].active = YES;
+    [ghostRow.heightAnchor constraintEqualToConstant:64].active = YES;
     [stack addArrangedSubview:ghostRow];
     _ghostSwitch = ghostRow.toggle;
 
@@ -2754,7 +2787,7 @@ static void NWInstallFloatingButton(void) {
     [locRow.heightAnchor constraintEqualToConstant:52].active = YES;
 
     UIImageView *pin = [[UIImageView alloc] initWithImage:NWSymbol(@"location.fill", 16)];
-    pin.tintColor = NWBlue();
+    pin.tintColor = NWGreen();
     pin.contentMode = UIViewContentModeScaleAspectFit;
     pin.translatesAutoresizingMaskIntoConstraints = NO;
     [locRow addSubview:pin];
@@ -2968,7 +3001,7 @@ static void NWInstallFloatingButton(void) {
     self = [super initWithFrame:frame];
     if (!self) return nil;
     self.backgroundColor = NWCardGlass();
-    self.layer.cornerRadius = 16;
+    self.layer.cornerRadius = 20;
     self.layer.borderWidth = 1;
     self.layer.borderColor = NWLine().CGColor;
 
@@ -3130,6 +3163,10 @@ static void NWInstallFloatingButton(void) {
 }
 
 - (void)rebuild {
+    // Normalisation : on est TOUJOURS sur Containers (landing) ou un module.
+    // L'ancien menu principal (grille Ghost/Orbit) n'est plus jamais construit.
+    if (!self.module.length) self.module = @"containers";
+
     for (UIView *v in [self.bar.arrangedSubviews copy]) {
         [self.bar removeArrangedSubview:v];
         [v removeFromSuperview];
@@ -3147,8 +3184,10 @@ static void NWInstallFloatingButton(void) {
     for (UIView *v in [self.footer.subviews copy]) [v removeFromSuperview];
     self.contentBottom.constant = isContainers ? -170 : -28;
     if (isContainers) [self buildContainersFooter];
-    if (!self.module) {
-        [self buildHome];
+    // Landing : Containers. L'ancien menu (grille Ghost/Orbit/Proxy) est supprime,
+    // il ne doit plus etre affiche dans aucun cas.
+    if (!self.module || [self.module isEqualToString:@"containers"]) {
+        [self buildContainers];
     } else if ([self.module isEqualToString:@"device"] ||
                [self.module isEqualToString:@"about"]) {
         [self buildDevice];
@@ -3156,8 +3195,6 @@ static void NWInstallFloatingButton(void) {
         [self buildLocation];
     } else if ([self.module isEqualToString:@"ghost"]) {
         [self buildGhost];
-    } else if ([self.module isEqualToString:@"containers"]) {
-        [self buildContainers];
     } else if ([self.module isEqualToString:@"proxy"]) {
         [self buildProxy];
     } else if ([self.module isEqualToString:@"changelog"]) {
@@ -3180,86 +3217,89 @@ static void NWInstallFloatingButton(void) {
     return titles[self.module] ?: @"nine9wham";
 }
 
+// Rotation CONTINUE du logo Telegram (CABasicAnimation : infinie, lineaire,
+// ne consomme pas de recursion et ne bloque pas le thread principal).
+static void NWStartSpin(UIImageView *v) {
+    if (!v) return;
+    [v.layer removeAllAnimations];
+    CABasicAnimation *spin = [CABasicAnimation animationWithKeyPath:@"transform.rotation.z"];
+    spin.fromValue = @0.0;
+    spin.toValue = @(M_PI * 2.0);
+    spin.duration = 1.6;
+    spin.repeatCount = HUGE_VALF;
+    spin.removedOnCompletion = NO;
+    spin.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionLinear];
+    [v.layer addAnimation:spin forKey:@"nw.telegram.spin"];
+}
+
 - (void)buildTopBar {
-    if (!self.module) {
-        // Icône Telegram sans arrière-plan, centree, avec @nine9wham.
-        UIImageView *tg = [[UIImageView alloc] initWithImage:NWSymbol(@"paperplane.fill", 20)];
-        tg.tintColor = [UIColor colorWithWhite:1 alpha:0.9];
-        tg.contentMode = UIViewContentModeScaleAspectFit;
-        tg.translatesAutoresizingMaskIntoConstraints = NO;
-        [tg.widthAnchor constraintEqualToConstant:20].active = YES;
-        [tg.heightAnchor constraintEqualToConstant:20].active = YES;
-        [self.bar addArrangedSubview:tg];
+    // Landing = Containers. L'ancien menu (Ghost/Orbit) n'existe plus :
+    // toute navigation part de / revient a Containers.
+    BOOL isLanding = (self.module == nil || [self.module isEqualToString:@"containers"]);
 
-        UIStackView *titles = [[UIStackView alloc] init];
-        titles.axis = UILayoutConstraintAxisVertical;
-        titles.alignment = UIStackViewAlignmentCenter;
-        titles.spacing = 2;
-        UILabel *t = NWLabelMake(@"@nine9wham", 17, UIColor.whiteColor, UIFontWeightBold);
-        t.textAlignment = NSTextAlignmentCenter;
-        UILabel *s = NWLabelMake(@"Instagram · nine9wham", 10, NWDim(), UIFontWeightRegular);
-        s.textAlignment = NSTextAlignmentCenter;
-        [titles addArrangedSubview:t];
-        [titles addArrangedSubview:s];
-        [self.bar addArrangedSubview:titles];
-
-        // Rotation simple au clic sur l'icone Telegram.
-        UITapGestureRecognizer *rot = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(rotateTelegram)];
-        [tg addGestureRecognizer:rot];
-        tg.userInteractionEnabled = YES;
-
-        // Icône de traduction (globe) : ouvre le choix de langue FR / EN / ES.
-        UIImageView *lang = [[UIImageView alloc] initWithImage:NWSymbol(@"globe", 18)];
-        lang.tintColor = [UIColor colorWithWhite:1 alpha:0.7];
-        lang.contentMode = UIViewContentModeScaleAspectFit;
-        lang.translatesAutoresizingMaskIntoConstraints = NO;
-        [lang.widthAnchor constraintEqualToConstant:18].active = YES;
-        [lang.heightAnchor constraintEqualToConstant:18].active = YES;
-        [self.bar addArrangedSubview:lang];
-        UITapGestureRecognizer *tapLang = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(showLanguagePicker)];
-        [lang addGestureRecognizer:tapLang];
-        lang.userInteractionEnabled = YES;
-
+    if (isLanding) {
+        // Espaceur de gauche = largeur du bouton xmark de droite -> centre exact.
+        UIView *pad = [[UIView alloc] init];
+        pad.translatesAutoresizingMaskIntoConstraints = NO;
+        [pad.widthAnchor constraintEqualToConstant:32].active = YES;
+        [self.bar addArrangedSubview:pad];
     } else {
         [self.bar addArrangedSubview:NWIconButton(@"chevron.left", ^(id s){
-            self.module = nil;
+            self.module = @"containers";
             [self rebuild];
         })];
-        UIStackView *titles = [[UIStackView alloc] init];
-        titles.axis = UILayoutConstraintAxisVertical;
-        titles.spacing = 1;
-        UILabel *t = NWLabelMake([self moduleTitle], 17, UIColor.whiteColor, UIFontWeightBold);
-        UILabel *s = NWLabelMake(@"nine9wham", 10, NWDim(), UIFontWeightRegular);
-        [titles addArrangedSubview:t];
-        [titles addArrangedSubview:s];
-        [self.bar addArrangedSubview:titles];
-
-        // Copy Blaze : bouton "ellipsis" = menu "Sort by" sur l'ecran Containers.
-        if ([self.module isEqualToString:@"containers"]) {
-            UIButton *sortBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-            [sortBtn setImage:NWSymbol(@"ellipsis", 20) forState:UIControlStateNormal];
-            sortBtn.tintColor = UIColor.whiteColor;
-            sortBtn.showsMenuAsPrimaryAction = YES;
-            sortBtn.menu = [self sortMenu];
-            sortBtn.translatesAutoresizingMaskIntoConstraints = NO;
-            [sortBtn.widthAnchor constraintEqualToConstant:38].active = YES;
-            [sortBtn.heightAnchor constraintEqualToConstant:38].active = YES;
-            [self.bar addArrangedSubview:sortBtn];
-        }
     }
 
-        // Copy Blaze : bouton "ellipsis" = menu "Sort by" sur l'ecran Containers.
-        if ([self.module isEqualToString:@"containers"]) {
-            UIButton *sortBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-            [sortBtn setImage:NWSymbol(@"ellipsis", 20) forState:UIControlStateNormal];
-            sortBtn.tintColor = NWAccent();
-            sortBtn.showsMenuAsPrimaryAction = YES;
-            sortBtn.menu = [self sortMenu];
-            sortBtn.translatesAutoresizingMaskIntoConstraints = NO;
-            [sortBtn.widthAnchor constraintEqualToConstant:38].active = YES;
-            [sortBtn.heightAnchor constraintEqualToConstant:38].active = YES;
-            [self.bar addArrangedSubview:sortBtn];
-        }
+    [self.bar addArrangedSubview:NWSpacer()];
+
+    // --- Centre : logo Telegram BLEU qui tourne + @nine9wham + langue ---
+    UIImageView *tg = [[UIImageView alloc] initWithImage:NWSymbol(@"paperplane.fill", 22)];
+    tg.tintColor = [UIColor colorWithRed:0.165 green:0.663 blue:0.933 alpha:1.0]; // bleu Telegram
+    tg.contentMode = UIViewContentModeScaleAspectFit;
+    tg.translatesAutoresizingMaskIntoConstraints = NO;
+    [tg.widthAnchor constraintEqualToConstant:22].active = YES;
+    [tg.heightAnchor constraintEqualToConstant:22].active = YES;
+    NWStartSpin(tg);
+
+    UILabel *t = NWLabelMake(@"@nine9wham", 17, UIColor.whiteColor, UIFontWeightBold);
+    t.textAlignment = NSTextAlignmentCenter;
+    UILabel *sub = NWLabelMake(@"Instagram · nine9wham", 10, NWDim(), UIFontWeightRegular);
+    sub.textAlignment = NSTextAlignmentCenter;
+    UIStackView *titles = [[UIStackView alloc] init];
+    titles.axis = UILayoutConstraintAxisVertical;
+    titles.alignment = UIStackViewAlignmentCenter;
+    titles.spacing = 1;
+    [titles addArrangedSubview:t];
+    [titles addArrangedSubview:sub];
+
+    // Icone de traduction : juste a cote de @nine9wham, clique = choix FR/EN/ES.
+    UIImageView *lang = [[UIImageView alloc] initWithImage:NWSymbol(@"globe", 17)];
+    lang.tintColor = [UIColor colorWithWhite:1 alpha:0.75];
+    lang.contentMode = UIViewContentModeScaleAspectFit;
+    lang.translatesAutoresizingMaskIntoConstraints = NO;
+    lang.userInteractionEnabled = YES;
+    [lang.widthAnchor constraintEqualToConstant:20].active = YES;
+    [lang.heightAnchor constraintEqualToConstant:20].active = YES;
+    UITapGestureRecognizer *tapLang = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(showLanguagePicker)];
+    [lang addGestureRecognizer:tapLang];
+
+    UIStackView *center = [[UIStackView alloc] init];
+    center.axis = UILayoutConstraintAxisHorizontal;
+    center.alignment = UIStackViewAlignmentCenter;
+    center.spacing = 8;
+    [center addArrangedSubview:tg];
+    [center addArrangedSubview:titles];
+    [center addArrangedSubview:lang];
+    [self.bar addArrangedSubview:center];
+
+    // Appui long sur @nine9wham = menu "Sort by" (les 3 points ont ete retires).
+    if (isLanding) {
+        UILongPressGestureRecognizer *sortPress = [[UILongPressGestureRecognizer alloc]
+            initWithTarget:self action:@selector(titleLongPress:)];
+        [titles addGestureRecognizer:sortPress];
+        titles.userInteractionEnabled = YES;
+    }
 
     [self.bar addArrangedSubview:NWSpacer()];
     [self.bar addArrangedSubview:NWIconButton(@"xmark", ^(id s){
@@ -3267,19 +3307,37 @@ static void NWInstallFloatingButton(void) {
     })];
 }
 
-- (void)rotateTelegram {
-    // Rotation continue automatique (pas besoin de clic) — tourne lentement.
-    [UIView animateWithDuration:1.2 delay:0 options:UIViewAnimationOptionCurveLinear
-                     animations:^{
-        for (UIView *v in self.bar.arrangedSubviews) {
-            if ([v isKindOfClass:[UIImageView class]]) {
-                v.transform = CGAffineTransformMakeRotation(M_PI);
-            }
-        }
-    } completion:^(BOOL finished){
-        // Relancer pour boucle infinie
-        [self rotateTelegram];
-    }];
+// Appui long sur le titre -> tri des conteneurs (remplace les 3 points).
+- (void)titleLongPress:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    [self showSortSheet];
+}
+
+- (void)showSortSheet {
+    NSString *cur = [self currentSort];
+    __weak typeof(self) weakSelf = self;
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Sort by"
+                                                               message:nil
+                                                        preferredStyle:UIAlertControllerStyleActionSheet];
+    NSArray *defs = @[
+        @[@"name_az", @"Name (A-Z)"],
+        @[@"name_za", @"Name (Z-A)"],
+        @[@"date_new", @"Date Newest"],
+        @[@"date_old", @"Date Oldest"],
+    ];
+    for (NSArray *d in defs) {
+        BOOL on = [cur isEqualToString:d[0]];
+        [a addAction:[UIAlertAction actionWithTitle:(on ? [NSString stringWithFormat:@"✓  %@", d[1]] : d[1])
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *act){
+            [weakSelf setSort:d[0]];
+            [weakSelf rebuild];
+        }]];
+    }
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    UIPopoverPresentationController *pop = a.popoverPresentationController;
+    if (pop) { pop.sourceView = self.view; pop.sourceRect = CGRectMake(self.view.bounds.size.width/2, 60, 1, 1); }
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 - (void)showLanguagePicker {
@@ -3431,7 +3489,7 @@ static void NWInstallFloatingButton(void) {
 - (UIStackView *)addPaddedCard {
     UIView *card = [[UIView alloc] init];
     card.backgroundColor = NWCardGlass();
-    card.layer.cornerRadius = 16;
+    card.layer.cornerRadius = 18;
     card.layer.borderWidth = 1;
     card.layer.borderColor = NWLine().CGColor;
 
@@ -3456,7 +3514,7 @@ static void NWInstallFloatingButton(void) {
 - (UIStackView *)addRowsCard {
     UIView *card = [[UIView alloc] init];
     card.backgroundColor = NWCardGlass();
-    card.layer.cornerRadius = 16;
+    card.layer.cornerRadius = 18;
     card.layer.borderWidth = 1;
     card.layer.borderColor = NWLine().CGColor;
 
@@ -3505,7 +3563,7 @@ static void NWInstallFloatingButton(void) {
                 badges:(NSArray *)badges {   // @[ @[text, color], ... ]
     UIView *hero = [[UIView alloc] init];
     hero.backgroundColor = NWCardGlass();
-    hero.layer.cornerRadius = 18;
+    hero.layer.cornerRadius = 20;
     hero.layer.borderWidth = 1;
     hero.layer.borderColor = [tint colorWithAlphaComponent:0.35].CGColor;
 
@@ -3743,7 +3801,7 @@ static void NWInstallFloatingButton(void) {
     // --- Hero unifie "Location Spoofer" -----------------------------------
     NSString *cname = c[@"name"] ?: @"default";
     [self addHeroIcon:@"location.fill"
-                tint:NWBlue()
+                tint:(on ? NWGreen() : NWDim())
               kicker:@"Orbit"
                title:@"Location Spoofer"
             subtitle:@"Fake GPS per container, applied through the hooks"
@@ -3757,7 +3815,7 @@ static void NWInstallFloatingButton(void) {
                                                    title:@"Enable"
                                                subtitle:[NSString stringWithFormat:@"Orbit for %@ container", cname]
                                                      on:on];
-    [sw.heightAnchor constraintEqualToConstant:60].active = YES;
+    [sw.heightAnchor constraintEqualToConstant:64].active = YES;
     __weak typeof(self) weakSelf = self;
     sw.onChange = ^(BOOL value) {
         NSString *cid = NWActiveID;
@@ -4009,15 +4067,13 @@ static void NWInstallFloatingButton(void) {
     BOOL ghostOn = NWGhostEnabled();
     __weak typeof(self) weakSelf = self;
 
-    // --- Hero unifie "Ghost" ----------------------------------------------
+    // --- Hero unifie "Ghost" (sans badge "Spoof ON" : demande explicite) ----
     [self addHeroIcon:@"private:emoji.ghost"
                 tint:NWGreen()
               kicker:nil
                title:@"Ghost"
             subtitle:@"Device Fingerprint Spoofer"
-              badges:@[
-                  @[ghostOn ? @"Spoof ON" : @"Spoof OFF", ghostOn ? NWGreen() : NWDim()],
-              ]];
+              badges:@[]];
 
     // --- Section "Ghost" (copy Blaze : Enable · Ghost for %@ container) -----
     [self addSection:@"Ghost"];
@@ -4025,9 +4081,7 @@ static void NWInstallFloatingButton(void) {
                                                title:@"Enable"
                                            subtitle:[NSString stringWithFormat:@"Ghost for %@ container", cname]
                                                  on:ghostOn];
-    sw.iconView.tintColor = ghostOn ? NWGreen() : [UIColor colorWithWhite:1 alpha:0.25];
-    sw.toggle.onTintColor = ghostOn ? NWGreen() : [UIColor colorWithWhite:1 alpha:0.25];
-    [sw.heightAnchor constraintEqualToConstant:60].active = YES;
+    [sw.heightAnchor constraintEqualToConstant:64].active = YES;
     sw.onChange = ^(BOOL value) {
         NWUpdateContainerField(NWActiveID, @"ghostOn", @(value));
         NWReloadAfterStateChange();
@@ -4352,7 +4406,7 @@ static void NWInstallFloatingButton(void) {
         }
         cell.ghostBtn.tintColor = ghostOn ? [UIColor colorWithWhite:1 alpha:0.9]
                                           : [UIColor colorWithWhite:1 alpha:0.25];
-        cell.locBtn.tintColor = gpsOn ? NWBlue() : [UIColor colorWithWhite:1 alpha:0.25];
+        cell.locBtn.tintColor = gpsOn ? NWGreen() : [UIColor colorWithWhite:1 alpha:0.25];
         cell.proxyBtn.tintColor = proxyOn ? NWAccent() : [UIColor colorWithWhite:1 alpha:0.25];
 
         NSString *cidS = cid;
@@ -4406,6 +4460,39 @@ static void NWInstallFloatingButton(void) {
     UILabel *note = NWLabelMake(@"Each container keeps its own prefs, cookies, keychain, fingerprint and location. Tap a container to switch to it.",
                                 11, NWDim(), UIFontWeightRegular);
     [self.content addArrangedSubview:note];
+
+    // --- Accueil (l'ancien menu Ghost/Orbit a ete supprime) : tout est ici --
+    [self addSection:@"Location Spoofer"];
+    UIStackView *orb = [self addRowsCard];
+    [self addRow:orb icon:@"location.fill" title:@"Location Spoofer"
+           value:@"Fake GPS settings for this container" action:^{
+        [weakSelf openModule:@"location"];
+    }];
+
+    [self addSection:@"nine9wham"];
+    UIStackView *ver = [self addRowsCard];
+    [self addRow:ver icon:@"number" title:@"Version"
+           value:[NSString stringWithFormat:@"Version: %@",
+                  NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"] ?: @"453.0"]
+          action:nil];
+    [self addRow:ver icon:@"note.text" title:@"Changelog"
+           value:@"A list of updates and bug fixes" action:^{
+        [weakSelf openModule:@"changelog"];
+    }];
+
+    [self addSection:@"Support"];
+    UIStackView *sup = [self addRowsCard];
+    [self addRow:sup icon:@"paperplane.fill" title:@"Mon Telegram"
+           value:@"@nine9wham" action:^{
+        [weakSelf openModule:@"support"];
+    }];
+
+    [self addSection:@"Reset"];
+    UIStackView *rst = [self addRowsCard];
+    [self addRow:rst icon:@"trash.fill" title:@"Reset everything"
+           value:@"Erase all containers & settings" action:^{
+        [weakSelf openModule:@"reset"];
+    }];
 }
 
 // Feuille "New Container" (copy Blaze). locOpt : position choisie sur la carte.
@@ -4509,7 +4596,7 @@ static void NWInstallFloatingButton(void) {
                                                      on:on];
     sw.iconView.tintColor = on ? NWGreen() : [UIColor colorWithWhite:1 alpha:0.25];
     sw.toggle.onTintColor = on ? NWGreen() : [UIColor colorWithWhite:1 alpha:0.25];
-    [sw.heightAnchor constraintEqualToConstant:60].active = YES;
+    [sw.heightAnchor constraintEqualToConstant:64].active = YES;
     sw.onChange = ^(BOOL value) {
         NWUpdateProxyKey(@"on", @(value));
         [weakSelf rebuild];
