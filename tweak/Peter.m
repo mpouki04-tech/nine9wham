@@ -1434,14 +1434,19 @@ static UILabel *NWBadge(NSString *text, UIColor *tint) {
     return l;
 }
 
-// Emoji drapeau depuis un code ISO a 2 lettres ("FR" -> 🇫🇷).
+// Nom du pays depuis un code ISO a 2 lettres ("FR" -> "France").
 static NSString *NWFlagEmoji(NSString *iso) {
-    NSString *u = [iso uppercaseString];
-    if (u.length != 2) return @"🌍";
-    unichar a = [u characterAtIndex:0], b = [u characterAtIndex:1];
-    if (a < 'A' || a > 'Z' || b < 'A' || b > 'Z') return @"🌍";
-    return [NSString stringWithFormat:@"%C%C\uFE0F",
-            (unichar)(0x1F1E6 + (a - 'A')), (unichar)(0x1F1E6 + (b - 'A'))];
+    static NSDictionary *map;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        map = @{
+            @"US": @"United States", @"GB": @"United Kingdom", @"FR": @"France",
+            @"ES": @"Spain", @"DE": @"Germany", @"IT": @"Italy", @"SA": @"Saudi Arabia",
+            @"BR": @"Brazil", @"JP": @"Japan", @"NL": @"Netherlands", @"AR": @"Argentina",
+        };
+    });
+    NSString *key = [iso uppercaseString];
+    return map[key] ?: iso;
 }
 
 static UILabel *NWSectionLabel(NSString *text) {
@@ -1816,24 +1821,21 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
 }
 
 - (MKAnnotationView *)mapView:(MKMapView *)mv viewForAnnotation:(id<MKAnnotation>)annotation {
-    if (annotation != _arrow) return nil;              // localisation reelle ignoree
+    if (annotation != _arrow) return nil;
     static NSString *rid = @"nw.arrow";
     MKAnnotationView *v = [mv dequeueReusableAnnotationViewWithIdentifier:rid];
     if (!v) {
         v = [[MKAnnotationView alloc] initWithAnnotation:annotation reuseIdentifier:rid];
         v.canShowCallout = NO;
-        v.bounds = CGRectMake(0, 0, 32, 32);
+        v.bounds = CGRectMake(0, 0, 28, 28);
 
-        // Fleche epineuse (pin) : une petite pointe qui indique exactement le lieu.
+        // Epingle pointee (triangle) avec pointe vers le bas
         UIView *badge = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 28, 28)];
-        badge.backgroundColor = UIColor.clearColor;
-        badge.layer.anchorPoint = CGPointMake(0.5, 0.85);   // pointe vers le bas
-
         CAShapeLayer *shape = [CAShapeLayer layer];
         UIBezierPath *path = [UIBezierPath bezierPath];
-        [path moveToPoint:CGPointMake(14, 0)];       // sommet
-        [path addLineToPoint:CGPointMake(0, 18)];    // bas gauche
-        [path addLineToPoint:CGPointMake(28, 18)];   // bas droit
+        [path moveToPoint:CGPointMake(14, 0)];
+        [path addLineToPoint:CGPointMake(0, 18)];
+        [path addLineToPoint:CGPointMake(28, 18)];
         [path closePath];
         shape.path = path.CGPath;
         shape.fillColor = NWAccent().CGColor;
@@ -1843,20 +1845,19 @@ static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *lab
         shape.shadowOffset = CGSizeMake(0, 2);
         [badge.layer addSublayer:shape];
 
-        // Petit cercle au centre de la pointe pour le style "epingle".
+        // Petit pin blanc au centre
         UIView *pin = [[UIView alloc] initWithFrame:CGRectMake(11, 11, 6, 6)];
         pin.backgroundColor = UIColor.whiteColor;
         pin.layer.cornerRadius = 3;
         [badge addSubview:pin];
 
-        v.bounds = CGRectMake(0, 0, 28, 28);
-        [v addSubview:badge];
-        // La pointe de la fleche touche la coordonnee exacte.
         v.centerOffset = CGPointMake(0, -14);
+        [v addSubview:badge];
     }
     v.annotation = annotation;
     return v;
 }
+
 
 - (void)mapView:(MKMapView *)mv didAddAnnotationViews:(NSArray<MKAnnotationView *> *)views {
     for (MKAnnotationView *v in views) {
@@ -2272,17 +2273,17 @@ static void NWInstallFloatingButton(void) {
 
     if (!NWMenuButton) {
         NWFloatingButton *b = [NWFloatingButton buttonWithType:UIButtonTypeCustom];
-        // Bouton TRANSLUCIDE carre (copy Blaze) : 4 petits carres vraiment centres.
-        b.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
-        b.layer.cornerRadius = 12;
+        // Bouton TRANSLUCIDE carre (copy Blaze) : 4 petits carres vraiment centres, plus grand et visible.
+        b.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.14];
+        b.layer.cornerRadius = 16;
         if (@available(iOS 13.0, *)) b.layer.cornerCurve = kCACornerCurveContinuous;
-        b.layer.borderWidth = 1.0;
-        b.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.20].CGColor;
+        b.layer.borderWidth = 1.2;
+        b.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.25].CGColor;
         b.layer.shadowColor = UIColor.blackColor.CGColor;
-        b.layer.shadowOpacity = 0.50;
-        b.layer.shadowRadius = 12;
-        b.layer.shadowOffset = CGSizeMake(0, 4);
-        // Icône 4 carres bien centree, peu d'espace autour.
+        b.layer.shadowOpacity = 0.55;
+        b.layer.shadowRadius = 14;
+        b.layer.shadowOffset = CGSizeMake(0, 5);
+        // Icône 4 carres bien centree, taille visible.
         [b setImage:NWGridIcon(26, [UIColor colorWithWhite:1 alpha:0.95]) forState:UIControlStateNormal];
         b.imageView.contentMode = UIViewContentModeScaleAspectFit;
         b.imageView.bounds = CGRectMake(0, 0, 26, 26);
@@ -2291,9 +2292,9 @@ static void NWInstallFloatingButton(void) {
         if (@available(iOS 13.0, *)) {
             UIVisualEffectView *blur = [[UIVisualEffectView alloc]
                 initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterialDark]];
-            blur.frame = CGRectMake(0, 0, 44, 44);
+            blur.frame = CGRectMake(0, 0, 60, 60);
             blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-            blur.layer.cornerRadius = 12;
+            blur.layer.cornerRadius = 16;
             blur.clipsToBounds = YES;
             blur.userInteractionEnabled = NO;
             [b addSubview:blur];
@@ -2307,11 +2308,11 @@ static void NWInstallFloatingButton(void) {
     NSNumber *ux = [ui[@"x"] isKindOfClass:[NSNumber class]] ? ui[@"x"] : nil;
     NSNumber *uy = [ui[@"y"] isKindOfClass:[NSNumber class]] ? ui[@"y"] : nil;
     CGSize s = root.bounds.size;
-    CGFloat x = ux ? ux.doubleValue : (s.width - 44 - 12);
-    CGFloat y = uy ? uy.doubleValue : (s.height * 0.45);
-    x = MAX(6, MIN(x, s.width - 44 - 6));
-    y = MAX(60, MIN(y, s.height - 44 - 34));
-    NWMenuButton.frame = CGRectMake(x, y, 44, 44);
+    CGFloat x = ux ? ux.doubleValue : (s.width / 2 - 30);
+    CGFloat y = uy ? uy.doubleValue : (s.height - 100);
+    x = MAX(6, MIN(x, s.width - 60 - 6));
+    y = MAX(60, MIN(y, s.height - 60 - 34));
+    NWMenuButton.frame = CGRectMake(x, y, 60, 60);
     if (NWMenuButton.superview != root) [root addSubview:NWMenuButton];
     NWLog("bouton flottant installe (%.0f, %.0f)", x, y);
 }
@@ -3247,6 +3248,19 @@ static void NWInstallFloatingButton(void) {
         }
     }
 
+        // Copy Blaze : bouton "ellipsis" = menu "Sort by" sur l'ecran Containers.
+        if ([self.module isEqualToString:@"containers"]) {
+            UIButton *sortBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+            [sortBtn setImage:NWSymbol(@"ellipsis", 20) forState:UIControlStateNormal];
+            sortBtn.tintColor = NWAccent();
+            sortBtn.showsMenuAsPrimaryAction = YES;
+            sortBtn.menu = [self sortMenu];
+            sortBtn.translatesAutoresizingMaskIntoConstraints = NO;
+            [sortBtn.widthAnchor constraintEqualToConstant:38].active = YES;
+            [sortBtn.heightAnchor constraintEqualToConstant:38].active = YES;
+            [self.bar addArrangedSubview:sortBtn];
+        }
+
     [self.bar addArrangedSubview:NWSpacer()];
     [self.bar addArrangedSubview:NWIconButton(@"xmark", ^(id s){
         [self dismissViewControllerAnimated:YES completion:nil];
@@ -3254,23 +3268,17 @@ static void NWInstallFloatingButton(void) {
 }
 
 - (void)rotateTelegram {
-    [UIView animateWithDuration:0.4 delay:0 options:UIViewAnimationOptionCurveEaseInOut
+    // Rotation continue automatique (pas besoin de clic) — tourne lentement.
+    [UIView animateWithDuration:1.2 delay:0 options:UIViewAnimationOptionCurveLinear
                      animations:^{
-        CGFloat angle = M_PI;
         for (UIView *v in self.bar.arrangedSubviews) {
             if ([v isKindOfClass:[UIImageView class]]) {
-                v.transform = CGAffineTransformMakeRotation(angle);
+                v.transform = CGAffineTransformMakeRotation(M_PI);
             }
         }
     } completion:^(BOOL finished){
-        [UIView animateWithDuration:0.4 delay:0 options:UIViewAnimationOptionCurveEaseInOut
-                         animations:^{
-            for (UIView *v in self.bar.arrangedSubviews) {
-                if ([v isKindOfClass:[UIImageView class]]) {
-                    v.transform = CGAffineTransformIdentity;
-                }
-            }
-        } completion:nil];
+        // Relancer pour boucle infinie
+        [self rotateTelegram];
     }];
 }
 
@@ -3390,24 +3398,11 @@ static void NWInstallFloatingButton(void) {
     });
     [self.footer addSubview:plus];
 
-    // Trois points en bas : menu "Sort by" (A-Z / Date).
-    UIButton *sortBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [sortBtn setImage:NWSymbol(@"ellipsis", 20) forState:UIControlStateNormal];
-    sortBtn.tintColor = NWDim();
-    sortBtn.backgroundColor = [UIColor colorWithWhite:1 alpha:0.10];
-    sortBtn.layer.cornerRadius = 14;
-    if (@available(iOS 13.0, *)) sortBtn.layer.cornerCurve = kCACornerCurveContinuous;
-    sortBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    sortBtn.accessibilityLabel = @"Sort by";
-    sortBtn.menu = [self sortMenu];
-    if (@available(iOS 13.0, *)) sortBtn.showsMenuAsPrimaryAction = YES;
-    [self.footer addSubview:sortBtn];
-
     [NSLayoutConstraint activateConstraints:@[
-        [sortBtn.trailingAnchor constraintEqualToAnchor:self.footer.trailingAnchor constant:-16],
-        [sortBtn.bottomAnchor constraintEqualToAnchor:self.footer.bottomAnchor constant:-30],
-        [sortBtn.widthAnchor constraintEqualToConstant:44],
-        [sortBtn.heightAnchor constraintEqualToConstant:44],
+        [plus.centerXAnchor constraintEqualToAnchor:self.footer.centerXAnchor],
+        [plus.bottomAnchor constraintEqualToAnchor:self.footer.bottomAnchor constant:-30],
+        [plus.widthAnchor constraintEqualToConstant:60],
+        [plus.heightAnchor constraintEqualToConstant:60],
     ]];
 }
 
@@ -4047,7 +4042,7 @@ static void NWInstallFloatingButton(void) {
     NSString *locId = fp[@"locale"] ?: @"en_US";
     NSString *iso = locId.length >= 3 ? [locId substringFromIndex:locId.length - 2] : @"US";
     [self addRow:country icon:@"flag.fill" title:@"Choose your preferred country"
-           value:[NSString stringWithFormat:@"%@ %@", NWFlagEmoji(iso), iso] action:^{
+           value:[NSString stringWithFormat:@"%@ (%@)", NWFlagEmoji(iso), iso] action:^{
         [weakSelf pickPreferredCountry];
     }];
 
@@ -4173,7 +4168,7 @@ static void NWInstallFloatingButton(void) {
     for (NSArray *p in pairs) {
         NSString *locale = p[0];
         NSString *iso = [locale substringFromIndex:locale.length - 2];
-        [opts addObject:@{@"title": [NSString stringWithFormat:@"%@ %@", NWFlagEmoji(iso), iso],
+        [opts addObject:@{@"title": [NSString stringWithFormat:@"%@ (%@)", NWFlagEmoji(iso), iso],
                           @"subtitle": [NSString stringWithFormat:@"%@ · %@", p[0], p[1]],
                           @"value": p[0], @"tz": p[1]}];
     }
@@ -4984,3 +4979,4 @@ static void NWInit(void) {
         NWLog("initialisation terminee — conteneur actif: %@", NWActiveID ?: @"(aucun)");
     }
 }
+
