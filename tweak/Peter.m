@@ -956,7 +956,7 @@ static NSString *NWCreateContainerWithLocGhost(NSString *name, NSDictionary *loc
     do { cid = [NSString stringWithFormat:@"c%ld", (long)n++]; } while (containers[cid]);
 
     // 3. Empreinte unique aleatoire (coherente avec la puce reelle)
-    NSDictionary *fp = NWGenerateFingerprint();
+    NSMutableDictionary *fp = [NWGenerateFingerprint() mutableCopy];
     // Nouveau conteneur : modele iPhone 12 aleatoire si compatible avec la puce reale.
     NSString *forced12 = NWRandomIPhone12IfCompatible(fp[@"realMachine"]);
     if (forced12) fp[@"model"] = forced12;
