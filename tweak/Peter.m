@@ -21,6 +21,7 @@
 #import <MapKit/MapKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <Security/Security.h>
+#import <CommonCrypto/CommonCrypto.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
@@ -878,6 +879,190 @@ static NSData *NWVaultRead(void) {
     OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)query, &res);
     if (st != errSecSuccess || !res) return nil;
     return (__bridge_transfer NSData *)res;
+}
+
+#pragma mark - Backup & Restore (survie re-install Sideloadly / mise a jour)
+
+// Dossier Documents (accessible via Fichiers / iCloud, survit a la re-install).
+static NSString *NWDocumentsDir(void) {
+    return NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+}
+
+static NSString *NWBackupDir(void) {
+    NSString *d = [NWDocumentsDir() stringByAppendingPathComponent:@"nine9wham_backups"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil];
+    return d;
+}
+
+// --- Chiffrement symetrique AES-256-CBC (mot de passe -> cle derivee PBKDF2) ---
+// Format fichier : [sel 16 octets][IV 16 octets][donnees chiffrees]
+
+static NSData *NWDeriveKey(NSString *password, NSData *salt, NSUInteger keyLen) {
+    NSMutableData *derived = [NSMutableData dataWithLength:keyLen];
+    CCKeyDerivationPBKDF(
+        kCCPBKDF2,
+        password.UTF8String, (CFIndex)password.length,
+        salt.bytes, (CFIndex)salt.length,
+        kCCPRFHmacAlgSHA256,
+        10000,                                 // iterations
+        derived.mutableBytes, keyLen);
+    return derived;
+}
+
+static NSData *NWEncryptData(NSData *plain, NSString *password, NSError **outErr) {
+    NSMutableData *salt = [NSMutableData dataWithLength:16];
+    NSMutableData *iv = [NSMutableData dataWithLength:16];
+    SecRandomCopyBytes(kSecRandomDefault, 16, salt.mutableBytes);
+    SecRandomCopyBytes(kSecRandomDefault, 16, iv.mutableBytes);
+
+    NSData *key = NWDeriveKey(password, salt, kCCKeySizeAES256);
+    NSUInteger bufSize = plain.length + kCCBlockSizeAES128;
+    NSMutableData *crypt = [NSMutableData dataWithLength:bufSize];
+    NSUInteger cryptLen = 0;
+    CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
+            key.bytes, kCCKeySizeAES256,
+            iv.bytes,
+            plain.bytes, (CFIndex)plain.length,
+            crypt.mutableBytes, (CFIndex)bufSize,
+            &cryptLen);
+    if (cryptLen == 0) {
+        if (outErr) *outErr = [NSError errorWithDomain:@"nine9wham.backup" code:1 userInfo:nil];
+        return nil;
+    }
+    [crypt replaceBytesInRange:NSMakeRange(cryptLen, 0) withBytes:NULL length:0];
+
+    NSMutableData *out = [NSMutableData data];
+    [out appendData:salt];
+    [out appendData:iv];
+    [out appendData:crypt];
+    return out;
+}
+
+static NSData *NWDecryptData(NSData *crypt, NSString *password, NSError **outErr) {
+    if (crypt.length < 32) { if (outErr) *outErr = [NSError errorWithDomain:@"nine9wham.backup" code:2 userInfo:nil]; return nil; }
+    NSData *salt = [crypt subdataWithRange:NSMakeRange(0, 16)];
+    NSData *iv = [crypt subdataWithRange:NSMakeRange(16, 16)];
+    NSData *ct = [crypt subdataWithRange:NSMakeRange(32, crypt.length - 32)];
+
+    NSData *key = NWDeriveKey(password, salt, kCCKeySizeAES256);
+    NSUInteger bufSize = ct.length + kCCBlockSizeAES128;
+    NSMutableData *plain = [NSMutableData dataWithLength:bufSize];
+    NSUInteger plainLen = 0;
+    CCCrypt(kCCDecrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
+            key.bytes, kCCKeySizeAES256,
+            iv.bytes,
+            ct.bytes, (CFIndex)ct.length,
+            plain.mutableBytes, (CFIndex)bufSize,
+            &plainLen);
+    if (plainLen == 0) { if (outErr) *outErr = [NSError errorWithDomain:@"nine9wham.backup" code:3 userInfo:nil]; return nil; }
+    [plain replaceBytesInRange:NSMakeRange(plainLen, 0) withBytes:NULL length:0];
+    return plain;
+}
+
+// Serialise l'etat complet (state + prefs/cookies de chaque conteneur) dans un seul dictionnaire.
+static NSDictionary *NWBackupPayload(void) {
+    NSMutableDictionary *payload = [NSMutableDictionary dictionary];
+    payload[@"version"] = @1;
+    payload[@"createdAt"] = @([[NSDate date] timeIntervalSince1970]);
+    payload[@"state"] = NWState ?: @{};
+
+    NSMutableDictionary *containersData = [NSMutableDictionary dictionary];
+    NSDictionary *st = NWState ?: @{};
+    NSDictionary *containers = st[@"containers"] ?: @{};
+    for (NSString *cid in containers) {
+        NSString *dir = NWContainerDir(cid);
+        NSMutableDictionary *cData = [NSMutableDictionary dictionary];
+        NSData *prefs = [NSData dataWithContentsOfFile:[dir stringByAppendingPathComponent:@"prefs.plist"]];
+        NSData *cookies = [NSData dataWithContentsOfFile:[dir stringByAppendingPathComponent:@"cookies.plist"]];
+        if (prefs) cData[@"prefs"] = prefs;
+        if (cookies) cData[@"cookies"] = cookies;
+        containersData[cid] = cData;
+    }
+    payload[@"containersData"] = containersData;
+    return payload;
+}
+
+// Restaure l'etat complet depuis un dictionnaire de backup.
+static BOOL NWRestorePayload(NSDictionary *payload, NSError **outErr) {
+    if (!payload) { if (outErr) *outErr = [NSError errorWithDomain:@"nine9wham.backup" code:4 userInfo:nil]; return NO; }
+    NSDictionary *st = payload[@"state"];
+    if (![st isKindOfClass:[NSDictionary class]]) { if (outErr) *outErr = [NSError errorWithDomain:@"nine9wham.backup" code:5 userInfo:nil]; return NO; }
+
+    // Ecrire state.plist
+    NSString *statePath = NWStatePath();
+    if (![st writeToFile:statePath atomically:YES]) { if (outErr) *outErr = [NSError errorWithDomain:@"nine9wham.backup" code:6 userInfo:nil]; return NO; }
+
+    // Restaurer prefs/cookies de chaque conteneur
+    NSDictionary *containersData = payload[@"containersData"] ?: @{};
+    for (NSString *cid in containersData) {
+        NSDictionary *cData = containersData[cid];
+        NSString *dir = NWContainerDir(cid);
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSData *prefs = cData[@"prefs"];
+        NSData *cookies = cData[@"cookies"];
+        if (prefs) [prefs writeToFile:[dir stringByAppendingPathComponent:@"prefs.plist"] atomically:YES];
+        if (cookies) [cookies writeToFile:[dir stringByAppendingPathComponent:@"cookies.plist"] atomically:YES];
+    }
+
+    // Recharger en memoire
+    NWState = st;
+    NWPersistState();
+    return YES;
+}
+
+// Exporte une sauvegarde chiffree dans Documents/nine9wham_backups/.
+// Retourne le chemin du fichier cree ou nil en cas d'erreur.
+static NSString *NWBackupExport(NSString *password, NSError **outErr) {
+    NSDictionary *payload = NWBackupPayload();
+    NSData *plist = [NSPropertyListSerialization dataWithPropertyList:payload
+                                                              format:NSPropertyListXMLFormat_v1_0
+                                                             options:0
+                                                               error:outErr];
+    if (!plist) return nil;
+
+    NSData *crypt = NWEncryptData(plist, password, outErr);
+    if (!crypt) return nil;
+
+    NSString *fileName = [NSString stringWithFormat:@"nine9wham_backup_%@.nw9",
+                          [[NSDate date] stringWithFormat:@"%.0f", [[NSDate date] timeIntervalSince1970]]];
+    NSString *path = [NWBackupDir() stringByAppendingPathComponent:fileName];
+    if (![crypt writeToFile:path atomically:YES]) { if (outErr) *outErr = [NSError errorWithDomain:@"nine9wham.backup" code:7 userInfo:nil]; return nil; }
+    NWLog("backup exporte: %@ (%lu octets)", path, (unsigned long)crypt.length);
+    return path;
+}
+
+// Importe une sauvegarde depuis un fichier chiffre.
+// Retourne YES si reussite.
+static BOOL NWBackupImport(NSString *filePath, NSString *password, NSError **outErr) {
+    NSData *crypt = [NSData dataWithContentsOfFile:filePath];
+    if (!crypt) { if (outErr) *outErr = [NSError errorWithDomain:@"nine9wham.backup" code:8 userInfo:nil]; return NO; }
+
+    NSData *plist = NWDecryptData(crypt, password, outErr);
+    if (!plist) return NO;
+
+    NSPropertyListFormat format = 0;
+    NSError *serr = nil;
+    id obj = [NSPropertyListSerialization propertyListWithData:plist options:0 format:&format error:&serr];
+    if (!obj || ![obj isKindOfClass:[NSDictionary class]]) {
+        if (outErr) *outErr = serr ?: [NSError errorWithDomain:@"nine9wham.backup" code:9 userInfo:nil];
+        return NO;
+    }
+    return NWRestorePayload((NSDictionary *)obj, outErr);
+}
+
+// Liste les fichiers de backup disponibles (plus recent en premier).
+static NSArray<NSString *> *NWListBackups(void) {
+    NSString *dir = NWBackupDir();
+    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
+    NSMutableArray *sorted = [files mutableArray];
+    [sorted sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+        NSString *pa = [dir stringByAppendingPathComponent:a];
+        NSString *pb = [dir stringByAppendingPathComponent:b];
+        NSDate *da = [[NSFileManager defaultManager] attributesOfItemAtPath:pa error:nil][NSFileModificationDate];
+        NSDate *db = [[NSFileManager defaultManager] attributesOfItemAtPath:pb error:nil][NSFileModificationDate];
+        return [db compare:da];
+    }];
+    return [sorted copy];
 }
 
 #pragma mark - Moteur conteneurs
@@ -4517,6 +4702,55 @@ static void NWInstallFloatingButton(void) {
                                 11, NWDim(), UIFontWeightRegular);
     foot.textAlignment = NSTextAlignmentCenter;
     [self.content addArrangedSubview:foot];
+
+    // --- Section "Backup & Restore" (survie re-install Sideloadly / mise a jour) ---
+    [self addSection:@"Backup & Restore"];
+    UIStackView *bak = [self addRowsCard];
+    [self addRow:bak icon:@"arrow.down.to.square" title:@"Export backup"
+           value:@"Sauvegarde chiffree de tous les comptes" action:^{
+        [weakSelf promptBackupPassword:YES completion:^(NSString *pw) {
+            NSError *err = nil;
+            NSString *path = NWBackupExport(pw, &err);
+            if (path) {
+                NWAlert(@"Backup exporte", [NSString stringWithFormat:@"Fichier : %@", path.lastPathComponent]);
+            } else {
+                NWAlert(@"Erreur export", err.localizedDescription ?: @"Echec");
+            }
+        }];
+    }];
+    [self addRow:bak icon:@"arrow.up.from.square" title:@"Import backup"
+           value:@"Restaurer les comptes depuis un fichier" action:^{
+        NSArray *backups = NWListBackups();
+        if (backups.count == 0) {
+            NWAlert(@"Aucun backup", @"Aucune sauvegarde trouvee dans Documents/nine9wham_backups/");
+            return;
+        }
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Choisir un backup"
+                                                                   message:nil
+                                                          preferredStyle:UIAlertControllerStyleActionSheet];
+        for (NSString *f in backups) {
+            [a addAction:[UIAlertAction actionWithTitle:f
+                                                 style:UIAlertActionStyleDefault
+                                               handler:^(UIAlertAction * _Nonnull act) {
+                [weakSelf promptBackupPassword:NO completion:^(NSString *pw) {
+                    NSString *path = [NWBackupDir() stringByAppendingPathComponent:f];
+                    NSError *err = nil;
+                    if (NWBackupImport(path, pw, &err)) {
+                        NWAlert(@"Backup restaure", @"Tous les comptes ont ete restaures. Redemarrage...");
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                                       dispatch_get_main_queue(), ^{ exit(0); });
+                    } else {
+                        NWAlert(@"Erreur import", err.localizedDescription ?: @"Echec");
+                    }
+                }];
+            }]];
+        }
+        [a addAction:[UIAlertAction actionWithTitle:@"Annuler" style:UIAlertActionStyleCancel handler:nil]];
+        a.popoverPresentationController.sourceView = self.view;
+        a.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds),
+                                                                self.view.bounds.size.height - 80, 1, 1);
+        [self presentViewController:a animated:YES completion:nil];
+    }];
 }
 
 - (void)buildReset {
@@ -4532,6 +4766,24 @@ static void NWInstallFloatingButton(void) {
     UILabel *note = NWLabelMake(@"If you only want to delete a container, do it from the container list.",
                                 11, NWDim(), UIFontWeightRegular);
     [self.content addArrangedSubview:note];
+}
+
+- (void)promptBackupPassword:(BOOL)isExport completion:(void (^)(NSString *password))completion {
+    UIAlertController *al = [UIAlertController alertControllerWithTitle:isExport ? @"Export backup" : @"Import backup"
+                                                                message:isExport ? @"Mot de passe pour chiffrer la sauvegarde :" : @"Mot de passe pour dechiffrer la sauvegarde :"
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+    [al addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"Mot de passe";
+        tf.secureTextEntry = YES;
+    }];
+    [al addAction:[UIAlertAction actionWithTitle:isExport ? @"Exporter" : @"Importer"
+                                         style:UIAlertActionStyleDefault
+                                       handler:^(UIAlertAction * _Nonnull act) {
+        NSString *pw = al.textFields.firstObject.text ?: @"";
+        if (completion) completion(pw);
+    }]];
+    [al addAction:[UIAlertAction actionWithTitle:@"Annuler" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:al animated:YES completion:nil];
 }
 
 // Confirmation du reset (copy Blaze : "Yes, I'm sure!" / "Cancel").

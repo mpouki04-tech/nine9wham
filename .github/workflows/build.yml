@@ -49,7 +49,7 @@ jobs:
             -Wall -Wextra -Wno-unused-parameter \
             -dynamiclib \
             -install_name @rpath/Peter.dylib \
-            -framework Foundation -framework UIKit -framework CoreLocation -framework Security \
+            -framework Foundation -framework UIKit -framework CoreLocation -framework Security -framework CommonCrypto \
             -framework MapKit -framework CoreGraphics -framework QuartzCore \
             -o build/Peter.dylib \
             tweak/Peter.m
