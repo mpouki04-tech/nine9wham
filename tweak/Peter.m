@@ -3094,21 +3094,21 @@ static void NWInstallFloatingButton(void) {
                                        handler:^(UIAlertAction * _Nonnull act) {
         NWSetLanguage(@"en");
         [self rebuild];
-        NWAlert(@"Language", @"English", nil);
+        NWAlert(@"Language", @"English");
     }]];
     [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"🇫🇷  Français"]
                                          style:UIAlertActionStyleDefault
                                        handler:^(UIAlertAction * _Nonnull act) {
         NWSetLanguage(@"fr");
         [self rebuild];
-        NWAlert(@"Langue", @"Français", nil);
+        NWAlert(@"Langue", @"Français");
     }]];
     [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"🇪🇸  Español"]
                                          style:UIAlertActionStyleDefault
                                        handler:^(UIAlertAction * _Nonnull act) {
         NWSetLanguage(@"es");
         [self rebuild];
-        NWAlert(@"Idioma", @"Español", nil);
+        NWAlert(@"Idioma", @"Español");
     }]];
     [a addAction:[UIAlertAction actionWithTitle:NWL(@"cancel", @"Cancel", @"Annuler", @"Cancelar")
                                          style:UIAlertActionStyleCancel
@@ -3210,32 +3210,16 @@ static void NWInstallFloatingButton(void) {
     if (@available(iOS 13.0, *)) sortBtn.layer.cornerCurve = kCACornerCurveContinuous;
     sortBtn.translatesAutoresizingMaskIntoConstraints = NO;
     sortBtn.accessibilityLabel = @"Sort by";
-    __weak typeof(self) wSelf2 = weakSelf;
-    [sortBtn addTarget:self action:@selector(showSortMenu:) forControlEvents:UIControlEventTouchUpInside];
+    sortBtn.menu = [self sortMenu];
+    if (@available(iOS 13.0, *)) sortBtn.showsMenuAsPrimaryAction = YES;
     [self.footer addSubview:sortBtn];
 
     [NSLayoutConstraint activateConstraints:@[
-        [plus.centerXAnchor constraintEqualToAnchor:self.footer.centerXAnchor],
-        [plus.bottomAnchor constraintEqualToAnchor:self.footer.bottomAnchor constant:-30],
-        [plus.widthAnchor constraintEqualToConstant:55],
-        [plus.heightAnchor constraintEqualToConstant:55],
-        [label.centerXAnchor constraintEqualToAnchor:self.footer.centerXAnchor],
-        [label.bottomAnchor constraintEqualToAnchor:plus.topAnchor constant:-4],
-        [label.heightAnchor constraintEqualToConstant:22],
         [sortBtn.trailingAnchor constraintEqualToAnchor:self.footer.trailingAnchor constant:-16],
         [sortBtn.bottomAnchor constraintEqualToAnchor:self.footer.bottomAnchor constant:-30],
         [sortBtn.widthAnchor constraintEqualToConstant:44],
         [sortBtn.heightAnchor constraintEqualToConstant:44],
     ]];
-}
-
-- (void)showSortMenu:(UIButton *)btn {
-    UIMenu *m = [self sortMenu];
-    if (@available(iOS 13.0, *)) {
-        btn.menu = m;
-        btn.showsMenuAsPrimaryAction = YES;
-        [btn presentMenuAsPrimaryAction];
-    }
 }
 
 // Menu d'actions d'un conteneur (Rename / Delete).
