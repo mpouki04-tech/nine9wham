@@ -495,6 +495,63 @@ static id NWHook_preferredLanguages(id self, SEL _cmd) {
     }
 }
 
+// +[NSLocale autoupdatingCurrentLocale] : deuxieme API utilises par les SDK
+// Meta pour connaitre la "langue du telephone". Cote empreinte, ce hook
+// ETAIT ABSENT -> Instagram voyait la vraie locale sur ce chemin-la.
+static id (*NWOrig_autoLocale)(id, SEL);
+static id NWHook_autoLocale(id self, SEL _cmd) {
+    @try {
+        if (NWGhostEnabled()) {
+            static NSLocale *cachedAuto = nil;
+            static NSString *cachedAutoId = nil;
+            NSString *eff = NWEffectiveLocale();
+            @synchronized ([NSLocale class]) {
+                if (!cachedAuto || ![cachedAutoId isEqualToString:eff]) {
+                    NSLocale *l = nil;
+                    @try { l = [[NSLocale alloc] initWithLocaleIdentifier:eff]; }
+                    @catch (NSException *e) { l = nil; }
+                    if (l) { cachedAuto = l; cachedAutoId = eff; }
+                }
+                if (cachedAuto) return cachedAuto;
+            }
+        }
+    } @catch (NSException *e) {
+        NWLog("autoupdatingCurrentLocale: %@", e.reason);
+    }
+    @try {
+        return NWOrig_autoLocale ? NWOrig_autoLocale(self, _cmd) : nil;
+    } @catch (NSException *e) {
+        NWLog("autoupdatingCurrentLocale(orig): %@", e.reason);
+        return [NSLocale currentLocale];
+    }
+}
+
+// -[NSBundle preferredLocalizations] (BUNDLE PRINCIPAL UNIQUEMENT) : la
+// langue de l'UI d'Instagram passe par ce chemin DANS le SDK Meta. Absent
+// des empreintes -> l'app ne "voyait" jamais la langue du conteneur ici.
+static id (*NWOrig_prefLocaliz)(id, SEL);
+static id NWHook_prefLocaliz(id self, SEL _cmd) {
+    @try {
+        if (self && [self isKindOfClass:[NSBundle class]]
+            && self == [NSBundle mainBundle] && NWGhostEnabled()) {
+            NSString *eff = NWEffectiveLocale();
+            if (eff.length) {
+                NSString *lang = [eff componentsSeparatedByString:@"_"].firstObject;
+                if ([lang isKindOfClass:[NSString class]] && lang.length)
+                    return @[lang];
+            }
+        }
+    } @catch (NSException *e) {
+        NWLog("preferredLocalizations: %@", e.reason);
+    }
+    @try {
+        return NWOrig_prefLocaliz ? NWOrig_prefLocaliz(self, _cmd) : @[@"en"];
+    } @catch (NSException *e) {
+        NWLog("preferredLocalizations(orig): %@", e.reason);
+        return @[@"en"];
+    }
+}
+
 // NSTimeZone --------------------------------------------------------------
 static id (*NWOrig_localTZ)(id, SEL);
 static id NWHook_localTZ(id self, SEL _cmd) {
@@ -675,6 +732,11 @@ static void NWInstallFingerprintHooks(void) {
     NWSwizzle([NSProcessInfo class], @selector(activeProcessorCount), (IMP)NWHook_activeCpuCount, &NWOrig_activeCpuCount);
     NWSwizzle(object_getClass([NSLocale class]), @selector(currentLocale), (IMP)NWHook_currentLocale, &NWOrig_currentLocale);
     NWSwizzle(object_getClass([NSLocale class]), @selector(preferredLanguages), (IMP)NWHook_preferredLanguages, &NWOrig_prefLangs);
+    // Deuxieme lecture de la langue du "telephone" par les SDK Meta :
+    // autoupdatingCurrentLocale (class) + preferredLocalizations (bundle
+    // principal). Ces empreintes ETAIENT absentes -> langue non detectee.
+    NWSwizzle(object_getClass([NSLocale class]), @selector(autoupdatingCurrentLocale), (IMP)NWHook_autoLocale, &NWOrig_autoLocale);
+    NWSwizzle([NSBundle class], @selector(preferredLocalizations), (IMP)NWHook_prefLocaliz, &NWOrig_prefLocaliz);
     NWSwizzle(object_getClass([NSTimeZone class]), @selector(localTimeZone), (IMP)NWHook_localTZ, &NWOrig_localTZ);
     NWSwizzle(object_getClass([NSTimeZone class]), @selector(systemTimeZone), (IMP)NWHook_sysTZ, &NWOrig_sysTZ);
     // Calendrier GREGORIEN force : les annees de naissance redeviennent normales
@@ -1744,11 +1806,33 @@ static NSString *NWCountryCode(void) {
 }
 
 // Identifiant de locale EFFECTIF : c'est la "langue du telephone" que voit
-// Instagram. Regle :
-//   - pays anglophone choisi (Etats-Unis, Royaume-Uni...) -> anglais ;
-//   - langue choisie dans le menu (FR / EN / ES)          -> cette langue ;
-//   - le pays sert de region (en_US, fr_FR, es_ES...).
+// Instagram. REGLAGE PAR CONTENEUR (chaque conteneur = un telephone unique) :
+//   1. Conteneur actif -> la langue vient de SA locale fp["locale"]
+//      (en_US -> anglais, es_ES -> espagnol). La langue du MENU ne s'applique
+//      JAMAIS au conteneur : sinon es_ES + menu anglais donnait "en_ES" et
+//      Instagram ne detectait PAS la langue du conteneur.
+//   2. Ghost sans conteneur valide -> langue du menu + pays du conteneur
+//      (Etats-Unis -> anglais) + pays comme region.
 static NSString *NWEffectiveLocale(void) {
+    // 1. Locale du conteneur : arbitre (langue integrale du fp, pas le menu).
+    NSString *cont = NWFPStr(@"locale");
+    if ([cont isKindOfClass:[NSString class]] && cont.length >= 5) {
+        NSArray *parts = [cont componentsSeparatedByString:@"_"];
+        NSString *lang = [parts.firstObject lowercaseString];
+        NSString *cc = [[cont substringFromIndex:cont.length - 2] uppercaseString];
+        BOOL langOK = (lang.length == 2 || lang.length == 3);
+        for (NSUInteger i = 0; langOK && i < lang.length; i++) {
+            unichar c = [lang characterAtIndex:i];
+            if (c < 'a' || c > 'z') langOK = NO;
+        }
+        BOOL ccOK = (cc.length == 2);
+        for (NSUInteger i = 0; ccOK && i < cc.length; i++) {
+            unichar c = [cc characterAtIndex:i];
+            if (c < 'A' || c > 'Z') ccOK = NO;
+        }
+        if (langOK && ccOK) return [NSString stringWithFormat:@"%@_%@", lang, cc];
+    }
+    // 2. Repli : langue du menu + pays (ancien reglage).
     NSString *cc = NWCountryCode();
     NSString *lang = [NWLanguage() lowercaseString];
     // Langue : 2-3 lettres minuscules uniquement (repli anglais sinon).
@@ -2112,11 +2196,139 @@ static NSArray<NSArray *> *NWCities(void) {
     return cities;
 }
 
+// ---------------------------------------------------------------------------
+// Langue/pays suivent la POSITION choisie (chaque conteneur = telephone unique)
+// ---------------------------------------------------------------------------
+// La position GPS donne le pays -> le telephone du conteneur adopte la langue
+// et le fuseau de CE pays (Etats-Unis -> anglais America/New_York). Colonnes :
+// [code pays, langue, fuseau, nom anglais tel que l'ecrit Nominatim].
+
+static NSArray<NSArray<NSString *> *> *NWCountryRows(void) {
+    static NSArray *rows;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        rows = @[
+            @[@"US", @"en", @"America/New_York", @"United States"],
+            @[@"GB", @"en", @"Europe/London", @"United Kingdom"],
+            @[@"CA", @"en", @"America/Toronto", @"Canada"],
+            @[@"AU", @"en", @"Australia/Sydney", @"Australia"],
+            @[@"IE", @"en", @"Europe/Dublin", @"Ireland"],
+            @[@"NZ", @"en", @"Pacific/Auckland", @"New Zealand"],
+            @[@"SG", @"en", @"Asia/Singapore", @"Singapore"],
+            @[@"ZA", @"en", @"Africa/Johannesburg", @"South Africa"],
+            @[@"NG", @"en", @"Africa/Lagos", @"Nigeria"],
+            @[@"KE", @"en", @"Africa/Nairobi", @"Kenya"],
+            @[@"PH", @"tl", @"Asia/Manila", @"Philippines"],
+            @[@"FR", @"fr", @"Europe/Paris", @"France"],
+            @[@"ES", @"es", @"Europe/Madrid", @"Spain"],
+            @[@"MX", @"es", @"America/Mexico_City", @"Mexico"],
+            @[@"AR", @"es", @"America/Argentina/Buenos_Aires", @"Argentina"],
+            @[@"CL", @"es", @"America/Santiago", @"Chile"],
+            @[@"CO", @"es", @"America/Bogota", @"Colombia"],
+            @[@"DE", @"de", @"Europe/Berlin", @"Germany"],
+            @[@"AT", @"de", @"Europe/Vienna", @"Austria"],
+            @[@"CH", @"de", @"Europe/Zurich", @"Switzerland"],
+            @[@"IT", @"it", @"Europe/Rome", @"Italy"],
+            @[@"NL", @"nl", @"Europe/Amsterdam", @"Netherlands"],
+            @[@"BE", @"nl", @"Europe/Brussels", @"Belgium"],
+            @[@"PT", @"pt", @"Europe/Lisbon", @"Portugal"],
+            @[@"BR", @"pt", @"America/Sao_Paulo", @"Brazil"],
+            @[@"SA", @"ar", @"Asia/Riyadh", @"Saudi Arabia"],
+            @[@"AE", @"ar", @"Asia/Dubai", @"United Arab Emirates"],
+            @[@"EG", @"ar", @"Africa/Cairo", @"Egypt"],
+            @[@"MA", @"ar", @"Africa/Casablanca", @"Morocco"],
+            @[@"TN", @"ar", @"Africa/Tunis", @"Tunisia"],
+            @[@"JP", @"ja", @"Asia/Tokyo", @"Japan"],
+            @[@"TR", @"tr", @"Europe/Istanbul", @"Turkey"],
+            @[@"RU", @"ru", @"Europe/Moscow", @"Russia"],
+            @[@"KR", @"ko", @"Asia/Seoul", @"South Korea"],
+            @[@"CN", @"zh", @"Asia/Shanghai", @"China"],
+            @[@"HK", @"zh", @"Asia/Hong_Kong", @"Hong Kong"],
+            @[@"SE", @"sv", @"Europe/Stockholm", @"Sweden"],
+            @[@"NO", @"nb", @"Europe/Oslo", @"Norway"],
+            @[@"DK", @"da", @"Europe/Copenhagen", @"Denmark"],
+            @[@"PL", @"pl", @"Europe/Warsaw", @"Poland"],
+            @[@"TH", @"th", @"Asia/Bangkok", @"Thailand"],
+            @[@"VN", @"vi", @"Asia/Ho_Chi_Minh", @"Vietnam"],
+            @[@"ID", @"id", @"Asia/Jakarta", @"Indonesia"],
+            @[@"IN", @"hi", @"Asia/Kolkata", @"India"],
+            @[@"IL", @"he", @"Asia/Jerusalem", @"Israel"],
+            @[@"UA", @"uk", @"Europe/Kyiv", @"Ukraine"],
+            @[@"RO", @"ro", @"Europe/Bucharest", @"Romania"],
+            @[@"GR", @"el", @"Europe/Athens", @"Greece"],
+        ];
+    });
+    return rows;
+}
+
+// Ligne pays dont le NOM termine le label (reverse geocoding Nominatim :
+// "Philadelphia, Pennsylvania, 19107, United States").
+static NSArray<NSString *> *NWCountryRowForLabel(NSString *label) {
+    if (![label isKindOfClass:[NSString class]] || label.length < 3) return nil;
+    for (NSArray<NSString *> *r in NWCountryRows()) {
+        NSString *nm = r[3];
+        NSRange hit = [label rangeOfString:nm
+                                   options:NSCaseInsensitiveSearch | NSDiacriticInsensitiveSearch];
+        if (hit.location == NSNotFound) continue;
+        if (hit.location + hit.length == label.length) return r;   // fin du label
+    }
+    return nil;
+}
+
+// Ecrit la langue et le fuseau DANS le fp du conteneur cid (pas seulement
+// l'actif) : chaque conteneur garde sa propre langue de "telephone".
+static void NWSetContainerLocale(NSString *cid, NSString *localeId, NSString *tz) {
+    @try {
+        if (!cid.length || ![localeId isKindOfClass:[NSString class]] || localeId.length < 5) return;
+        NSDictionary *st = NWState ?: @{};
+        NSMutableDictionary *containers = [st[@"containers"] mutableCopy] ?: [NSMutableDictionary dictionary];
+        NSMutableDictionary *c = [containers[cid] mutableCopy];
+        if (!c) return;
+        NSMutableDictionary *fp = [c[@"fp"] mutableCopy] ?: [NSMutableDictionary dictionary];
+        fp[@"locale"] = localeId;
+        if ([tz isKindOfClass:[NSString class]] && tz.length) fp[@"tz"] = tz;
+        c[@"fp"] = fp;
+        containers[cid] = c;
+        NSMutableDictionary *newSt = [st mutableCopy] ?: [NSMutableDictionary dictionary];
+        newSt[@"containers"] = containers;
+        NWSaveState(newSt);
+        NWPersistState();
+    } @catch (NSException *e) {
+        NWLog("set locale conteneur: %@", e.reason);
+    }
+}
+
+// Le pays reconnu s'applique au CONTENEUR cid : fp["locale"] + fp["tz"], et
+// si c'est le conteneur ACTIF, la langue du telephone est poussee tout de
+// suite (hooks NSLocale immediats + AppleLanguages/CFPreferences au restart).
+static void NWMapFollowCountry(NSString *cid, NSString *label) {
+    @try {
+        NSArray<NSString *> *r = NWCountryRowForLabel(label);
+        if (!r || !cid.length) return;
+        NSString *locId = [NSString stringWithFormat:@"%@_%@", r[1], r[0]];
+        NSDictionary *st = NWState ?: @{};
+        NSDictionary *c = st[@"containers"][cid];
+        if (![c isKindOfClass:[NSDictionary class]]) return;
+        NSDictionary *fp = c[@"fp"];
+        if ([fp isKindOfClass:[NSDictionary class]]
+            && [((NSDictionary *)fp)[@"locale"] isKindOfClass:[NSString class]]
+            && [((NSString *)((NSDictionary *)fp)[@"locale"]) isEqualToString:locId]) return;   // deja bon
+        NWSetContainerLocale(cid, locId, r[2]);
+        if ([cid isEqualToString:NWActiveID]) NWApplySystemLanguage();
+        NWLog("conteneur %@ adopte le pays du lieu choisi -> %@ (%@)",
+              cid, label, locId);
+    } @catch (NSException *e) {
+        NWLog("suite carte locale: %@", e.reason);
+    }
+}
+
 static void NWApplyLocation(NSString *cid, double lat, double lon, NSString *label) {
     if (!cid) return;
     NWUpdateContainerField(cid, @"loc", @{@"on": @YES, @"lat": @(lat), @"lon": @(lon),
                                           @"label": label ?: @""});
     NWReloadAfterStateChange();
+    // Le pays du point GPS impose la langue/fuseau du conteneur.
+    NWMapFollowCountry(cid, label);
 }
 
 #pragma mark - Carte du monde (sélecteur de localisation)
@@ -5210,6 +5422,8 @@ static void NWStartSpin(UIImageView *v) {
                 NSDictionary *newLoc = @{@"on": @YES, @"lat": @(lat), @"lon": @(lon),
                                          @"label": label.length ? label : @"Current Location"};
                 NWUpdateContainerField(cidS, @"loc", newLoc);
+                // Le pays du lieu choisi donne la langue + fuseau au conteneur.
+                NWMapFollowCountry(cidS, label);
                 if ([cidS isEqualToString:NWActiveID]) {
                     NWActiveLoc = newLoc;
                     NWReloadAfterStateChange();
@@ -5252,6 +5466,13 @@ static void NWStartSpin(UIImageView *v) {
     __weak typeof(self) weakSelf = self;
     sheet.onCreate = ^(NSString *name, NSDictionary *loc, BOOL ghostOn) {
         NSString *cid = NWCreateContainerWithLocGhost(name, loc ? loc : locOpt, ghostOn);
+        // La position initiale choisie donne son pays -> langue + fuseau du
+        // nouveau conteneur (chaque conteneur = un telephone unique).
+        if (cid.length) {
+            NSDictionary *src = loc ?: locOpt;
+            NSString *lbl = src[@"label"];
+            if ([lbl isKindOfClass:[NSString class]]) NWMapFollowCountry(cid, lbl);
+        }
         [weakSelf rebuild];
         // Pas d'activation ni de redemarrage automatique : le conteneur reste
         // inactif dans la liste, l'utilisateur le lance en tapant dessus.
