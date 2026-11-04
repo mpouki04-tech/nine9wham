@@ -33,6 +33,11 @@
 #import <dispatch/dispatch.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <execinfo.h>
 
 #define NWLog(fmt, ...) NSLog(@"[nine9wham] " fmt, ##__VA_ARGS__)
 
@@ -85,24 +90,32 @@ static void NWSaveState(NSDictionary *st) {
     NWActiveFP = nil;
     NWActiveLoc = nil;
     NSDictionary *cs = st[@"containers"];
-    NSDictionary *c = (NWActiveID && cs[NWActiveID]) ? cs[NWActiveID] : nil;
+    NSDictionary *c = (NWActiveID && [cs isKindOfClass:[NSDictionary class]] && [cs[NWActiveID] isKindOfClass:[NSDictionary class]])
+                      ? cs[NWActiveID] : nil;
     if (c) {
-        NWActiveFP = c[@"fp"];
-        NWActiveLoc = c[@"loc"];
+        // Garde-fou anti-crash : une valeur corrompue (liste/chaine a la place
+        // d'un dictionnaire) ferait un "unrecognized selector" DANS un hook
+        // (NSLocale/NSCalendar) au moment de la creation de compte.
+        id fp = c[@"fp"], loc = c[@"loc"];
+        NWActiveFP  = [fp isKindOfClass:[NSDictionary class]] ? fp : nil;
+        NWActiveLoc = [loc isKindOfClass:[NSDictionary class]] ? loc : nil;
     }
     [st writeToFile:NWStatePath() atomically:YES];
 }
 
 static NSDictionary *NWActiveContainer(NSDictionary *st) {
     NSString *aid = st[@"activeContainer"];
-    NSDictionary *cs = st[@"containers"];
-    return (aid && cs[aid]) ? cs[aid] : nil;
+    id cs = st[@"containers"];
+    if (![aid isKindOfClass:[NSString class]] || ![cs isKindOfClass:[NSDictionary class]]) return nil;
+    id c = cs[aid];
+    return [c isKindOfClass:[NSDictionary class]] ? c : nil;
 }
 
 // Ghost actif ou non (copy Blaze : "Enable · Ghost for %@ container").
 // Cle par conteneur "ghostOn" ; absente = actif (retrocompatible).
 static BOOL NWGhostEnabled(void) {
     NSDictionary *c = NWActiveContainer(NWState ?: @{});
+    if (![c isKindOfClass:[NSDictionary class]]) return YES;   // etat corrompu -> defaut
     id v = c[@"ghostOn"];
     if ([v isKindOfClass:[NSNumber class]]) return [v boolValue];
     return YES;
@@ -372,12 +385,23 @@ static NSString *NWRealSystemVersion(void) {
 
 static NSUUID *(*NWOrig_idfv)(id, SEL);
 static NSUUID *NWHook_idfv(id self, SEL _cmd) {
-    NSString *s = NWFPStr(@"idfv");
-    if (s) {
-        NSUUID *u = [[NSUUID alloc] initWithUUIDString:s];
-        if (u) return u;
+    // IDFV = cle d'inscription Instagram : appele pendant la creation de
+    // compte -> protege (jamais d'exception non catchee).
+    @try {
+        NSString *s = NWFPStr(@"idfv");
+        if (s) {
+            NSUUID *u = [[NSUUID alloc] initWithUUIDString:s];
+            if (u) return u;
+        }
+    } @catch (NSException *e) {
+        NWLog("idfv: %@", e.reason);
     }
-    return NWOrig_idfv ? NWOrig_idfv(self, _cmd) : nil;
+    @try {
+        return NWOrig_idfv ? NWOrig_idfv(self, _cmd) : nil;
+    } @catch (NSException *e) {
+        NWLog("idfv(orig): %@", e.reason);
+        return nil;
+    }
 }
 
 // NSProcessInfo -----------------------------------------------------------
@@ -611,12 +635,23 @@ static id NWHook_localeCalKey(id self, SEL _cmd, id key) {
 // IDFA (AdSupport charge a la demande) ------------------------------------
 static NSUUID *(*NWOrig_idfa)(id, SEL);
 static NSUUID *NWHook_idfa(id self, SEL _cmd) {
-    NSString *s = NWFPStr(@"idfa");
-    if (s) {
-        NSUUID *u = [[NSUUID alloc] initWithUUIDString:s];
-        if (u) return u;
+    // Appelle pendant la creation de compte (tracking d'inscription) :
+    // jamais d'exception non catchee depuis ce hook.
+    @try {
+        NSString *s = NWFPStr(@"idfa");
+        if (s) {
+            NSUUID *u = [[NSUUID alloc] initWithUUIDString:s];
+            if (u) return u;
+        }
+    } @catch (NSException *e) {
+        NWLog("idfa: %@", e.reason);
     }
-    return NWOrig_idfa ? NWOrig_idfa(self, _cmd) : nil;
+    @try {
+        return NWOrig_idfa ? NWOrig_idfa(self, _cmd) : nil;
+    } @catch (NSException *e) {
+        NWLog("idfa(orig): %@", e.reason);
+        return nil;
+    }
 }
 
 static void NWSwizzle(Class cls, SEL sel, IMP replacement, void *origStorage) {
@@ -826,7 +861,14 @@ static void NWDeliverFake(CLLocationManager *mgr) {
     if ([delegate respondsToSelector:sel]) {
         // Signature : void locationManager:(CLLocationManager*) didUpdateLocations:(NSArray*)
         typedef void (*Fn)(id, SEL, CLLocationManager *, NSArray *);
-        ((Fn)objc_msgSend)(delegate, sel, mgr, @[fake]);
+        // Jamais d'exception fatale : ce code tourne sur un timer toutes les
+        // 2 s, une exception lancee par le delegate d'Instagram tuerait l'app
+        // (creation de compte = delegate actif a ce moment-la).
+        @try {
+            ((Fn)objc_msgSend)(delegate, sel, mgr, @[fake]);
+        } @catch (NSException *e) {
+            NWLog("deliverFake: %@", e.reason);
+        }
     }
 }
 
@@ -1091,6 +1133,120 @@ static NSString *NWBackupDir(void) {
     NSString *d = [NWDocumentsDir() stringByAppendingPathComponent:@"nine9wham_backups"];
     [[NSFileManager defaultManager] createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil];
     return d;
+}
+
+#pragma mark - Rapporteur de crash (preuves, pas de suppositions)
+
+// Exception ObjC non catchee + signaux materiels -> Documents/nine9wham_crash.log
+// Consultable dans le menu : Support -> "Crash log" (copiable pour l'analyse).
+// Re-verifie toutes les 2 s : Instagram peut POSER son propre handler et
+// remplacer le notre -> on re-affirme le notre en chainant le leur.
+static NSString *NWCrashLogPath(void) {
+    return [NWDocumentsDir() stringByAppendingPathComponent:@"nine9wham_crash.log"];
+}
+
+// Copie C du chemin : utilisee par le handler de signal (aucun alloc ObjC,
+// le handler tourne dans un contexte ou Objective-C est interdit).
+static char NWCrashPathC[1024] = "";
+static NSUncaughtExceptionHandler *NWPrevExceptionHandler = NULL;
+static void NWCrashExceptionHandler(NSException *e);
+
+// Ecritures async-signal-safe (write uniquement).
+static void NWCrashWStr(int fd, const char *s) {
+    if (fd >= 0 && s) { ssize_t w = write(fd, s, strlen(s)); (void)w; }
+}
+static void NWCrashWHex(int fd, unsigned long long v) {
+    static const char *hx = "0123456789abcdef";
+    char b[20];
+    int i = 20;
+    do { b[--i] = hx[v & 0xF]; v >>= 4; } while (v && i > 0);
+    ssize_t w = write(fd, b + i, (size_t)(20 - i)); (void)w;
+}
+
+// SIGSEGV / SIGABRT / SIGBUS / SIGILL / SIGFPE : signal + adresse fautive +
+// pile (backtrace) ecrits en AVANT-COURS dans le fichier, puis comportement
+// par defaut (le systeme produit son crash classique).
+static void NWCrashSignal(int sig, siginfo_t *si, void *ctx) {
+    (void)ctx;
+    int fd = NWCrashPathC[0] ? open(NWCrashPathC, O_WRONLY | O_APPEND | O_CREAT, 0644) : -1;
+    if (fd >= 0) {
+        NWCrashWStr(fd, "\n=== nine9wham CRASH (signal) ===\nsignal: ");
+        const char *nm = "UNKNOWN";
+        switch (sig) {
+            case SIGSEGV: nm = "SIGSEGV"; break;
+            case SIGABRT: nm = "SIGABRT"; break;
+            case SIGBUS:  nm = "SIGBUS";  break;
+            case SIGILL:  nm = "SIGILL";  break;
+            case SIGFPE:  nm = "SIGFPE";  break;
+        }
+        NWCrashWStr(fd, nm);
+        NWCrashWStr(fd, "\nsi_addr: 0x");
+        NWCrashWHex(fd, si ? (unsigned long long)(uintptr_t)si->si_addr : 0);
+        NWCrashWStr(fd, "\n");
+        void *frames[64];
+        int n = backtrace(frames, 64);
+        if (n > 0) backtrace_symbols_fd(frames, n, fd);
+        close(fd);
+    }
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof(dfl));
+    dfl.sa_handler = SIG_DFL;
+    sigaction(sig, &dfl, NULL);
+    raise(sig);
+}
+
+// Exception ObjC non catchee : nom + raison + pile complete.
+static void NWCrashExceptionHandler(NSException *e) {
+    @try {
+        NSMutableString *s = [NSMutableString stringWithString:
+            @"=== nine9wham CRASH (exception ObjC) ===\n"];
+        [s appendFormat:@"date: %@\n", [NSDate date]];
+        [s appendFormat:@"name: %@\n", e.name ?: @"?"];
+        [s appendFormat:@"reason: %@\n", e.reason ?: @"?"];
+        [s appendString:@"stack:\n"];
+        for (NSString *line in (e.callStackSymbols ?: @[])) {
+            [s appendString:line];
+            [s appendString:@"\n"];
+        }
+        [s writeToFile:NWCrashLogPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        NWLog("exception non catchee: %@ — %@", e.name, e.reason);
+    } @catch (NSException *x) { (void)x; }
+    if (NWPrevExceptionHandler && NWPrevExceptionHandler != NWCrashExceptionHandler) {
+        NWPrevExceptionHandler(e);
+    }
+}
+
+// Re-affirme notre instrumentation sans jamais se battre avec un autre
+// handler : signaux uniquement si personne ne les a encore reclames
+// (le JIT de WebKit possede SIGILL/SIGBUS — on ne le touche pas).
+static void NWMaintainCrashReporter(void) {
+    NSUncaughtExceptionHandler *cur = NSGetUncaughtExceptionHandler();
+    if (cur != NWCrashExceptionHandler) {
+        if (cur) NWPrevExceptionHandler = cur;   // handler pose par Instagram
+        NSSetUncaughtExceptionHandler(NWCrashExceptionHandler);
+    }
+    if (!NWCrashPathC[0]) {
+        NSString *p = NWCrashLogPath();
+        strncpy(NWCrashPathC, p.fileSystemRepresentation ?: "", sizeof(NWCrashPathC) - 1);
+        NWCrashPathC[sizeof(NWCrashPathC) - 1] = '\0';
+    }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = NWCrashSignal;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    int sigs[] = { SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGFPE };
+    for (unsigned i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
+        struct sigaction cur2;
+        if (sigaction(sigs[i], NULL, &cur2) == 0 && cur2.sa_handler == SIG_DFL) {
+            sigaction(sigs[i], &sa, NULL);
+        }
+    }
+}
+
+static void NWInstallCrashReporter(void) {
+    NWMaintainCrashReporter();
+    NWLog("rapporteur de crash actif -> %@", NWCrashLogPath());
 }
 
 // --- Chiffrement symetrique AES-256-CBC (mot de passe -> cle derivee PBKDF2) ---
@@ -1641,6 +1797,18 @@ static void NWApplySystemLanguage(void) {
         [ud synchronize];
     } @catch (NSException *e) {
         NWLog("AppleLanguages non ecrit: %@", e.reason);
+    }
+    // Ecriture CFPreferences directe : NSBundle lit AppleLanguages via
+    // CFPreferences (cache separe de NSUserDefaults). Les deux ecritures
+    // font que le REDEMARRAGE recharge vraiment la locale d'Instagram.
+    @try {
+        CFPreferencesSetAppValue(CFSTR("AppleLanguages"), (__bridge CFPropertyListRef)tags,
+                                 kCFPreferencesCurrentApplication);
+        CFPreferencesSetAppValue(CFSTR("AppleLocale"), (__bridge CFPropertyListRef)eff,
+                                 kCFPreferencesCurrentApplication);
+        CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+    } @catch (NSException *e) {
+        NWLog("CFPreferences AppleLanguages non ecrit: %@", e.reason);
     }
 }
 
@@ -2448,12 +2616,34 @@ static UIViewController *NWTopVC(void) {
     }
     vc = w.rootViewController;
     while (vc.presentedViewController) vc = vc.presentedViewController;
+    // Ne JAMAIS presenter depuis une vue en cours de fermeture : UIKit leve
+    // alors "whose view is not in the window hierarchy" (exception non catchee
+    // = crash). On remonte au presentateur tant que la vue se ferme.
+    for (int guard = 0; guard < 8 && vc.isBeingDismissed && vc.presentingViewController; guard++) {
+        vc = vc.presentingViewController;
+    }
     return vc;
 }
 
-// Relance requise pour qu'Instagram recharge prefs / cookies / empreinte.
-static void NWAskRelaunch(NSString *raison) {
+// Relance requise pour qu'Instagram recharge prefs / cookies / empreinte
+// ET relise AppleLanguages (la locale est figee par NSBundle au lancement).
+static void NWAskRelaunchAfter(NSTimeInterval delay, NSString *raison);
+
+// Une tentative : si une vue est presentee / en cours d'animation, on RETENTE
+// quelques fois au lieu d'abandonner silencieusement (ca empechait le
+// "Restart required" apres le choix d'une langue ou d'un pays).
+static void NWAskRelaunchTry(NSString *raison, int n) {
     if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
+    UIViewController *top = NWTopVC();
+    if (top.presentedViewController || top.isBeingDismissed || top.isBeingPresented) {
+        if (n < 6) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ NWAskRelaunchTry(raison, n + 1); });
+        } else {
+            NWLog("relance proposee: une vue reste occupee (abandon)");
+        }
+        return;
+    }
     UIAlertController *a = [UIAlertController
         alertControllerWithTitle:@"Restart required"
         message:[NSString stringWithFormat:@"%@ needs to restart to apply this change.", raison]
@@ -2462,9 +2652,26 @@ static void NWAskRelaunch(NSString *raison) {
         exit(0);
     }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Later" style:UIAlertActionStyleCancel handler:nil]];
-    UIViewController *top = NWTopVC();
-    if (top.presentedViewController) return;
     [top presentViewController:a animated:YES completion:nil];
+}
+
+static void NWAskRelaunchAfter(NSTimeInterval delay, NSString *raison) {
+    if (delay > 0) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ NWAskRelaunchTry(raison, 0); });
+    } else {
+        NWAskRelaunchTry(raison, 0);
+    }
+}
+
+static void NWAskRelaunch(NSString *raison) {
+    NWAskRelaunchAfter(0, raison);
+}
+
+// Demande de relance un peu plus tard : laisse la feuille / l'alerte de choix
+// se terminer de se fermer avant de proposer "Restart required".
+static void NWAskRelaunchLater(NSString *raison) {
+    NWAskRelaunchAfter(0.7, raison);
 }
 
 // Fenetre overlay persistante (geree plus bas)
@@ -3669,9 +3876,14 @@ static void NWStartSpin(UIImageView *v) {
     // --- Slots lateraux de largeur FIXE et EGALE (32 pt) ------------------
     // Les deux cotes ont exactement la meme largeur : le groupe du milieu est
     // donc centre quoi qu'il arrive (aucune derive possible).
+    // HAUTEUR EXPLICITE (44 pt) : sans elle un UIView nu dans une stack en
+    // .center a une hauteur 0 -> le bouton 32x32 sort des bounds du slot ->
+    // hitTest:withEvent: renvoie nil sur le slot -> le X et le chevron
+    // etaient VISIBLES mais INTOUCHABLES (bug vague 4).
     UIView *leftSlot = [[UIView alloc] init];
     leftSlot.translatesAutoresizingMaskIntoConstraints = NO;
     [leftSlot.widthAnchor constraintEqualToConstant:32].active = YES;
+    [leftSlot.heightAnchor constraintEqualToConstant:44].active = YES;
     [self.bar addArrangedSubview:leftSlot];
 
     if (!isLanding) {
@@ -3686,7 +3898,8 @@ static void NWStartSpin(UIImageView *v) {
         ]];
     }
 
-    [self.bar addArrangedSubview:NWSpacer()];
+    UIView *spacerL = NWSpacer();
+    [self.bar addArrangedSubview:spacerL];
 
     // --- Centre : logo Telegram (pastille bleue + avion blanc) + @nine9wham
     UIView *badge = [[UIView alloc] init];
@@ -3737,7 +3950,17 @@ static void NWStartSpin(UIImageView *v) {
         initWithTarget:self action:@selector(showLanguagePicker)];
     [lang addGestureRecognizer:tapLang];
 
-    UIStackView *center = [[UIStackView alloc] initWithArrangedSubviews:@[badge, titles, lang]];
+    // Decalage optique : le couple [badge + @nine9wham] est a gauche du centre
+    // car le drapeau (26) + son gap (8) sont a droite de ce couple. On ajoute
+    // donc un padding de 26 pt en tete du groupe : le couple se retrouve
+    // EXACTEMENT au centre de la barre (maths : centre = (106 + L)/2 des deux
+    // cotes). Sans ce padding, "@nine9wham" restait ~17 pt sur la gauche.
+    UIView *pad = [[UIView alloc] init];
+    pad.translatesAutoresizingMaskIntoConstraints = NO;
+    [pad.widthAnchor constraintEqualToConstant:26].active = YES;
+    [pad.heightAnchor constraintEqualToConstant:1].active = YES;
+
+    UIStackView *center = [[UIStackView alloc] initWithArrangedSubviews:@[pad, badge, titles, lang]];
     center.axis = UILayoutConstraintAxisHorizontal;
     center.alignment = UIStackViewAlignmentCenter;
     center.spacing = 8;
@@ -3759,11 +3982,19 @@ static void NWStartSpin(UIImageView *v) {
 
     [self.bar addArrangedSubview:center];
 
-    [self.bar addArrangedSubview:NWSpacer()];
+    // Les deux spacers ont EXACTEMENT la meme largeur (contrainte d'egalite) :
+    // la repartition de l'espace restant n'est plus laissee au solveur, le
+    // groupe du milieu est donc toujours strictement centre.
+    UIView *spacerR = NWSpacer();
+    [self.bar addArrangedSubview:spacerR];
+    [NSLayoutConstraint activateConstraints:@[
+        [spacerR.widthAnchor constraintEqualToAnchor:spacerL.widthAnchor],
+    ]];
 
     UIView *rightSlot = [[UIView alloc] init];
     rightSlot.translatesAutoresizingMaskIntoConstraints = NO;
     [rightSlot.widthAnchor constraintEqualToConstant:32].active = YES;
+    [rightSlot.heightAnchor constraintEqualToConstant:44].active = YES;
     [self.bar addArrangedSubview:rightSlot];
     UIButton *close = NWIconButton(@"xmark", ^(id s){
         [self dismissViewControllerAnimated:YES completion:nil];
@@ -3813,33 +4044,36 @@ static void NWStartSpin(UIImageView *v) {
                                                                message:NWL(@"lang_msg", @"Choose the interface language", @"Choisir la langue de l'interface", @"Elegir el idioma de la interfaz")
                                                       preferredStyle:UIAlertControllerStyleAlert];
     // Langue automatique = celle du telephone (drapeau detecte automatiquement).
+    // IMPORTANT : NSBundle fige la localisation au lancement -> apres chaque
+    // choix on propose la RESTART pour qu'Instagram se retraduise vraiment
+    // (c'etait le bug "l'application ne se traduit pas automatiquement").
     [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"📱  Auto (Phone language)"]
                                          style:UIAlertActionStyleDefault
                                        handler:^(UIAlertAction * _Nonnull act) {
         NWSetLanguage(@"");
         [self rebuild];
-        NWAlert(@"Language", @"Auto");
+        NWAskRelaunchLater(@"Instagram");
     }]];
     [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"🇺🇸  English"]
                                          style:UIAlertActionStyleDefault
                                        handler:^(UIAlertAction * _Nonnull act) {
         NWSetLanguage(@"en");
         [self rebuild];
-        NWAlert(@"Language", @"English");
+        NWAskRelaunchLater(@"Instagram");
     }]];
     [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"🇫🇷  Français"]
                                          style:UIAlertActionStyleDefault
                                        handler:^(UIAlertAction * _Nonnull act) {
         NWSetLanguage(@"fr");
         [self rebuild];
-        NWAlert(@"Langue", @"Français");
+        NWAskRelaunchLater(@"Instagram");
     }]];
     [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"🇪🇸  Español"]
                                          style:UIAlertActionStyleDefault
                                        handler:^(UIAlertAction * _Nonnull act) {
         NWSetLanguage(@"es");
         [self rebuild];
-        NWAlert(@"Idioma", @"Español");
+        NWAskRelaunchLater(@"Instagram");
     }]];
     [a addAction:[UIAlertAction actionWithTitle:NWL(@"cancel", @"Cancel", @"Annuler", @"Cancelar")
                                          style:UIAlertActionStyleCancel
@@ -4753,6 +4987,9 @@ static void NWStartSpin(UIImageView *v) {
         NWApplySystemLanguage();   // pays -> langue du telephone (US = anglais)
         NWReloadAfterStateChange();
         [weakSelf rebuild];
+        // Pays/langue ecrits dans AppleLanguages : Instagram ne se retraduit
+        // qu'apres rechargement de NSBundle -> on propose la RESTART.
+        NWAskRelaunchLater(@"Instagram");
     }];
 }
 
@@ -4830,6 +5067,9 @@ static void NWStartSpin(UIImageView *v) {
         if (opt[@"tz"]) NWUpdateActiveFPKey(@"tz", opt[@"tz"]);
         NWApplySystemLanguage();   // locale -> langue du telephone
         [weakSelf rebuild];
+        // AppleLanguages change -> Instagram ne se retraduit qu'au rechargement
+        // de NSBundle : on propose la RESTART ( meme mecanique que le pays ).
+        NWAskRelaunchLater(@"Instagram");
     }];
 }
 
@@ -5301,6 +5541,30 @@ static void NWStartSpin(UIImageView *v) {
                    NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"] ?: @"453.0"]
           action:nil];
 
+    // Preuve du plantage (creation de compte) : nom + raison + pile, ecrits
+    // par le rapporteur installe au demarrage. A consulter apres un crash.
+    NSString *crashPath = NWCrashLogPath();
+    BOOL hasCrash = [[NSFileManager defaultManager] fileExistsAtPath:crashPath];
+    [self addRow:info icon:@"exclamationmark.triangle" title:@"Crash log"
+           value:hasCrash ? @"View / copy" : @"None yet"
+          action:^{
+        NSString *txt = [NSString stringWithContentsOfFile:NWCrashLogPath()
+                                                  encoding:NSUTF8StringEncoding error:nil];
+        if (!txt.length) {
+            NWAlert(@"Crash log", @"No crash recorded yet.");
+            return;
+        }
+        NSString *shown = txt.length > 1400 ? [txt substringFromIndex:txt.length - 1400] : txt;
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Crash log"
+                                                                   message:shown
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"Copy" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+            UIPasteboard.generalPasteboard.string = txt;
+        }]];
+        [a addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];
+        [weakSelf presentViewController:a animated:YES completion:nil];
+    }];
+
     UILabel *foot = NWLabelMake(@"Instagram modified · isolated containers · fake GPS · ghost fingerprint",
                                 11, NWDim(), UIFontWeightRegular);
     foot.textAlignment = NSTextAlignmentCenter;
@@ -5503,8 +5767,15 @@ static void NWCloseMenu(void) {
 }
 
 static void NWTogglePanel(void) {
-    if (NWDashInstance) NWCloseMenu();
-    else NWOpenMenu();
+    // Toujours en @try : appele depuis touchesEnded du bouton flottant, une
+    // exception UIKit ("not in the window hierarchy") tuerait l'app.
+    @try {
+        if (NWDashInstance) NWCloseMenu();
+        else NWOpenMenu();
+    } @catch (NSException *e) {
+        NWLog("toggle panel: %@", e.reason);
+        NWDashInstance = nil;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5522,12 +5793,17 @@ static id NWHook_defaultSessionCfg(id self, SEL _cmd) {
         NWLog("defaultSessionConfiguration: %@", e.reason);
     }
     // Si l'original a ete avale, on fournit quand meme une configuration
-    // valide : retourner nil ferait planter sessionWithConfiguration:.
+    // valide : retourner nil ferait planter sessionWithConfiguration: au
+    // moment ou Instagram verifie le nom de compte (= creation de compte).
     if (!cfg) {
         @try { cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration]; }
         @catch (NSException *e) { NWLog("ephemeralSessionConfiguration: %@", e.reason); }
-        if (!cfg) return cfg;
     }
+    if (!cfg) {
+        @try { cfg = [NSURLSessionConfiguration backgroundSessionConfigurationWithIdentifier:@"com.nine9wham.fb"]; }
+        @catch (NSException *e) { NWLog("backgroundSessionConfiguration: %@", e.reason); }
+    }
+    if (!cfg) return cfg;   // dernier recours (quasi impossible)
     @try {
         NSDictionary *p = NWActiveProxy();
         if (![p isKindOfClass:[NSDictionary class]]) return cfg;
@@ -5566,6 +5842,10 @@ static void NWFlushOnExit(void) {
 __attribute__((constructor))
 static void NWInit(void) {
     @autoreleasepool {
+        // 0. Rapporteur de crash : installe AVANT tout hook, pour capturer le
+        //    plantage a la creation de compte (nom + raison + pile).
+        NWInstallCrashReporter();
+
         NWLog("demarrage — Instagram %@", UIDevice.currentDevice.systemVersion);
 
         // 1. Etat (disque ou vault keychain si re-install)
@@ -5591,8 +5871,18 @@ static void NWInit(void) {
                                   2ull * NSEC_PER_SEC, 500ull * NSEC_PER_MSEC);
         dispatch_source_set_event_handler(ot, ^{
             @autoreleasepool {
-                NWEnsureOverlay();
-                NWInstallFloatingButton();
+                // Jamais d'exception non catchee depuis un timer : une
+                // exception lancee ici tue l'app au moment ou elle se
+                // produit (= pendant la creation de compte si ca arrive).
+                @try {
+                    // Instagram peut re-poser SON handler d'exception au fil du
+                    // temps : on re-affirme le notre (chaine conservee).
+                    NWMaintainCrashReporter();
+                    NWEnsureOverlay();
+                    NWInstallFloatingButton();
+                } @catch (NSException *e) {
+                    NWLog("timer overlay: %@", e.reason);
+                }
             }
         });
         dispatch_resume(ot);
