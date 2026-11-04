@@ -53,12 +53,19 @@ Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). San
 - **Anti-crash création de compte** : hook proxy (`NSURLSessionConfiguration`) rendu inerte (`NSNull`/mauvais types = exception fatale au moment de la vérification du pseudo) et **repli `ephemeralSessionConfiguration` si l’original lève** (retourner `nil` planterait `sessionWithConfiguration:`) ; `@try` sur **tous** les hooks `NSLocale` / `NSCalendar` / `preferredLanguages` ; identifiants de locale **validés** (ISO2 + langue 2-3 lettres → repli `en_US` / `en`) ; tags `AppleLanguages` en **BCP-47 strict** (plus d’underscore) ; `setDelegate:` CLLocation **encapsulé** (anti-exception) ; `vm_protect` du rebinding GOT **vérifié** (échec = pas d’écriture → pas de SIGSEGV).
 - **UI 100 % anglaise** : les dernières chaînes françaises (Backup & Restore : export/import, mot de passe, *Cancel*) passées par `NWL(...)` → EN / FR / ES à chaud.
 
+### Vague 5 (build actuel)
+
+- **X et chevron réellement touchables** : les `leftSlot` / `rightSlot` de la barre étaient des `UIView` **sans hauteur intrinsèque** dans une stack centrée → hauteur 0 → les boutons 32 × 32 tombaient **hors des `bounds`** et `hitTest` renvoyait `nil` (visibles, mais intouchables). **Fix** : hauteur explicite **44 pt** sur les deux slots.
+- **`@nine9wham` centré au point près** : padding de **26 pt** en tête du groupe central (`[pad, badge, titles, lang]`) + contrainte `spacerR.width == spacerL.width` → le couple pastille + titre tombe **exactement** au centre de la barre (sans ce padding, il restait ~17 pt sur la gauche).
+- **Instagram se traduit vraiment** : `NWApplySystemLanguage` écrivait `AppleLanguages`/`AppleLocale` dans `NSUserDefaults` **sans redémarrage** → `NSBundle` gardait la localisation figée. **Fix** : écriture **double** (`NSUserDefaults` **+** `CFPreferencesSetAppValue`/`CFPreferencesAppSynchronize`) puis **relance proposée** (0,7 s, avec 6 nouvelles tentatives si une vue est encore présentée) après le choix d’une langue, d’un pays ou d’une locale. États-Unis → Instagram en anglais, et inversement.
+- **Crash à la création de compte : preuves, pas de suppositions** — la cause exacte restant à prouver, le **rapporteur** (déjà actif) est désormais consultable : **Support → « Crash log »** (`Documents/nine9wham_crash.log`, nom + raison + pile, écrit en `write()` async-signal-safe, re-affirmé toutes les 2 s). Garde-fous ajoutés : `@try` autour du handler du timer 2 s et de l’ouverture du menu, **vérification de type** de l’état (`fp`/`loc`/`containers`/`ghostOn`), `NWDeliverFake` protégé, 3ᵉ repli réseau `backgroundSessionConfigurationWithIdentifier`, `NWTopVC` qui remonte les vues en cours de *dismissal*.
+
 ---
 
 ## Installer
 
 1. Télécharger l'IPA : **[Release `nine9wham`](https://github.com/mpouki04-tech/nine9wham/releases/download/nine9wham/nine9wham_instagram_453.ipa)**
-   sha256 : `ad3fcef1d629344f72a0c47785b2efa528fb60ebeed2a5377a7ff1f14f89729e` (338 669 525 octets)
+   sha256 : `cabb629cd06bd74d22ccec4113a9fd4b8d525ebbfee337bcc88019c98e230a0b` (338 673 720 octets)
 2. Ouvrir **Sideloadly** → sélectionner l'IPA → Install (certificat 7 jours, même Apple ID). Sideloadly est ici **uniquement** l'outil d'installation : aucune licence Blaze/Bumble n'est incluse.
 3. Lancer Instagram → le bouton **carré translucide (4 carrés)** apparaît **centré en bas**.
 
