@@ -1291,8 +1291,19 @@ static UIColor *NWLine(void)      { return [UIColor colorWithWhite:1.0 alpha:0.0
 // Langue de l'interface (en / fr / es). Sauvegarde dans l'etat.
 static NSString *NWLanguage(void) {
     NSDictionary *st = NWState ?: @{};
-    id l = st[@"uiLanguage"];
-    return [l isKindOfClass:[NSString class]] ? l : @"en";
+    // 1. Langue explicitement choisie dans le menu (ui.language).
+    id ui = st[@"ui"];
+    if ([ui isKindOfClass:[NSDictionary class]]) {
+        id l = ((NSDictionary *)ui)[@"language"];
+        if ([l isKindOfClass:[NSString class]] && ((NSString *)l).length) return l;
+    }
+    // 2. Ancien emplacement (compatibilite).
+    id legacy = st[@"uiLanguage"];
+    if ([legacy isKindOfClass:[NSString class]] && ((NSString *)legacy).length) return legacy;
+    // 3. Sinon : langue detectee automatiquement sur le telephone.
+    NSString *dev = NSLocale.currentLocale.languageCode;
+    if (dev.length) return [dev lowercaseString];
+    return @"en";
 }
 static void NWSetLanguage(NSString *lang) {
     NSDictionary *st = NWState ?: @{};
@@ -1300,15 +1311,39 @@ static void NWSetLanguage(NSString *lang) {
     ui[@"language"] = lang;
     NSMutableDictionary *newSt = [st mutableCopy] ?: [NSMutableDictionary dictionary];
     newSt[@"ui"] = ui;
+    newSt[@"uiLanguage"] = lang;
     NWSaveState(newSt);
 }
 
 // Traduction simple : retourne la chaine selon la langue active.
 static NSString *NWL(NSString *key, NSString *en, NSString *fr, NSString *es) {
     NSString *lang = NWLanguage();
-    if ([lang isEqualToString:@"fr"]) return fr ?: en;
-    if ([lang isEqualToString:@"es"]) return es ?: en;
+    if ([lang hasPrefix:@"fr"]) return fr ?: en;
+    if ([lang hasPrefix:@"es"]) return es ?: en;
     return en;
+}
+
+// Drapeau de la langue active : choisie dans le menu, sinon detectee sur le telephone.
+static NSString *NWLanguageFlag(void) {
+    static NSDictionary *map;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        map = @{
+            @"fr": @"🇫🇷", @"en": @"🇬🇧", @"es": @"🇪🇸", @"de": @"🇩🇪",
+            @"it": @"🇮🇹", @"pt": @"🇧🇷", @"ar": @"🇸🇦", @"ja": @"🇯🇵",
+            @"nl": @"🇳🇱", @"ru": @"🇷🇺", @"tr": @"🇹🇷", @"ko": @"🇰🇷",
+            @"zh": @"🇨🇳", @"pl": @"🇵🇱", @"sv": @"🇸🇪", @"hi": @"🇮🇳",
+            @"he": @"🇮🇱", @"id": @"🇮🇩", @"th": @"🇹🇭", @"vi": @"🇻🇳",
+        };
+    });
+    NSString *lang = [NWLanguage() lowercaseString];
+    NSString *f = map[lang];
+    if (f) return f;
+    if (lang.length >= 2) {
+        f = map[[lang substringToIndex:2]];
+        if (f) return f;
+    }
+    return @"🇬🇧";
 }
 
 static UIImage *NWSymbol(NSString *name, CGFloat pt) {
@@ -1339,10 +1374,9 @@ static UILabel *NWLabelMake(NSString *text, CGFloat size, UIColor *color, UIFont
 
 // Icone "4 petits carres" (menu Blaze) : dessinee pour rester nette a toute taille.
 static UIImage *NWGridIcon(CGFloat side, UIColor *color) {
-    // Padding interne : les 4 carres ne doivent JAMAIS toucher les bords
-    // (2*0.34 + 0.16 = 0.84 -> 8% de marge de chaque cote = cadrage net).
-    CGFloat sq = side * 0.34;          // carre de la grille
-    CGFloat gap = side * 0.16;         // espacement au centre
+    // Padding interne : 5% de marge de chaque cote, carres GENEREUX (0.37).
+    CGFloat sq = side * 0.37;          // carre de la grille
+    CGFloat gap = side * 0.14;         // espacement au centre
     UIGraphicsImageRenderer *r =
         [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(side, side)];
     UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
@@ -2237,8 +2271,10 @@ static void NWTogglePanel(void);   // declare avant NWFloatingButton
     CGFloat mid = v.bounds.size.width / 2;
     CGFloat tx = (self.center.x < mid) ? 8 + sz.width / 2
                                        : v.bounds.size.width - sz.width - 8 - sz.width / 2;
-    CGFloat ty = MIN(MAX(self.center.y, 60 + sz.height / 2),
-                     v.bounds.size.height - sz.height - 34 + sz.height / 2);
+    // Limites larges : coins haut et bas accessibles (50 pt sous le haut,
+    // 44 pt au-dessus du bas = zone home).
+    CGFloat ty = MIN(MAX(self.center.y, 50 + sz.height / 2),
+                     v.bounds.size.height - sz.height - 44 + sz.height / 2);
     CGPoint target = CGPointMake(tx, ty);
     // ease-in-out (mouvement dans la vue) + retour a l'echelle 1.
     [UIView animateWithDuration:0.2 delay:0 options:UIViewAnimationOptionCurveEaseInOut
@@ -2288,7 +2324,7 @@ static void NWInstallFloatingButton(void) {
         b.layer.shadowOpacity = 0.50;
         b.layer.shadowRadius = 12;
         b.layer.shadowOffset = CGSizeMake(0, 4);
-        [b setImage:NWGridIcon(24, [UIColor colorWithWhite:1 alpha:0.95]) forState:UIControlStateNormal];
+        [b setImage:NWGridIcon(28, [UIColor colorWithWhite:1 alpha:0.95]) forState:UIControlStateNormal];
         b.imageView.contentMode = UIViewContentModeCenter;
         b.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
         b.contentVerticalAlignment = UIControlContentVerticalAlignmentCenter;
@@ -2309,6 +2345,15 @@ static void NWInstallFloatingButton(void) {
         NWMenuButton = b;
     }
 
+    // Ajout au besoin AVANT toute garde : le bouton doit toujours etre present.
+    if (NWMenuButton.superview != root) [root addSubview:NWMenuButton];
+
+    // Ne JAMAIS repositionner pendant un glisser ou pendant une animation :
+    // le timer de 2 s remettait le bouton a sa position sauvegardee en plein
+    // drag, ce qui empechait d'aller au coin de l'ecran.
+    if (((NWFloatingButton *)NWMenuButton).dragging) return;
+    if (NWMenuButton.layer.animationKeys.count > 0) return;
+
     NSDictionary *ui = (NWState ?: @{})[@"ui"];
     NSNumber *ux = [ui[@"x"] isKindOfClass:[NSNumber class]] ? ui[@"x"] : nil;
     NSNumber *uy = [ui[@"y"] isKindOfClass:[NSNumber class]] ? ui[@"y"] : nil;
@@ -2316,10 +2361,10 @@ static void NWInstallFloatingButton(void) {
     // Position par defaut : centre horizontalement, en bas, au-dessus du footer.
     CGFloat x = ux ? ux.doubleValue : (s.width / 2.0 - 28);
     CGFloat y = uy ? uy.doubleValue : (s.height - 56 - 96);
+    // Limites larges : le bouton doit pouvoir atteindre les coins de l'ecran.
     x = MAX(8, MIN(x, s.width - 56 - 8));
-    y = MAX(60, MIN(y, s.height - 56 - 40));
+    y = MAX(50, MIN(y, s.height - 56 - 44));
     NWMenuButton.frame = CGRectMake(x, y, 56, 56);
-    if (NWMenuButton.superview != root) [root addSubview:NWMenuButton];
     NWLog("bouton flottant installe (%.0f, %.0f)", x, y);
 }
 
@@ -3252,13 +3297,14 @@ static void NWStartSpin(UIImageView *v) {
 
     [self.bar addArrangedSubview:NWSpacer()];
 
-    // --- Centre : logo Telegram BLEU qui tourne + @nine9wham + langue ---
-    UIImageView *tg = [[UIImageView alloc] initWithImage:NWSymbol(@"paperplane.fill", 22)];
+    // --- Centre : logo Telegram BLEU qui tourne + @nine9wham + drapeau ---
+    // Les deux cotes font EXACTEMENT 24 pt : le titre est donc vraiment centre.
+    UIImageView *tg = [[UIImageView alloc] initWithImage:NWSymbol(@"paperplane.fill", 24)];
     tg.tintColor = [UIColor colorWithRed:0.165 green:0.663 blue:0.933 alpha:1.0]; // bleu Telegram
     tg.contentMode = UIViewContentModeScaleAspectFit;
     tg.translatesAutoresizingMaskIntoConstraints = NO;
-    [tg.widthAnchor constraintEqualToConstant:22].active = YES;
-    [tg.heightAnchor constraintEqualToConstant:22].active = YES;
+    [tg.widthAnchor constraintEqualToConstant:24].active = YES;
+    [tg.heightAnchor constraintEqualToConstant:24].active = YES;
     NWStartSpin(tg);
 
     UILabel *t = NWLabelMake(@"@nine9wham", 17, UIColor.whiteColor, UIFontWeightBold);
@@ -3272,14 +3318,13 @@ static void NWStartSpin(UIImageView *v) {
     [titles addArrangedSubview:t];
     [titles addArrangedSubview:sub];
 
-    // Icone de traduction : juste a cote de @nine9wham, clique = choix FR/EN/ES.
-    UIImageView *lang = [[UIImageView alloc] initWithImage:NWSymbol(@"globe", 17)];
-    lang.tintColor = [UIColor colorWithWhite:1 alpha:0.75];
-    lang.contentMode = UIViewContentModeScaleAspectFit;
+    // Drapeau de la langue detectee sur le telephone (remplace le globe).
+    UILabel *lang = NWLabelMake(NWLanguageFlag(), 17, UIColor.whiteColor, UIFontWeightRegular);
+    lang.textAlignment = NSTextAlignmentCenter;
     lang.translatesAutoresizingMaskIntoConstraints = NO;
     lang.userInteractionEnabled = YES;
-    [lang.widthAnchor constraintEqualToConstant:20].active = YES;
-    [lang.heightAnchor constraintEqualToConstant:20].active = YES;
+    [lang.widthAnchor constraintEqualToConstant:24].active = YES;
+    [lang.heightAnchor constraintEqualToConstant:24].active = YES;
     UITapGestureRecognizer *tapLang = [[UITapGestureRecognizer alloc]
         initWithTarget:self action:@selector(showLanguagePicker)];
     [lang addGestureRecognizer:tapLang];
@@ -3344,6 +3389,14 @@ static void NWStartSpin(UIImageView *v) {
     UIAlertController *a = [UIAlertController alertControllerWithTitle:NWL(@"lang_title", @"Language", @"Langue", @"Idioma")
                                                                message:NWL(@"lang_msg", @"Choose the interface language", @"Choisir la langue de l'interface", @"Elegir el idioma de la interfaz")
                                                       preferredStyle:UIAlertControllerStyleAlert];
+    // Langue automatique = celle du telephone (drapeau detecte automatiquement).
+    [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"📱  Auto (Phone language)"]
+                                         style:UIAlertActionStyleDefault
+                                       handler:^(UIAlertAction * _Nonnull act) {
+        NWSetLanguage(@"");
+        [self rebuild];
+        NWAlert(@"Language", @"Auto");
+    }]];
     [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"🇬🇧  English"]
                                          style:UIAlertActionStyleDefault
                                        handler:^(UIAlertAction * _Nonnull act) {
@@ -3423,45 +3476,70 @@ static void NWStartSpin(UIImageView *v) {
     return [UIMenu menuWithTitle:@"Sort by" image:nil identifier:nil options:0 children:items];
 }
 
-// --- Pied de page "New Container" (copy Blaze) ----------------------------
+// Petits feedbacks tactiles communs (emil-design-eng : 140-180 ms, ease-out).
+- (void)nwPressIn:(UIButton *)b {
+    [UIView animateWithDuration:0.14 delay:0 options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{ b.transform = CGAffineTransformMakeScale(0.97, 0.97); }
+                     completion:nil];
+}
+- (void)nwPressOut:(UIButton *)b {
+    [UIView animateWithDuration:0.18 delay:0 options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{ b.transform = CGAffineTransformIdentity; }
+                     completion:nil];
+}
+
+// --- Pied de page "New Container" (rectangle semi-transparent) ------------
 - (void)buildContainersFooter {
     __weak typeof(self) weakSelf = self;
 
-    UIButton *label = [UIButton buttonWithType:UIButtonTypeCustom];
-    [label setTitle:@"New Container" forState:UIControlStateNormal];
-    [label setTitleColor:NWDim() forState:UIControlStateNormal];
-    label.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
-    label.translatesAutoresizingMaskIntoConstraints = NO;
-    NWBind(label, ^(id s){
-        __strong typeof(weakSelf) self2 = weakSelf;
-        if (self2) [self2 presentNewContainerSheet:nil];
-    });
-    [self.footer addSubview:label];
+    // Bouton RECTANGLE arrondi, semi-transparent : icone + libelle dedans,
+    // parfaitement centres (le libelle n'est plus une vue orpheline).
+    UIButton *pill = [UIButton buttonWithType:UIButtonTypeCustom];
+    pill.backgroundColor = [UIColor colorWithWhite:1 alpha:0.10];
+    pill.layer.cornerRadius = 16;
+    if (@available(iOS 13.0, *)) pill.layer.cornerCurve = kCACornerCurveContinuous;
+    pill.layer.borderWidth = 1;
+    pill.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.20].CGColor;
+    pill.layer.shadowColor = UIColor.blackColor.CGColor;
+    pill.layer.shadowOpacity = 0.35;
+    pill.layer.shadowRadius = 10;
+    pill.layer.shadowOffset = CGSizeMake(0, 4);
+    pill.translatesAutoresizingMaskIntoConstraints = NO;
+    pill.accessibilityLabel = @"New Container";
+    [self.footer addSubview:pill];
 
-    UIButton *plus = [UIButton buttonWithType:UIButtonTypeSystem];
-    [plus setImage:NWSymbol(@"plus", 24) forState:UIControlStateNormal];
-    plus.tintColor = UIColor.whiteColor;
-    plus.backgroundColor = NWAccent();
-    plus.layer.cornerRadius = 27.5;
-    plus.layer.shadowColor = UIColor.blackColor.CGColor;
-    plus.layer.shadowOpacity = 0.45;
-    plus.layer.shadowRadius = 8;
-    plus.layer.shadowOffset = CGSizeMake(0, 3);
-    if (@available(iOS 13.0, *)) plus.layer.cornerCurve = kCACornerCurveContinuous;
-    plus.translatesAutoresizingMaskIntoConstraints = NO;
-    plus.accessibilityLabel = @"New Container";
-    NWBind(plus, ^(id s){
-        __strong typeof(weakSelf) self2 = weakSelf;
-        if (self2) [self2 presentNewContainerSheet:nil];
-    });
-    [self.footer addSubview:plus];
+    UIImageView *ic = [[UIImageView alloc] initWithImage:NWSymbol(@"plus", 16)];
+    ic.tintColor = [UIColor colorWithWhite:1 alpha:0.95];
+    ic.contentMode = UIViewContentModeScaleAspectFit;
+
+    UILabel *lab = NWLabelMake(@"New Container", 13.5,
+                               [UIColor colorWithWhite:1 alpha:0.92], UIFontWeightSemibold);
+
+    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[ic, lab]];
+    row.axis = UILayoutConstraintAxisHorizontal;
+    row.alignment = UIStackViewAlignmentCenter;
+    row.spacing = 7;
+    row.userInteractionEnabled = NO;
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+    [pill addSubview:row];
 
     [NSLayoutConstraint activateConstraints:@[
-        [plus.centerXAnchor constraintEqualToAnchor:self.footer.centerXAnchor],
-        [plus.bottomAnchor constraintEqualToAnchor:self.footer.bottomAnchor constant:-30],
-        [plus.widthAnchor constraintEqualToConstant:60],
-        [plus.heightAnchor constraintEqualToConstant:60],
+        [pill.centerXAnchor constraintEqualToAnchor:self.footer.centerXAnchor],
+        [pill.bottomAnchor constraintEqualToAnchor:self.footer.bottomAnchor constant:-28],
+        [pill.widthAnchor constraintEqualToConstant:214],
+        [pill.heightAnchor constraintEqualToConstant:52],
+        [row.centerXAnchor constraintEqualToAnchor:pill.centerXAnchor],
+        [row.centerYAnchor constraintEqualToAnchor:pill.centerYAnchor],
     ]];
+
+    // Feedback tactile (emil-design-eng : 140 ms ease-out).
+    [pill addTarget:self action:@selector(nwPressIn:) forControlEvents:UIControlEventTouchDown];
+    [pill addTarget:self action:@selector(nwPressOut:)
+       forControlEvents:UIControlEventTouchUpOutside | UIControlEventTouchCancel | UIControlEventTouchDragExit];
+    NWBind(pill, ^(id s){
+        __strong typeof(weakSelf) self2 = weakSelf;
+        if (self2) [self2 presentNewContainerSheet:nil];
+    });
 }
 
 // Menu d'actions d'un conteneur (Rename / Delete).
@@ -4146,10 +4224,6 @@ static void NWStartSpin(UIImageView *v) {
            value:[NSString stringWithFormat:@"General info about %@", @"@nine9wham"] action:nil];
     [self addRow:ad icon:@"shippingbox" title:@"Bundle Identifier"
            value:(b.bundleIdentifier ?: @"—") action:nil];
-    [self addRow:ad icon:@"number" title:@"Version"
-           value:[NSString stringWithFormat:@"Version: %@ (%@)",
-                   info[@"CFBundleShortVersionString"] ?: @"453.0",
-                   info[@"CFBundleVersion"] ?: @"—"] action:nil];
 
     // --- Section "Device" (copy Blaze : Enable Spoof / Choose an iPhone) ----
     [self addSection:@"Device"];
@@ -4202,6 +4276,22 @@ static void NWStartSpin(UIImageView *v) {
            value:(fp[@"tz"] ?: @"—") action:^{
         [weakSelf pickTimezone];
     }];
+
+    // --- Fin de page Ghost : Support + Version (deplaces de l'ancien menu) --
+    [self addSection:@"Support"];
+    UIStackView *sup = [self addRowsCard];
+    [self addRow:sup icon:@"paperplane.fill" title:@"Mon Telegram"
+           value:@"@nine9wham" action:^{
+        [weakSelf openModule:@"support"];
+    }];
+
+    [self addSection:@"nine9wham"];
+    UIStackView *ver = [self addRowsCard];
+    [self addRow:ver icon:@"number" title:@"Version"
+           value:[NSString stringWithFormat:@"Version: %@ (%@)",
+                   info[@"CFBundleShortVersionString"] ?: @"453.0",
+                   info[@"CFBundleVersion"] ?: @"—"]
+          action:nil];
 
     UILabel *note = NWLabelMake(@"Spoofed values are applied per container through the hooks. Restart Instagram so the app reads the new fingerprint.",
                                 11, NWDim(), UIFontWeightRegular);
@@ -4461,32 +4551,9 @@ static void NWStartSpin(UIImageView *v) {
                                 11, NWDim(), UIFontWeightRegular);
     [self.content addArrangedSubview:note];
 
-    // --- Accueil (l'ancien menu Ghost/Orbit a ete supprime) : tout est ici --
-    [self addSection:@"Location Spoofer"];
-    UIStackView *orb = [self addRowsCard];
-    [self addRow:orb icon:@"location.fill" title:@"Location Spoofer"
-           value:@"Fake GPS settings for this container" action:^{
-        [weakSelf openModule:@"location"];
-    }];
-
-    [self addSection:@"nine9wham"];
-    UIStackView *ver = [self addRowsCard];
-    [self addRow:ver icon:@"number" title:@"Version"
-           value:[NSString stringWithFormat:@"Version: %@",
-                  NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"] ?: @"453.0"]
-          action:nil];
-    [self addRow:ver icon:@"note.text" title:@"Changelog"
-           value:@"A list of updates and bug fixes" action:^{
-        [weakSelf openModule:@"changelog"];
-    }];
-
-    [self addSection:@"Support"];
-    UIStackView *sup = [self addRowsCard];
-    [self addRow:sup icon:@"paperplane.fill" title:@"Mon Telegram"
-           value:@"@nine9wham" action:^{
-        [weakSelf openModule:@"support"];
-    }];
-
+    // --- Reset (seule section module restante sur Containers) ---------------
+    // Location Spoofer, Changelog, Version et Mon Telegram ont ete retires
+    // d'ici : Mon Telegram + Version sont maintenant dans Ghost (fin de page).
     [self addSection:@"Reset"];
     UIStackView *rst = [self addRowsCard];
     [self addRow:rst icon:@"trash.fill" title:@"Reset everything"
