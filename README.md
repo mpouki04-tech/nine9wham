@@ -39,19 +39,19 @@ Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). San
 
 ## Dernier build (interface)
 
-- **Bouton flottant refait** : 56 × 56 exacts (bouton = flou = rayon), icône 4 carrés **avec marge intérieure** (elle était collée aux bords), icône recentrée par UIKit, position par défaut **centrée en bas**.
-- **Barre du haut** : logo **Telegram bleu qui tourne en continu** + **@nine9wham bien centré**, icône **langue 🌐 juste à côté** (FR / EN / ES, traduction à chaud). Le mot **« Containers »** et les **3 points** ont été retirés → appui long sur `@nine9wham` = menu *Sort by*.
-- **Ancien menu supprimé** : la grille d’accueil Ghost/Orbit n’apparaît plus. Le retour (chevron) ramène toujours à **Containers** (landing). *Location Spoofer*, *Version*, *Changelog*, *Mon Telegram* et *Reset everything* sont maintenant en bas de l’écran Containers.
-- **Switches** : **vert quand activé** (Localisation, Ghost, Proxy), icône dans une **tuile ronde**, hauteur 64 pt, switch légèrement réduit. Hero **Ghost sans badge « Spoof ON »**.
-- **Localisation** : héros **vert quand le GPS est actif** (au lieu de bleu), icône 📍 des cellules en vert.
-- **Options** : sélection en **pastille arrondie verte** (plus de carré plat), cartes plus arrondies (18–20 pt).
+- **Bouton flottant** : 56 × 56 exacts, icône 4 carrés **agrandie** (carrés 0.37 du côté, 5 % de marge), recentrée par UIKit. **Glisser libre jusqu’aux coins** : le timer de 2 s ne repositionne plus pendant un drag (c’était ce qui bloquait le bouton « au milieu »), limites élargies (50 pt sous le haut, 44 pt au-dessus du bas).
+- **Pied de page** : « New Container » est maintenant **dans** un bouton **rectangle arrondi semi-transparent** (214 × 52, fond blanc 10 %, bordure 20 %, icône ＋ + texte centrés) — le libellé n’est plus une vue orpheline mal placée.
+- **Barre du haut** : logo **Telegram bleu qui tourne en continu** + **@nine9wham exactement centré** (deux côtés à 24 pt) + **drapeau de la langue détectée sur le téléphone** (🇫🇷/🇬🇧/🇪🇸…) qui remplace le globe → clic = choix FR / EN / ES / **Auto (Phone language)**. Le mot **« Containers »** et les **3 points** ont été retirés → **appui long sur `@nine9wham` = menu *Sort by***.
+- **Containers** : sections *Location Spoofer* et *Changelog* supprimées ; **Mon Telegram** et **Version** déplacés **en fin de page Ghost**. Il ne reste que *Reset everything*.
+- **Switches** : **vert quand activé** (Localisation, Ghost, Proxy), icône dans une **tuile ronde**, hauteur 64 pt. Hero **Ghost sans badge « Spoof ON »**, héros Localisation **vert quand le GPS est actif**.
+- **Langue** : enregistrée correctement (bug corrigé : elle était écrite d’un côté et lue de l’autre) + détection automatique de la langue du téléphone.
 
 ---
 
 ## Installer
 
 1. Télécharger l'IPA : **[Release `nine9wham`](https://github.com/mpouki04-tech/nine9wham/releases/download/nine9wham/nine9wham_instagram_453.ipa)**
-   sha256 : `c4e849948fc5a36f1de4c9b9e9984b158a092c2e4bbefe8afa5d8013e1747e1e` (338 660 815 octets)
+   sha256 : `a89de4b3ecc467da571a0eaa08f0d0d8d8aa7330bca5e7a8b7664c03ba6c4a41` (338 662 161 octets)
 2. Ouvrir **Sideloadly** → sélectionner l'IPA → Install (certificat 7 jours, même Apple ID). Sideloadly est ici **uniquement** l'outil d'installation : aucune licence Blaze/Bumble n'est incluse.
 3. Lancer Instagram → le bouton **carré translucide (4 carrés)** apparaît **centré en bas**.
 
@@ -61,12 +61,13 @@ Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). San
 
 ## Conteneurs : mode d'emploi
 
-- **Containers → ＋** (bouton flottant « New Container ») → feuille **New Container** : nom (bouton *Create* inactif tant que vide), switch *Enable Spoof*, ligne *Spoof Location* (petite icône carte) → **Create** → l'app redémarre → Instagram redemande tout (compte neuf, empreinte neuve).
+- **Containers → bouton « ＋ New Container »** (rectangle arrondi semi-transparent en bas de l’écran) → feuille **New Container** : nom (bouton *Create* inactif tant que vide), switch *Enable Spoof*, ligne *Spoof Location* (petite icône carte) → **Create** → l'app redémarre → Instagram redemande tout (compte neuf, empreinte neuve).
 - **Switch de conteneur** (tap sur la cellule) → alerte *« Are you sure you want to switch to the %@ container? Restarting the app is required! »* → *Yes, I'm sure!* → relance.
 - **Icônes de cellule** : 🛡 Ghost (menu Ghost complet) · 📍 Location (carte du monde directement) · 🌐 Proxy · **…** → *Rename / Delete Container*.
-- **Tri** : bouton **…** en haut à droite → **Sort by** → Name (A-Z) / Name (Z-A) / Date Newest / Date Oldest.
+- **Tri** : **appui long sur `@nine9wham`** (haut du menu) → **Sort by** → Name (A-Z) / Name (Z-A) / Date Newest / Date Oldest.
 - **Orbit / Maps** → carte du monde : recherche de lieu (barre de recherche sombre solide *Search a place...*), sélection manuelle, *Current Location*. **Maintien (long-press) sur la carte → flèche posée à l'endroit exact** de la localisation ; l'adresse s'affiche en bas dans la carte de verre. La barre Standard/Hybrid/Satellite a été retirée.
-- **Ghost** → switch *Enable* (coupe les hooks d'empreinte → valeurs réelles), pays préféré, *Formulate*, choix iPhone / Version / Storage / Device Name / Identifiers / Locale / TimeZone.
+- **Ghost** → switch *Enable* (coupe les hooks d'empreinte → valeurs réelles), pays préféré, *Formulate*, choix iPhone / Version / Storage / Device Name / Identifiers / Locale / TimeZone, et **en fin de page : Mon Telegram + Version**.
+- **Containers** → plus que *Reset everything* (Location Spoofer et Changelog retirés).
 
 ---
 
