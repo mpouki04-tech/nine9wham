@@ -53,6 +53,12 @@
 #define NWDevKeyOn       @"nw9.dev.on"         // masque global
 #define NWDevKeyPinOwner @"nw9.dev.pin.owner"  // conteneur proprietaire du pin
 #define NWSafeModeKey    @"nw9.safe.mode"      // safe-mode one-shot
+// Vague 9 : garde du scan getDeviceId incremental. Le scan note son debut ;
+// au lancement suivant, si le rapporteur de crash a ecrit pendant le scan,
+// l'etape 9 est neutralisee (et definitivement apres 2 crashs).
+#define NWScanStartKey   @"nw9.scan.start"
+#define NWScanFailsKey   @"nw9.scan.fails"
+#define NWScanOffKey     @"nw9.scan.off"
 
 // ---- v7 : declarations avancees (corps definis dans la section Device
 // identity, en aval). Les cles ci-dessus + ces protos rendent l'ordre du
@@ -7205,6 +7211,9 @@ static void NWScanGetDeviceIdStep(void) {
                            dispatch_get_main_queue(), ^{ NWScanGetDeviceIdStep(); });
         } else {
             NWGetIdScanRunning = NO;
+            // Scan termine sans crash : on efface le temoin de debut.
+            [[NSUserDefaults standardUserDefaults] removeObjectForKey:NWScanStartKey];
+            [[NSUserDefaults standardUserDefaults] synchronize];
             if (NWGetIdClasses) free(NWGetIdClasses);
             NWGetIdClasses = NULL;
             NWLog("device id : scan termine (%u classes)", NWGetIdClassCount);
@@ -7225,6 +7234,11 @@ static void NWInstall_getDeviceId(void) {
     }
     NWGetIdScanIndex = 0;
     NWGetIdScanRunning = YES;
+    // Temoin de debut : si l'app meurt pendant les lots, le prochain lancement
+    // le voit (via le rapporteur de crash) et neutralise l'etape 9.
+    NSUserDefaults *scanU = [NSUserDefaults standardUserDefaults];
+    [scanU setDouble:[NSDate date].timeIntervalSince1970 forKey:NWScanStartKey];
+    [scanU synchronize];
     // On ne scanne jamais dans le chemin d'appel : premier lot au prochain run.
     dispatch_async(dispatch_get_main_queue(), ^{ NWScanGetDeviceIdStep(); });
 }
@@ -7475,7 +7489,7 @@ static void NWPresentSafeModeUI(void) {
 
 // Change a chaque build publie : un nouveau dylib re-tente TOUTES les etapes
 // (sinon une etape neutralisee le resterait pour toujours).
-#define NWBuildID @"w9-1"
+#define NWBuildID @"w9-2"
 
 static int NWBootStopAt = 0;      // etapes >= cette valeur : neutralisees
 static int NWBootFaultStage = 0;  // etape responsable de l'echec precedent
@@ -7504,6 +7518,9 @@ static void NWBootBegin(void) {
             // Nouveau build : on repart propre, toutes les etapes retentees.
             [u removeObjectForKey:NW_BOOT_KEY_FAULT];
             [u removeObjectForKey:NW_BOOT_KEY_ALERT];
+            [u removeObjectForKey:NWScanStartKey];
+            [u removeObjectForKey:NWScanFailsKey];
+            [u removeObjectForKey:NWScanOffKey];
             [u setObject:NWBuildID forKey:NW_BOOT_KEY_BUILD];
         }
         int fault = (int)[u integerForKey:NW_BOOT_KEY_FAULT];
@@ -7512,6 +7529,27 @@ static void NWBootBegin(void) {
         int last = (int)[u integerForKey:NW_BOOT_KEY_STAGE];
         double now = [NSDate date].timeIntervalSince1970;
         BOOL failed = (!done && t0 > 0 && (now - t0) < 180.0);
+        // --- Vague 9 : le scan getDeviceId a-t-il tue le lancement precedent ?
+        //     Le scan note son heure de debut ; un crash ecrit le rapport a cet
+        //     instant. Si le rapport est plus recent que le debut du scan, la
+        //     cause est le scan -> etape 9 neutralisee. Un arret manuel de
+        //     l'app n'ecrit aucun rapport : aucune fausse detection.
+        BOOL scanOff = [u boolForKey:NWScanOffKey];
+        BOOL scanCrash = NO;
+        double scanStart = [u doubleForKey:NWScanStartKey];
+        if (scanStart > 0) {
+            NSDictionary *at = [[NSFileManager defaultManager]
+                attributesOfItemAtPath:NWCrashLogPath() error:nil];
+            NSDate *mt = at[NSFileModificationDate];
+            if (mt && mt.timeIntervalSince1970 >= scanStart) {
+                NSInteger n = [u integerForKey:NWScanFailsKey] + 1;
+                [u setInteger:n forKey:NWScanFailsKey];
+                if (n >= 2) [u setBool:YES forKey:NWScanOffKey];
+                scanCrash = YES;
+                NWLog("boot: crash pendant le scan getDeviceId (n=%ld)", (long)n);
+            }
+            [u removeObjectForKey:NWScanStartKey];
+        }
         if (failed) {
             if (fault > 0) {
                 // La recuperation a elle-meme echoue : on descend d'une etape
@@ -7529,6 +7567,11 @@ static void NWBootBegin(void) {
                   NWBootFaultStage, NWBootStageName(NWBootFaultStage));
         } else if (fault > 0) {
             NWBootFaultStage = fault;
+        }
+        // Scan neutralise (crash pendant les lots, ou 2 crashs constates) :
+        // on saute l'etape 9 mais tout le reste demarre normalement.
+        if ((scanCrash || scanOff) && NWBootFaultStage <= 0) {
+            NWBootFaultStage = 9;
         }
         NWBootStopAt = NWBootFaultStage;
         [u setDouble:now forKey:NW_BOOT_KEY_T0];
