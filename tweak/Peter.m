@@ -863,14 +863,24 @@ static int NWHook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, 
 }
 
 // ---------------------------------------------------------------------------
-// Rebinding GOT == fishhook maison TOUTES IMAGES.
+// Rebinding GOT == fishhook maison, IMAGES DE L'APP UNIQUEMENT.
 // MOTATIF (architecture shim evidente chez eux, reecrite ici) : Instagram
 // appelle SecItemAdd/CopyMatching/Update/Delete en C DIRECT avec
 // kSecAttrAccessGroup force -> nos hooks ObjC (accessGroup) ne couvrent PAS
 // ce chemin. Solution : remplacer les pointeurs cibles dans les sections
-// __got / __auth_got / __la_symbol_ptr / __nl_symbol_ptr de TOUTES les
-// images chargees. Notre image est exclue (dladdr) : les externes de Peter
-// restent reels (sinon nos hooks se rebindent eux-memes -> recursion).
+// __got / __auth_got / __la_symbol_ptr / __nl_symbol_ptr des images de
+// l'APP (binaire principal + frameworks du bundle).
+//
+// INTERDICTION ABSOLUE (vague 7b) : toucher le dyld shared cache.
+// Les libs systeme (Foundation/libsystem/Security) sont PRE-LIEES : leur
+// __got porte deja l'adresse finale de uname/sysctl/SecItem* -> dlsym
+// matche -> rebind garanti. Leurs appels internes passeraient alors par
+// NOS hooks, qui rappellent Foundation (NWFPStr/NWGhostEnabled) ->
+// recursion infinie -> stack overflow -> crash instantane a l'ouverture.
+// (C'est exactement ce qui faisait planter la vague 7 : seul le binaire
+//  principal etait rebind en vague 6b, d'ou un demarrage correct.)
+// Notre image est exclue (dladdr) : les externes de Peter restent reels
+// (sinon nos hooks se rebindent eux-memes -> recursion).
 // Les images chargees PLUS TARD sont couvertes par
 // _dyld_register_func_for_add_image : dyld declenche le callback deja pour
 // chaque image chargee (la passe initiale est couverte), puis a chaque
@@ -923,6 +933,25 @@ static void NWRbImage(const struct mach_header *mh, intptr_t slide) {
     void *selfBase = NULL;
     if (dladdr((void *)&NWRbImage, &di)) selfBase = di.dli_fbase;
     if ((const void *)mh == selfBase) return;   // notre image : JAMAIS rebind
+
+    // FILTRE Système (vague 7b) : on ne rebind QUE les images de l'app.
+    // Image 0 (le binaire principal) = cible primaire depuis la vague 6b :
+    // passage GARANTI, meme si dladdr reussit mal. Pour les autres images,
+    // dladdr sur l'entete donne son chemin ; tout ce qui vit dans /System
+    // ou /usr/lib (dyld shared cache) est SAUTE avant la moindre lecture
+    // ou ecriture de GOT.
+    if ((const void *)mh != _dyld_get_image_header(0)) {
+        Dl_info dim;
+        const char *ipath = NULL;
+        if (dladdr((const void *)mh, &dim) && dim.dli_fname) ipath = dim.dli_fname;
+        if (!ipath) return;   // chemin indetermine -> on ne touche rien
+        if (strncmp(ipath, "/System/", 8) == 0 ||
+            strncmp(ipath, "/usr/lib", 8) == 0 ||
+            strncmp(ipath, "/usr/lib64", 10) == 0 ||
+            strstr(ipath, "dyld_shared_cache") != NULL) {
+            return;   // lib systeme : rebind = recursion infinie -> crash
+        }
+    }
     const struct mach_header_64 *mh64 = (const struct mach_header_64 *)mh;
     int patched = 0;
     const uint8_t *cmd = (const uint8_t *)(mh64 + 1);
@@ -975,7 +1004,7 @@ static void NWRebindGOT(void) {
     if (armed) return;
     armed = YES;
     _dyld_register_func_for_add_image(NWRbImage);
-    NWLog("rebind global arme : 7 cibles SecItem*/sysctl/uname, toutes images");
+    NWLog("rebind app : 7 cibles SecItem*/sysctl/uname, images de l'app uniquement (shared cache exclu)");
 }
 
 #pragma mark - Fake GPS (localisation par conteneur)
