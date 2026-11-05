@@ -100,7 +100,7 @@ Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). San
 ## Installer
 
 1. Télécharger l'IPA : **[Release `nine9wham`](https://github.com/mpouki04-tech/nine9wham/releases/download/nine9wham/nine9wham_instagram_454.ipa)**
-   sha256 : `e188b314a2fd277b15706849fd3a7b8fd840ca9ce874378e2b6b49d497bdb20b` (344 127 300 octets)
+   sha256 : `bd55ae4a0ac1a674a867b12e662d2ead68918f2a287809ddab7f893de532d2a8` (343 771 505 octets)
 2. Ouvrir **Sideloadly** → sélectionner l'IPA → Install (certificat 7 jours, même Apple ID). Sideloadly est ici **uniquement** l'outil d'installation : aucune licence Blaze/Bumble n'est incluse.
 3. Lancer Instagram → le bouton **carré translucide (4 carrés)** apparaît **centré en bas**.
 
@@ -239,4 +239,55 @@ RyukGram/zx/Substrate/FLEX, un seul `LC_LOAD_WEAK_DYLIB` `@rpath/Peter.dylib`
 (+ `@rpath/NWSupport.dylib` faible et inexistant, ignore par dyld),
 `cryptid=0`, `LC_RPATH @executable_path/Frameworks`, `Peter.dylib` 510 560 o
 (minOS 15.0, sdk 17.5). CI : run `42089891033`, succes, **13 warnings**
+(identiques a la reference).
+
+### Vague 9 — fin du plantage a ~5 s + identite par conteneur
+
+**Cause du plantage a ~5 s apres l'ouverture.** Le scan global de
+`getDeviceId` (`objc_copyClassList` + `class_getInstanceMethod` sur **toutes**
+les classes, y compris les classes Swift d'Instagram) forcait la realisation de
+toutes les classes d'un coup, 6 s apres le lancement. Remplace par un scan
+**incremental** : `class_copyMethodList` (sans realisation), **lots de 100
+classes toutes les 45 ms** sur la main queue, `@autoreleasepool` par lot,
+`@try` par classe, garde anti-double-installation. Le hook repond d'abord
+l'identite du conteneur, donc l'app n'attend plus le scan.
+
+**Identite automatique et etanche par conteneur.**
+`NWGenerateFingerprintKeepingLocale` complete toute empreinte existante
+(modele, iOS, device ID, machine ID, FDID...) sans toucher a la langue ni au
+fuseau du conteneur. La migration s'execute au demarrage
+(`NWBootstrapState`) : chaque conteneur obtient son propre telephone, sans
+conflit. `NWRollIdentityForContainer` regenere l'appareil d'un conteneur
+precis. Le pin global de Device identity (Mask / Enter ID) est desormais
+**scopé au conteneur proprietaire** (`nw9.dev.pin.owner`) : un autre conteneur
+ne peut plus heriter du device ID / machine ID d'un autre.
+
+**Pays -> langue -> appareil.** `NWMapFollowCountry` ne regenere l'identite
+que si le **pays change** (deplacer la carte dans le meme pays ne change pas
+l'appareil). Choisir les Etats-Unis donne un appareil **entierement aleatoire**
+et applique l'anglais (New York -> anglais, Paris -> francais, Tokyo ->
+japonais). `NWSwitchContainer` et `NWBootstrapState` appliquent la langue du
+conteneur actif des le demarrage (relance proposee apres bascule).
+
+**UI Device identity comprehensible + noir translucide.** Le bouton flottant
+et la carte « Device identity » utilisent un flou `SystemMaterialDark` + voile
+noir (alpha 0.38). Deux cartes d'explication (EN/FR/ES) : « How it works » et
+« This container » (nom, pays et langue **en toutes lettres**, modele + iOS).
+Les items d'origine sont conserves : `Device identity`, `Real • ...`,
+`No machine ID yet`, `Mask everything & relaunch`, `Roll a new fingerprint`,
+`Enter ID manually...`, `Enter machine ID manually...`, `Copy current ID`,
+`Copy machine ID`, `Block Apple attestation: Off`, `Relaunch now`,
+`Hide button until relaunch`.
+
+**Listes en noms complets.** « Choose country » et « Choose Language »
+affichent « France », « francais », « Japanese — Japan · Asia/Tokyo » au lieu
+des codes `fr_FR` / `FR`.
+
+**IPA publiee (release `nine9wham`)** : `nine9wham_instagram_454.ipa` —
+**343 771 505 octets**, sha256
+`bd55ae4a0ac1a674a867b12e662d2ead68918f2a287809ddab7f893de532d2a8`
+(digest GitHub identique). Contenu verifie : 3640 entrees, un seul
+`LC_LOAD_WEAK_DYLIB` `@rpath/Peter.dylib`, `cryptid=0`, rpath
+`@executable_path/Frameworks`, `Peter.dylib` **512 528 o** contenant `w9-1`,
+aucun residu RyukGram. CI : run `42107873614`, succes, **13 warnings**
 (identiques a la reference).
