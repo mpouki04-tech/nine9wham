@@ -79,9 +79,9 @@ Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). San
 - **Le pays choisi suit tout** : nouvelle table de 48 pays `[code, langue, fuseau]` (`NWCountryRows`). Quand un lieu est choisi (goulot `NWApplyLocation` = carte du monde, cellule conteneur, sheet « New Container »), le **nom du pays en fin de label** est reconnu (reverse geocoding Nominatim, ex. *"…, United States"*) → le conteneur adopte **langue + fuseau + locale** du pays (`NWSetContainerLocale` écrit `fp["locale"]` + `fp["tz"]`, persistés). Choisir États-Unis → l'anglais (`en_US`, `America/New_York`) est appliqué au conteneur, immédiat pour l'actif + écrit dans `AppleLanguages`/`AppleLocale` pour le restart.
 - **Le menu ne pilote plus la langue du téléphone** : il ne change que l'UI du dashboard (traduits à chaud FR/EN/ES via `NWL`). La langue du téléphone est dérivée du conteneur actif uniquement (règle inchangée : pas d'écriture iOS quand le Ghost est OFF).
 
-### Vague 7 (build actuel) — architecture anti-détection + Device identity
+### Vague 7 — architecture anti-détection + Device identity
 
-- **Base propre** : `com.burbn.instagram_v454.0.0_sideload_clean.ipa` — les résiduels d'un autre tweak (bundle, dylib, dylib d'injection) ont été retirés de l'archive et les 2 `LC_LOAD_WEAK_DYLIB` réécrits vers `@rpath/Peter.dylib` ; `cryptid=0`, **minOS 15.0**, zéro résidu (strings + Info.plist).
+- **Base propre** : `com.burbn.instagram_v454.0.0_sideload_clean.ipa` — les résiduels d'un autre tweak (bundle, dylib, dylib d'injection, framework) ont été retirés de l'archive et les 2 `LC_LOAD_WEAK_DYLIB` réécrits vers `@rpath/Peter.dylib` ; `cryptid=0`, **minOS 15.0**, zéro résidu (strings + Info.plist) — dernier reliquat `CydiaSubstrate.framework` supprimé en vague 7c.
 - **Rebinding des images de l'app** : le rebind GOT (`uname` / `sysctl` / `sysctlbyname` + **`SecItemAdd/CopyMatching/Update/Delete`**) parcourt les sections `__got` / `__auth_got` / `__la_symbol_ptr` / `__nl_symbol_ptr` des images **de l'app** (binaire principal + frameworks du bundle), déjà chargées **et** celles chargées ensuite (`_dyld_register_func_for_add_image`), avec exclusion propre de notre image (`dladdr`) et `vm_protect VM_PROT_COPY`. **Le dyld shared cache est exclu** (`/System/`, `/usr/lib`) : rebind des libs système = récursion infinie dans nos hooks → crash instantané (correction vague 7b).
 - **Keychain en C** : les appels `SecItem*` faits en C par Instagram passent par des **wrappers** qui réécrivent `kSecAttrAccessGroup` vers le **vrai** groupe du certificat (item bidon → groupe réel) — repli direct vers l'API si pas encore rebindé.
 - **Conteneurs v2** : `-[LSBundleProxy groupContainerURLs]` (merge du faux conteneur) et `-[CKEntitlements initWithEntitlementsDict:]` (entitlement `com.apple.security.application-groups` injecté pour CloudKit), en plus du hook `NSFileManager` d'origine.
@@ -89,12 +89,18 @@ Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). San
 - **Safe mode** : *Support → « Disable all tweaks & relaunch »* coupe **tous** les hooks au prochain lancement (seuls le rapporteur de crash et le fix sideload restent actifs) ; l'UI de réactivation propose *Re-enable & relaunch* / *Keep*.
 - **`inject_dylib.py` idempotent** : si le `LC_LOAD_WEAK_DYLIB` est déjà présent, le script ne fait rien (rebuild local sûr).
 
+### Vague 7c (build actuel) — démarrage différé : fix du plantage à l'ouverture
+
+- **Cause racine identifiée par analyse reverse de l'IPA de référence (elle démarre)** : notre `__attribute__((constructor))` exécutait **tout synchrone pendant l'init dyld** — I/O keychain `SecItem*`, `dlopen(AdSupport)`, scan global des classes (`objc_copyClassList`), écritures `NSUserDefaults`/`CFPreferences`, enregistrement du rebind GOT et création de fenêtres UIKit. L'IPA de référence, elle, n'a **aucun constructeur C** (section `__mod_init_func` absente de ses dylibs) et diffuse toute son initialisation (`dispatch_after`, notifications d'app) **après** le chargement de dyld.
+- **Refonte** : le constructeur ne fait plus que le **rapporteur de crash** (aucune I/O, aucun dlopen, aucune fenêtre pendant le verrou dyld). Tout le reste — sideload fix, Device identity, état, hooks empreinte/GPS, rebind, proxy, overlay — part en `dispatch_async` sur la queue principale via `NWStartTweaks()`, donc avant toute interaction utilisateur ; l'overlay et le bouton sont rattrapés par le timer de 2 s.
+- **Base encore plus propre** : le dernier reliquat de l'archive d'origine, `CydiaSubstrate.framework` (4 entrées / 381 999 o), a été retiré → **3669 entrées**, binaire byte-identique (LC `@rpath/Peter.dylib` ×2 conservés), zéro référence à un autre tweak dans les LC ou le contenu.
+
 ---
 
 ## Installer
 
 1. Télécharger l'IPA : **[Release `nine9wham`](https://github.com/mpouki04-tech/nine9wham/releases/download/nine9wham/nine9wham_instagram_454.ipa)**
-   sha256 : `692f956e9cba047b6fb9fa28924af3833c6f4af97b025d13102cd79bae0bc525` (344 232 702 octets)
+   sha256 : `e188b314a2fd277b15706849fd3a7b8fd840ca9ce874378e2b6b49d497bdb20b` (344 127 300 octets)
 2. Ouvrir **Sideloadly** → sélectionner l'IPA → Install (certificat 7 jours, même Apple ID). Sideloadly est ici **uniquement** l'outil d'installation : aucune licence Blaze/Bumble n'est incluse.
 3. Lancer Instagram → le bouton **carré translucide (4 carrés)** apparaît **centré en bas**.
 
@@ -147,7 +153,7 @@ nine9wham/
 La consigne initiale visait une base tierce. La base utilisée est **454.0.0 propre** (`com.burbn.instagram_v454.0.0_sideload_clean.ipa`) :
 
 - `cryptid=0` (déjà décryptée), **minOS 15.0**, aucune modification du binaire d'origine,
-- **aucun dylib injecté** : les 2 `LC_LOAD_WEAK_DYLIB` résiduels d'un autre tweak ont été réécrits vers `@rpath/Peter.dylib` (même taille, NUL-pad) et les bundles/dylibs tiers retirés de l'archive,
+- **aucun dylib injecté** : les 2 `LC_LOAD_WEAK_DYLIB` résiduels d'un autre tweak ont été réécrits vers `@rpath/Peter.dylib` (même taille, NUL-pad) et les bundles/dylibs/frameworks tiers retirés de l'archive (dont `CydiaSubstrate.framework`),
 - `LC_RPATH @executable_path/Frameworks` **déjà présent** → injection valide sans toucher aux rpaths,
 - `CFBundleExecutable=Instagram`, zéro résidu (strings, clés Info.plist).
 
