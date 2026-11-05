@@ -7162,8 +7162,15 @@ static void NWPresentSafeModeUI(void) {
     } @catch (NSException *e) { NWLog("safe mode UI: %@", e.reason); }
 }
 
-__attribute__((constructor))
-static void NWInit(void) {
+// ---------------------------------------------------------------------------
+// Amorcage DIFFERE (meme architecture que l'IPA de reference qui fonctionne) :
+// le constructeur dyld ne fait que le strict minimum, SANS AUCUNE I/O. Tout le
+// reste — keychain SecItem, dlopen(AdSupport), scan global des classes,
+// ecriture de preferences, rebind GOT, fenetres UIKit — part en file sur la
+// queue principale, une fois dyld relache. C'etait le travail synchrone dans le
+// constructeur qui plantait l'app a l'ouverture.
+// ---------------------------------------------------------------------------
+static void NWStartTweaks(void) {
     @autoreleasepool {
         // 0. Rapporteur de crash : installe AVANT tout hook, pour capturer le
         //    plantage a la creation de compte (nom + raison + pile).
@@ -7260,6 +7267,25 @@ static void NWInit(void) {
                                                       usingBlock:^(NSNotification *n) { NWFlushOnExit(); }];
 
         NWLog("initialisation terminee — conteneur actif: %@", NWActiveID ?: @"(aucun)");
+    }
+}
+
+// Constructeur dyld : le SEUL travail acceptable ici est le rapporteur de
+// crash (ni I/O keychain, ni dlopen, ni scan de classes, ni UIKit pendant le
+// verrou dyld — c'etait exactement ce qui plantait l'app a l'ouverture).
+// Les hooks (sideload fix, empreinte, GPS, rebind, UI) demarrent des que la
+// queue principale tourne, avant toute interaction utilisateur.
+__attribute__((constructor))
+static void NWInit(void) {
+    @autoreleasepool {
+        NWInstallCrashReporter();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            @try {
+                NWStartTweaks();
+            } @catch (NSException *e) {
+                NWLog("demarrage: %@", e.reason);
+            }
+        });
     }
 }
 
