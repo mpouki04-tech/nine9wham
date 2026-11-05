@@ -298,3 +298,55 @@ aucun rapport : pas de fausse detection.
 `@executable_path/Frameworks`, `Peter.dylib` **512 528 o** contenant `w9-2`,
 aucun residu RyukGram. CI : run `42112979440`, succes, **13 warnings**
 (identiques a la reference).
+
+### Vague 10
+
+**Crash a la creation de compte : cause trouvee par audit statique.** Scan des
+binaires de l'IPA (Instagram 454, `FBSharedFramework`, extensions) avec un
+parseur Mach-O/ObjC dedie : **aucune classe ni methode ObjC `getDeviceId`**
+n'existe (pas de `FBFamilyDeviceID` non plus). Le scan ne hookait donc rien,
+mais `objc_copyClassList` forcait la realisation de ~31 000 classes (dont les
+classes Swift) sur le thread principal : c'est lui qui faisait tomber l'app
+~5 s apres la saisie du nom, pendant la creation de compte. Le scan est
+**neutralise** (`nw9.dev.scan.enabled`, jamais pose par l'app) ; le code reste
+en place pour ne pas modifier la liste des warnings.
+
+**Access group keychain via les entitlements signes.** `NWLoadAccessGroupReal`
+lit d'abord `keychain-access-groups` avec `SecTaskCreateFromSelf` +
+`SecTaskCopyValueForEntitlement` (groupe egal a `application-identifier`, sinon
+le premier de la liste, qui est forcement accorde par le profil) ; repli sur
+`application-identifier` **entier** (`TEAMID.bundleid`, prefixe conserve),
+puis sur l'ancienne sonde `SecItemAdd`. Fini les `-34018`/`errSecMissingEntitlement`
+au demarrage.
+
+**Bouton Device identity deplacable.** Le pill flottant utilise les memes gestes
+que le bouton principal (seuil 4 pt, clamp aux bords, position sauvegardee en
+cours de glissement toutes les 250 ms). Position persistee dans
+`NWState[@"ui"][@"devX"/@"devY"]`, donc elle survit aux relances et au
+rafraichissement de l'overlay toutes les 2 s (aucun repositionnement pendant un
+glisser).
+
+**Conteneur neuf toujours en anglais.** `NWCreateContainerWithLocGhost` force
+`locale = en_US` et `tz = America/New_York` avant l'enregistrement : le
+conteneur par defaut compris demarre en anglais, cote Instagram comme cote
+Device identity. La ville choisie sur la carte (ou *Preferred Country*) reprend
+la main ensuite via `NWMapFollowCountry`.
+
+**Export / import de conteneurs entre telephones.** Ghost -> section
+**Containers** : *Export containers* ecrit un fichier chiffre `.nw9c`
+(plist XML + `NWEncryptData`, mot de passe) puis ouvre la feuille de partage
+(`UIActivityViewController`) ; *Import containers* ouvre le selecteur de
+fichiers (`UIDocumentPickerViewController`, `UTTypeData`, copie locale) et
+**fusionne** : les conteneurs deja presents sont conserves, les collisions
+renommees `cN`, et chaque conteneur arrive avec ses **prefs + cookies**
+(l'empreinte, la langue, le GPS et le Device ID sont dans l'etat, donc les
+comptes se retrouvent connectes sans en recreer un seul).
+
+**IPA publiee (release `nine9wham`)** : `nine9wham_instagram_454.ipa` —
+**343 779 592 octets**, sha256
+`37ea7af137aa1eecb38f072ec979f88fab8468dfcbdcb20fe702d8c0cc70f874`
+(digest GitHub identique). Contenu verifie : 3640 entrees, un seul
+`LC_LOAD_WEAK_DYLIB` `@rpath/Peter.dylib`, `cryptid=0`, rpath
+`@executable_path/Frameworks`, `Peter.dylib` **533 776 o** contenant `w10-1`,
+aucun residu RyukGram. CI : run `42128074601`, succes, **13 warnings**
+(identiques a la reference).
