@@ -222,3 +222,21 @@ hooks empreinte/GPS -> rebind GOT -> proxy -> timers.
 **Scan `getDeviceId` differe.** L'enumeration de toutes les classes
 (`objc_copyClassList` + `class_getInstanceMethod`, tres lourde) ne bloque plus
 l'ouverture : elle part 6 s plus tard sur une file d'arriere-plan (etape 9).
+
+### Vague 8b — escalade de la garde + IPA publiee
+
+La garde anti-boucle **escalade** desormais : si un lancement en mode
+recuperation echoue encore, l'etape neutralisee descend d'un cran
+(`fault - 1`, minimum 1). L'app finit donc **toujours** par atteindre un
+demarrage sain, meme si la premiere etape attribuee n'etait pas la bonne.
+`NWBuildID` passe a `w8-2` : chaque nouveau dylib re-tente toutes les etapes.
+
+IPA publiee (release `nine9wham`) :
+`nine9wham_instagram_454.ipa` — **343 765 757 octets**, sha256
+`8620583cd33dec3eead56205c799639ca85b54c883bb1cd9d4b0c73227f48c30`
+(digest GitHub identique). Contenu verifie : 3640 entrees, aucun residu
+RyukGram/zx/Substrate/FLEX, un seul `LC_LOAD_WEAK_DYLIB` `@rpath/Peter.dylib`
+(+ `@rpath/NWSupport.dylib` faible et inexistant, ignore par dyld),
+`cryptid=0`, `LC_RPATH @executable_path/Frameworks`, `Peter.dylib` 510 560 o
+(minOS 15.0, sdk 17.5). CI : run `42089891033`, succes, **13 warnings**
+(identiques a la reference).
