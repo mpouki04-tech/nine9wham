@@ -183,3 +183,42 @@ puis : téléchargement de la base (release `base`) → `inject_dylib.py` → co
 
 - Aucune licence **Bumble** ni **Blaze** n'est incluse : seul le **design** du menu et l'**architecture** des conteneurs/localisation ont été analysés, puis réécrits.
 - Tweak inclus : uniquement notre code (`Peter.dylib`). Aucun tweak tiers, aucune bibliothèque injectée, aucune UI étrangère dans l'IPA.
+
+
+---
+
+## Vague 8 — base refaite depuis l'IPA RyukGram + demarrage auto-diagnostiquant
+
+**Base reconstruite a la source.** La base n'est plus derivee d'une archive
+intermediaire : elle est re-extraite de l'IPA de reference
+`1697-RyukGram_sideload_v1.5.1_IG454.0.0.ipa` (qui fonctionne), puis **tout
+RyukGram est retire** :
+
+- `Frameworks/RyukGram.dylib`, `Frameworks/zxPluginsInject.dylib`,
+  `Frameworks/CydiaSubstrate.framework/`, `RyukGram.bundle/`, tous les
+  `_CodeSignature/` ;
+- les 2 `LC_LOAD_WEAK_DYLIB` d'origine sont re-ecrits **sur place** (meme
+  taille, NUL-pad) : `[168] -> @rpath/Peter.dylib`,
+  `[169] -> @rpath/NWSupport.dylib` (faible + inexistant = ignore par dyld).
+  Il n'y a donc **plus deux references identiques** a `Peter.dylib` ;
+- binaire principal inchange par ailleurs (`ncmds=171`, `sizeofcmds=17312`,
+  `LC_UUID 4c4c448c...`, `cryptid=0`, minOS 16.3.0).
+
+Base publiee (release `base`) : `com.burbn.instagram_v454.0.0_sideload_clean.ipa`
+— **343 479 610 octets**, sha256
+`a59bf7503243cca025861d332be161aca4eb47ac2e618cfb7de4bfdb0bd965f6`.
+
+**Constructeur dyld vide.** `NWInit` ne fait plus qu'un
+`dispatch_async(main, NWStartTweaks)` : plus aucune API Foundation/UIKit/I-O
+pendant le verrou dyld.
+
+**Demarrage par etapes + garde anti-boucle de crash.** Chaque etape est
+marquee dans `NSUserDefaults` ; si un lancement meurt, le suivant s'arrete
+**avant** l'etape fautive, affiche une alerte « Recovery mode » qui nomme
+l'etape, et l'app reste utilisable. Ordre : rapporteur de crash -> **bouton
+flottant d'abord** -> sideload fix -> safe mode -> device identity -> etat ->
+hooks empreinte/GPS -> rebind GOT -> proxy -> timers.
+
+**Scan `getDeviceId` differe.** L'enumeration de toutes les classes
+(`objc_copyClassList` + `class_getInstanceMethod`, tres lourde) ne bloque plus
+l'ouverture : elle part 6 s plus tard sur une file d'arriere-plan (etape 9).

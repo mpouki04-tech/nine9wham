@@ -7126,7 +7126,8 @@ static void NWInstallDeviceIdentity(void) {
         NWDevPillHiddenNow = ([u objectForKey:NWDevKeyHidePill] != nil);
         if (NWDevPillHiddenNow) [u removeObjectForKey:NWDevKeyHidePill];
 
-        NWInstall_getDeviceId();
+        // getDeviceId (scan global des classes) est appele 6 s plus tard,
+        // hors du chemin critique : voir etape 9 dans NWStartTweaks.
         NWInstall_FBFamilyDeviceID();
         NWInstall_UdsHooks();
         NWInstallAttestation();
@@ -7163,62 +7164,219 @@ static void NWPresentSafeModeUI(void) {
 }
 
 // ---------------------------------------------------------------------------
-// Amorcage DIFFERE (meme architecture que l'IPA de reference qui fonctionne) :
-// le constructeur dyld ne fait que le strict minimum, SANS AUCUNE I/O. Tout le
-// reste — keychain SecItem, dlopen(AdSupport), scan global des classes,
-// ecriture de preferences, rebind GOT, fenetres UIKit — part en file sur la
-// queue principale, une fois dyld relache. C'etait le travail synchrone dans le
-// constructeur qui plantait l'app a l'ouverture.
+// GARDE ANTI-BOUCLE DE CRASH (vague 8).
+//
+// Chaque etape du demarrage est marquee sur disque (NSUserDefaults) AVANT et
+// APRES son execution. Si un lancement meurt sans atteindre la fin, le
+// lancement suivant demarre en mode recuperation : il s'arrete AVANT l'etape
+// qui a tue, affiche un diagnostic lisible et laisse l'app utilisable.
+//
+// Resultat : plus jamais de boucle de crash, et l'etape fautive est connue
+// sans aucun log systeme (un simple coup d'oeil a l'alerte suffit).
 // ---------------------------------------------------------------------------
+#define NW_BOOT_KEY_T0    @"nw9.boot.t0"
+#define NW_BOOT_KEY_STAGE @"nw9.boot.stage"
+#define NW_BOOT_KEY_DONE  @"nw9.boot.done"
+#define NW_BOOT_KEY_FAULT @"nw9.boot.fault"
+#define NW_BOOT_KEY_BUILD @"nw9.boot.build"
+#define NW_BOOT_KEY_ALERT @"nw9.boot.alert"
+
+// Change a chaque build publie : un nouveau dylib re-tente TOUTES les etapes
+// (sinon une etape neutralisee le resterait pour toujours).
+#define NWBuildID @"w8-1"
+
+static int NWBootStopAt = 0;      // etapes >= cette valeur : neutralisees
+static int NWBootFaultStage = 0;  // etape responsable de l'echec precedent
+
+static const char *NWBootStageName(int s) {
+    switch (s) {
+        case 1:  return "rapporteur de crash";
+        case 2:  return "bouton flottant";
+        case 3:  return "sideload fix";
+        case 4:  return "device identity";
+        case 5:  return "etat / empreinte";
+        case 6:  return "hooks empreinte + GPS";
+        case 7:  return "rebind GOT";
+        case 8:  return "proxy reseau";
+        case 9:  return "scan device id";
+        case 10: return "termine";
+        default: return "?";
+    }
+}
+
+static void NWBootBegin(void) {
+    @try {
+        NSUserDefaults *u = NSUserDefaults.standardUserDefaults;
+        NSString *bid = [u stringForKey:NW_BOOT_KEY_BUILD];
+        if (![bid isEqualToString:NWBuildID]) {
+            // Nouveau build : on repart propre, toutes les etapes retentees.
+            [u removeObjectForKey:NW_BOOT_KEY_FAULT];
+            [u removeObjectForKey:NW_BOOT_KEY_ALERT];
+            [u setObject:NWBuildID forKey:NW_BOOT_KEY_BUILD];
+        }
+        int fault = (int)[u integerForKey:NW_BOOT_KEY_FAULT];
+        BOOL done = [u boolForKey:NW_BOOT_KEY_DONE];
+        double t0 = [u doubleForKey:NW_BOOT_KEY_T0];
+        int last = (int)[u integerForKey:NW_BOOT_KEY_STAGE];
+        double now = [NSDate date].timeIntervalSince1970;
+        if (fault > 0) {
+            NWBootFaultStage = fault;
+        } else if (!done && t0 > 0 && (now - t0) < 180.0) {
+            // Le lancement precedent n'a jamais atteint la fin : l'etape qui
+            // suit la derniere marque est celle qui a tue l'app.
+            NWBootFaultStage = last + 1;
+            [u setInteger:NWBootFaultStage forKey:NW_BOOT_KEY_FAULT];
+            NWLog("boot: echec precedent a l'etape %d (%s) -> neutralisee",
+                  NWBootFaultStage, NWBootStageName(NWBootFaultStage));
+        }
+        NWBootStopAt = NWBootFaultStage;
+        [u setDouble:now forKey:NW_BOOT_KEY_T0];
+        [u setInteger:0 forKey:NW_BOOT_KEY_STAGE];
+        [u setBool:NO forKey:NW_BOOT_KEY_DONE];
+        [u synchronize];
+    } @catch (NSException *e) {
+        NWLog("boot begin: %@", e.reason);
+    }
+}
+
+static void NWBootMark(int stage) {
+    @try {
+        NSUserDefaults *u = NSUserDefaults.standardUserDefaults;
+        [u setInteger:stage forKey:NW_BOOT_KEY_STAGE];
+        [u synchronize];
+    } @catch (NSException *e) { (void)e; }
+}
+
+static void NWBootFinish(void) {
+    @try {
+        NSUserDefaults *u = NSUserDefaults.standardUserDefaults;
+        [u setInteger:10 forKey:NW_BOOT_KEY_STAGE];
+        [u setBool:YES forKey:NW_BOOT_KEY_DONE];
+        [u synchronize];
+    } @catch (NSException *e) { (void)e; }
+}
+
+static BOOL NWBootSkip(int stage) {
+    return NWBootStopAt > 0 && stage >= NWBootStopAt;
+}
+
+// Diagnostic visible (une seule fois par etape fautive) : dit exactement
+// quelle etape a ete neutralisee, pour pouvoir la corriger.
+static void NWPresentBootRecoveryUI(void) {
+    @try {
+        if (NWBootFaultStage <= 0) return;
+        NSUserDefaults *u = NSUserDefaults.standardUserDefaults;
+        if ((int)[u integerForKey:NW_BOOT_KEY_ALERT] == NWBootFaultStage) return;
+        [u setInteger:NWBootFaultStage forKey:NW_BOOT_KEY_ALERT];
+        [u synchronize];
+        UIViewController *top = NWTopVC();
+        if (!top || top.presentedViewController) return;
+        NSString *stageName = [NSString stringWithUTF8String:NWBootStageName(NWBootFaultStage)];
+        NSString *fmt = NWL(@"boot_rec",
+            @"Startup step %d (%@) failed last time. It is disabled for this session so the app stays usable.",
+            @"L'etape de demarrage %d (%@) a echoue la derniere fois. Elle est desactivee pour cette session afin que l'appli reste utilisable.",
+            @"El paso de inicio %d (%@) fallo la ultima vez. Esta desactivado en esta sesion para que la app siga funcionando.");
+        NSString *msg = [NSString stringWithFormat:fmt, NWBootFaultStage, stageName];
+        UIAlertController *a = [UIAlertController
+            alertControllerWithTitle:NWL(@"boot_rec_t", @"Recovery mode", @"Mode recuperation", @"Modo recuperacion")
+                             message:msg
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:NWL(@"ok", @"OK", @"OK", @"OK")
+                                              style:UIAlertActionStyleDefault handler:nil]];
+        [top presentViewController:a animated:YES completion:nil];
+    } @catch (NSException *e) {
+        NWLog("boot recovery UI: %@", e.reason);
+    }
+}
+
 static void NWStartTweaks(void) {
     @autoreleasepool {
-        // 0. Rapporteur de crash : installe AVANT tout hook, pour capturer le
-        //    plantage a la creation de compte (nom + raison + pile).
-        NWInstallCrashReporter();
+        NWBootBegin();
 
-        // 0 bis. Sideload fix : conteneur de groupe + accessGroup keychain.
-        //    Sans cela Instagram plante a l'inscription en sideloading
-        //    (certificat personnel sans entitlement de groupe).
-        NWInstallSideloadFix();
+        // --- Etape 1. Rapporteur de crash : installe AVANT tout hook, pour
+        //     capturer le plantage a la creation de compte (nom + raison + pile).
+        if (!NWBootSkip(1)) NWInstallCrashReporter();
+        NWBootMark(1);
 
-        // 0 ter. SAFE MODE (vague 7) : si l'utilisateur a demande la coupe
-        //    totale (Support -> "Disable all tweaks & relaunch"), on
-        //    n'installe AUCUN hook empreinte/GPS/rebind/proxy/UI et on
-        //    propose la reactivation. Le fix sideload + le rapporteur de
-        //    crash restent actifs : sans eux l'app ne peut pas demarrer.
+        // --- Etape 2. UI D'ABORD (vague 8) : bouton flottant + pill poses
+        //     avant les hooks. Si une etape ulterieure tue l'app, la garde la
+        //     neutralise au lancement suivant et l'app reste utilisable.
+        //     C'est aussi la preuve visible que le dylib est bien charge.
+        if (!NWBootSkip(2)) {
+            @try { NWInstallFloatingButton(); }
+            @catch (NSException *e) { NWLog("ui: %@", e.reason); }
+        }
+        NWBootMark(2);
+
+        // --- Etape 3. Sideload fix : conteneur de groupe + accessGroup keychain.
+        //     Sans cela Instagram plante a l'inscription en sideloading
+        //     (certificat personnel sans entitlement de groupe).
+        if (!NWBootSkip(3)) NWInstallSideloadFix();
+        NWBootMark(3);
+
+        // --- SAFE MODE (vague 7) : si l'utilisateur a demande la coupe
+        //     totale (Support -> "Disable all tweaks & relaunch"), on
+        //     n'installe AUCUN hook empreinte/GPS/rebind/proxy/UI et on
+        //     propose la reactivation. Le fix sideload + le rapporteur de
+        //     crash restent actifs : sans eux l'app ne peut pas demarrer.
         if (NWSafeModeOn()) {
             NWLog("SAFE MODE : hooks empreinte/GPS/rebind/UI non installes");
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 @try { NWPresentSafeModeUI(); } @catch (NSException *e) { NWLog("safe: %@", e.reason); }
             });
+            NWBootFinish();
             return;
         }
 
-        // 0 quater. Device identity (vague 7) : hooks getDeviceId (scan
-        //    global des classes), FBFamilyDeviceID, machine ID (mid via
-        //    NSUserDefaults) et attestation Apple. Consomme aussi le flag
-        //    one-shot « Hide button until relaunch » du pill.
-        NWInstallDeviceIdentity();
+        // --- Etape 4. Device identity (vague 7) : FBFamilyDeviceID, machine
+        //     ID (mid via NSUserDefaults) et attestation Apple. Consomme aussi
+        //     le flag one-shot « Hide button until relaunch » du pill.
+        //     Le scan global des classes (getDeviceId) est DIFFERE de 6 s
+        //     (etape 9) : c'est l'operation la plus lourde du tweak.
+        if (!NWBootSkip(4)) NWInstallDeviceIdentity();
+        NWBootMark(4);
 
-        NWLog("demarrage — Instagram %@", UIDevice.currentDevice.systemVersion);
+        NWLog("demarrage - Instagram %@", UIDevice.currentDevice.systemVersion);
 
-        // 1. Etat (disque ou vault keychain si re-install)
-        NWBootstrapState();
+        // --- Etape 5. Etat (disque ou vault keychain si re-install)
+        if (!NWBootSkip(5)) NWBootstrapState();
+        NWBootMark(5);
 
-        // 2. Hooks d'empreinte + fake GPS + GOT + proxy NSURLSession
-        NWInstallFingerprintHooks();
-        NWInstallLocationHooks();
-        NWRebindGOT();
-        NWSwizzle(object_getClass([NSURLSessionConfiguration class]),
-                  @selector(defaultSessionConfiguration),
-                  (IMP)NWHook_defaultSessionCfg, &NWOrig_defaultSessionCfg);
+        // --- Etape 6. Hooks d'empreinte + fake GPS
+        if (!NWBootSkip(6)) {
+            @try {
+                NWInstallFingerprintHooks();
+                NWInstallLocationHooks();
+            } @catch (NSException *e) {
+                NWLog("hooks empreinte: %@", e.reason);
+            }
+        }
+        NWBootMark(6);
 
-        // 3. Fenetre overlay + bouton flottant (persistant)
-        NWInstallFloatingButton();
+        // --- Etape 7. Rebind GOT (SecItem*/sysctl/uname, images de l'app)
+        if (!NWBootSkip(7)) NWRebindGOT();
+        NWBootMark(7);
 
-        // 4. Re-verification reguliere : si Instagram recree ses fenetres,
-        //    l'overlay et le bouton sont remis en place automatiquement.
+        // --- Etape 8. Proxy NSURLSession
+        if (!NWBootSkip(8)) {
+            @try {
+                NWSwizzle(object_getClass([NSURLSessionConfiguration class]),
+                          @selector(defaultSessionConfiguration),
+                          (IMP)NWHook_defaultSessionCfg, &NWOrig_defaultSessionCfg);
+            } @catch (NSException *e) {
+                NWLog("proxy: %@", e.reason);
+            }
+        }
+        NWBootMark(8);
+
+        // Repositionnement du bouton une fois l'etat charge.
+        if (!NWBootSkip(2)) {
+            @try { NWInstallFloatingButton(); } @catch (NSException *e) { (void)e; }
+        }
+
+        // Re-verification reguliere : si Instagram recree ses fenetres,
+        // l'overlay et le bouton sont remis en place automatiquement.
         static dispatch_source_t overlayTimer;
         dispatch_source_t ot = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                                                       dispatch_get_main_queue());
@@ -7232,9 +7390,9 @@ static void NWStartTweaks(void) {
                 @try {
                     // Instagram peut re-poser SON handler d'exception au fil du
                     // temps : on re-affirme le notre (chaine conservee).
-                    NWMaintainCrashReporter();
+                    if (!NWBootSkip(1)) NWMaintainCrashReporter();
                     NWEnsureOverlay();
-                    NWInstallFloatingButton();
+                    if (!NWBootSkip(2)) NWInstallFloatingButton();
                 } @catch (NSException *e) {
                     NWLog("timer overlay: %@", e.reason);
                 }
@@ -7243,12 +7401,12 @@ static void NWStartTweaks(void) {
         dispatch_resume(ot);
         overlayTimer = ot;
 
-        // 5. Flush regulier : chaque 15 s, l'etat est persiste + vault.
+        // Flush regulier : chaque 15 s, l'etat est persiste + vault.
         static dispatch_source_t flushTimer;
         dispatch_queue_t q = dispatch_queue_create("com.nine9wham.flush", DISPATCH_QUEUE_SERIAL);
         flushTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
         dispatch_source_set_timer(flushTimer, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC),
-                                  15ull * NSEC_PER_SEC, 3ull * NSEC_PER_SEC);
+                                  15ull * NSEC_PER_SEC, 3ull * NSEC_PER_MSEC);
         dispatch_source_set_event_handler(flushTimer, ^{
             @autoreleasepool {
                 @try {
@@ -7258,7 +7416,7 @@ static void NWStartTweaks(void) {
         });
         dispatch_resume(flushTimer);
 
-        // 6. Sauvegarde avant mise en arriere-plan / fermeture
+        // Sauvegarde avant mise en arriere-plan / fermeture
         [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillTerminateNotification
                                                           object:nil queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(NSNotification *n) { NWFlushOnExit(); }];
@@ -7266,26 +7424,47 @@ static void NWStartTweaks(void) {
                                                           object:nil queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(NSNotification *n) { NWFlushOnExit(); }];
 
-        NWLog("initialisation terminee — conteneur actif: %@", NWActiveID ?: @"(aucun)");
-    }
-}
+        NWLog("initialisation terminee - conteneur actif: %@", NWActiveID ?: @"(aucun)");
 
-// Constructeur dyld : le SEUL travail acceptable ici est le rapporteur de
-// crash (ni I/O keychain, ni dlopen, ni scan de classes, ni UIKit pendant le
-// verrou dyld — c'etait exactement ce qui plantait l'app a l'ouverture).
-// Les hooks (sideload fix, empreinte, GPS, rebind, UI) demarrent des que la
-// queue principale tourne, avant toute interaction utilisateur.
-__attribute__((constructor))
-static void NWInit(void) {
-    @autoreleasepool {
-        NWInstallCrashReporter();
-        dispatch_async(dispatch_get_main_queue(), ^{
-            @try {
-                NWStartTweaks();
-            } @catch (NSException *e) {
-                NWLog("demarrage: %@", e.reason);
+        // --- Etape 9. Scan getDeviceId (toutes les classes) DIFFERE hors du
+        //     chemin critique : il realise des milliers de classes Swift et
+        //     n'a aucune raison de bloquer l'ouverture de l'app. La fin du
+        //     demarrage n'est validee qu'apres, pour que la garde puisse
+        //     attribuer un crash a cette etape.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            @autoreleasepool {
+                @try {
+                    if (!NWBootSkip(9)) NWInstall_getDeviceId();
+                } @catch (NSException *e) {
+                    NWLog("getDeviceId differe: %@", e.reason);
+                }
+                NWBootMark(9);
+                NWBootFinish();
             }
         });
+
+        // Diagnostic de recuperation, une fois l'UI en place.
+        if (NWBootFaultStage > 0) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                @try { NWPresentBootRecoveryUI(); } @catch (NSException *e) { (void)e; }
+            });
+        }
     }
 }
 
+// Constructeur dyld : ZERO travail ici (ni Foundation, ni I/O, ni UIKit, ni
+// scan de classes pendant le verrou dyld). On ne fait que planifier le
+// demarrage sur la queue principale ; c'est la seule operation qui ne peut
+// pas echouer ni bloquer dyld.
+__attribute__((constructor))
+static void NWInit(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            NWStartTweaks();
+        } @catch (NSException *e) {
+            NWLog("demarrage: %@", e.reason);
+        }
+    });
+}
