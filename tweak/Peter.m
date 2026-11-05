@@ -7214,6 +7214,7 @@ static void NWScanGetDeviceIdStep(void) {
 
 static void NWInstall_getDeviceId(void) {
     if (NWGetIdScanRunning) return;
+    if (NWGetIdSeen.count > 0) return;   // deja scanne : ne jamais re-hooker
     if (NWGetIdClasses) { free(NWGetIdClasses); NWGetIdClasses = NULL; }
     NWGetIdClassCount = 0;
     NWGetIdClasses = objc_copyClassList(&NWGetIdClassCount);
@@ -7235,7 +7236,7 @@ static IMP NWOrig_fdidCached = NULL;
 
 static id NWHook_fdid(id self, SEL _cmd, id cfg, id file, int line) {
     @try {
-        NSString *p = NWDevPinnedStr(NWDevKeyFDID);
+        NSString *p = NWDevFDIDCurrent();   // pin du conteneur > empreinte
         if (p) return p;
         if (NWOrig_fdid) return ((id (*)(id, SEL, id, id, int))NWOrig_fdid)(self, _cmd, cfg, file, line);
         return nil;
@@ -7244,7 +7245,7 @@ static id NWHook_fdid(id self, SEL _cmd, id cfg, id file, int line) {
 
 static id NWHook_fdidCached(id self, SEL _cmd, id cfg, id file, int line) {
     @try {
-        NSString *p = NWDevPinnedStr(NWDevKeyFDID);
+        NSString *p = NWDevFDIDCurrent();   // pin du conteneur > empreinte
         if (p) return p;
         if (NWOrig_fdidCached) return ((id (*)(id, SEL, id, id, int))NWOrig_fdidCached)(self, _cmd, cfg, file, line);
         return nil;
