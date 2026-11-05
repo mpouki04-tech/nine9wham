@@ -100,7 +100,7 @@ Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). San
 ## Installer
 
 1. Télécharger l'IPA : **[Release `nine9wham`](https://github.com/mpouki04-tech/nine9wham/releases/download/nine9wham/nine9wham_instagram_454.ipa)**
-   sha256 : `bd55ae4a0ac1a674a867b12e662d2ead68918f2a287809ddab7f893de532d2a8` (343 771 505 octets)
+   sha256 : `b95a08ef640d15d08ec7484944ec44837ba293e8aefd891befc08856888f0237` (343 771 950 octets)
 2. Ouvrir **Sideloadly** → sélectionner l'IPA → Install (certificat 7 jours, même Apple ID). Sideloadly est ici **uniquement** l'outil d'installation : aucune licence Blaze/Bumble n'est incluse.
 3. Lancer Instagram → le bouton **carré translucide (4 carrés)** apparaît **centré en bas**.
 
@@ -283,11 +283,18 @@ Les items d'origine sont conserves : `Device identity`, `Real • ...`,
 affichent « France », « francais », « Japanese — Japan · Asia/Tokyo » au lieu
 des codes `fr_FR` / `FR`.
 
+**Garde du scan.** Le scan note son heure de debut (`nw9.scan.start`). Au
+lancement suivant, si le rapporteur de crash a ecrit un rapport plus recent
+que ce debut, la cause est le scan : **l'etape 9 est sautee** (alerte Recovery
+« scan device id ») et, apres 2 crashs constates, le scan reste desactive
+(`nw9.scan.off`) jusqu'au prochain build. Un arret manuel de l'app n'ecrit
+aucun rapport : pas de fausse detection.
+
 **IPA publiee (release `nine9wham`)** : `nine9wham_instagram_454.ipa` —
-**343 771 505 octets**, sha256
-`bd55ae4a0ac1a674a867b12e662d2ead68918f2a287809ddab7f893de532d2a8`
+**343 771 950 octets**, sha256
+`b95a08ef640d15d08ec7484944ec44837ba293e8aefd891befc08856888f0237`
 (digest GitHub identique). Contenu verifie : 3640 entrees, un seul
 `LC_LOAD_WEAK_DYLIB` `@rpath/Peter.dylib`, `cryptid=0`, rpath
-`@executable_path/Frameworks`, `Peter.dylib` **512 528 o** contenant `w9-1`,
-aucun residu RyukGram. CI : run `42107873614`, succes, **13 warnings**
+`@executable_path/Frameworks`, `Peter.dylib` **512 528 o** contenant `w9-2`,
+aucun residu RyukGram. CI : run `42112979440`, succes, **13 warnings**
 (identiques a la reference).
