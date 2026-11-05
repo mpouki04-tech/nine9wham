@@ -51,6 +51,7 @@
 #define NWDevKeyHidePill @"nw9.dev.hidepill"   // one-shot (jusqu'au relaunch)
 #define NWDevKeyPill     @"nw9.dev.pill"       // bouton flottant (defaut ON)
 #define NWDevKeyOn       @"nw9.dev.on"         // masque global
+#define NWDevKeyPinOwner @"nw9.dev.pin.owner"  // conteneur proprietaire du pin
 #define NWSafeModeKey    @"nw9.safe.mode"      // safe-mode one-shot
 
 // ---- v7 : declarations avancees (corps definis dans la section Device
@@ -66,6 +67,8 @@ static NSString *NWDevDevIDCurrent(void);
 static NSString *NWDevFDIDCurrent(void);
 static NSString *NWDevMidCurrent(void);
 static NSString *NWDevMidHdrCurrent(void);
+static NSString *NWDevPinnedStr(NSString *k);
+static BOOL     NWDevPinActive(void);
 static NSString *NWDevShort(NSString *s);
 static void     NWDevRollIdentity(BOOL makeMask);
 static BOOL NWDevPillHiddenNow;          // tentative ; definition + loin
@@ -351,6 +354,21 @@ static NSDictionary *NWGenerateFingerprint(void) {
     };
 }
 
+// Variante qui CONSERVE la langue et le fuseau du conteneur (vague 9) : on
+// renouvelle l'appareil sans perdre le pays choisi. Evite tout conflit entre
+// "nouvelle identite" et "pays / langue du conteneur".
+static NSDictionary *NWGenerateFingerprintKeepingLocale(NSDictionary *old) {
+    NSMutableDictionary *nfp = [NWGenerateFingerprint() mutableCopy];
+    if (!nfp) return nil;
+    if ([old isKindOfClass:[NSDictionary class]]) {
+        id l = old[@"locale"];
+        id z = old[@"tz"];
+        if ([l isKindOfClass:[NSString class]] && [l length]) nfp[@"locale"] = l;
+        if ([z isKindOfClass:[NSString class]] && [z length]) nfp[@"tz"] = z;
+    }
+    return nfp;
+}
+
 
 #pragma mark - Hooks d'empreinte (ObjC)
 
@@ -429,7 +447,7 @@ static NSUUID *NWHook_idfv(id self, SEL _cmd) {
     // compte -> protege (jamais d'exception non catchee).
     @try {
         // 1) pin device identity global (vague 7), 2) empreinte du conteneur.
-        NSString *s = NWDevMaskOn() ? NWDevGetStr(NWDevKeyDevID) : nil;
+        NSString *s = NWDevPinnedStr(NWDevKeyDevID);
         if (!s) s = NWFPStr(@"deviceId");          // device id epingle par conteneur
         if (!s) s = NWFPStr(@"idfv");
         if (s) {
@@ -1746,6 +1764,9 @@ static void NWSwitchContainer(NSString *cid) {
     NWSaveState(newSt);            // met a jour NWActiveFP / NWActiveLoc
     NWPersistState();
     NWRestoreContainer(cid);
+    // Chaque conteneur = un telephone : sa langue prend effet au relancement
+    // propose juste apres la bascule.
+    NWApplySystemLanguage();
     NWLog("bascule vers conteneur %@", cid);
 }
 
@@ -1820,10 +1841,52 @@ static void NWBootstrapState(void) {
             NWLog("conteneur par defaut renomme en 'Default Container'");
         }
     }
+    // Migration identite (vague 9) : chaque conteneur recoit une identite
+    // COMPLETE des sa premiere lecture (device id, family device id, machine
+    // id + header, langue, fuseau). Sans ca : "No machine ID yet" et deux
+    // conteneurs pouvaient partager la meme empreinte.
+    if ([st[@"containers"] isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *cs = [st[@"containers"] mutableCopy];
+        BOOL fixed = NO;
+        for (NSString *key in cs.allKeys) {
+            id raw = cs[key];
+            if (![raw isKindOfClass:[NSDictionary class]]) continue;
+            NSMutableDictionary *mc = [raw mutableCopy];
+            NSMutableDictionary *fp = [mc[@"fp"] isKindOfClass:[NSDictionary class]]
+                ? [mc[@"fp"] mutableCopy] : [NSMutableDictionary dictionary];
+            BOOL missing = NO;
+            for (NSString *k in @[@"deviceId", @"fdid", @"mid", @"midHeader", @"locale", @"tz"]) {
+                id v = fp[k];
+                if (!v || [v isKindOfClass:[NSNull class]] ||
+                    ([v isKindOfClass:[NSString class]] && ![v length])) { missing = YES; break; }
+            }
+            if (!missing) continue;
+            NSDictionary *gen = NWGenerateFingerprint();
+            for (NSString *k in @[@"deviceId", @"fdid", @"mid", @"midHeader", @"locale", @"tz"]) {
+                id v = fp[k];
+                if (!v || [v isKindOfClass:[NSNull class]] ||
+                    ([v isKindOfClass:[NSString class]] && ![v length])) {
+                    if (gen[k]) fp[k] = gen[k];
+                }
+            }
+            mc[@"fp"] = fp;
+            cs[key] = mc;
+            fixed = YES;
+            NWLog("identite completee pour %@ -> %@ (%@ / %@)", key,
+                  fp[@"model"], fp[@"locale"], fp[@"mid"]);
+        }
+        if (fixed) {
+            NSMutableDictionary *ns = [st mutableCopy] ?: [NSMutableDictionary dictionary];
+            ns[@"containers"] = cs;
+            st = ns;
+        }
+    }
     NWSaveState(st);
     NSString *aid = st[@"activeContainer"];
     if ([aid isKindOfClass:[NSString class]] && st[@"containers"][aid]) {
         NWRestoreContainer(aid);
+        // Le telephone actif impose sa langue des le demarrage.
+        NWApplySystemLanguage();
         NWLog("conteneur actif: %@ (modele=%@)", aid, NWActiveFP[@"model"]);
     }
 }
@@ -2134,6 +2197,7 @@ static UILabel *NWBadge(NSString *text, UIColor *tint) {
 }
 
 // Nom du pays depuis un code ISO a 2 lettres ("FR" -> "France").
+__attribute__((unused))
 static NSString *NWFlagEmoji(NSString *iso) {
     static NSDictionary *map;
     static dispatch_once_t once;
@@ -2374,6 +2438,52 @@ static NSArray<NSArray<NSString *> *> *NWCountryRows(void) {
     return rows;
 }
 
+// --- Noms COMPLETS (vague 9) : plus jamais "fr" / "FR" dans les listes ------
+// Le pays s'ecrit "France" et la langue "francais", dans la langue du menu.
+static NSLocale *NWDisplayLocale(void) {
+    NSString *l = [NWLanguage() lowercaseString];
+    NSString *ident = [l hasPrefix:@"fr"] ? @"fr_FR"
+                    : ([l hasPrefix:@"es"] ? @"es_ES" : @"en_US");
+    return [NSLocale localeWithLocaleIdentifier:ident];
+}
+
+static NSString *NWCountryDisplayName(NSString *cc) {
+    if (![cc isKindOfClass:[NSString class]] || cc.length != 2) return cc ?: @"";
+    NSString *n = [NWDisplayLocale() displayNameForKey:NSLocaleCountryCode
+                                                 value:[cc uppercaseString]];
+    return n.length ? n : [cc uppercaseString];
+}
+
+static NSString *NWLanguageDisplayName(NSString *lang) {
+    if (![lang isKindOfClass:[NSString class]] || !lang.length) return @"";
+    NSString *base = [[lang componentsSeparatedByString:@"-"] firstObject];
+    base = [[base componentsSeparatedByString:@"_"] firstObject];
+    if (!base.length) return @"";
+    NSString *n = [NWDisplayLocale() displayNameForKey:NSLocaleLanguageCode
+                                                 value:[base lowercaseString]];
+    return n.length ? n : base;
+}
+
+// Liste unique "pays" utilisee par les deux menus (Preferred Country et
+// Locale & Language) : titre = nom complet du pays, sous-titre = langue
+// complete + fuseau. La valeur garde le format interne "lang_CC".
+static NSArray<NSDictionary *> *NWCountryOptions(void) {
+    NSMutableArray *opts = [NSMutableArray array];
+    for (NSArray<NSString *> *r in NWCountryRows()) {
+        NSString *cc = r[0], *lang = r[1], *tz = r[2];
+        [opts addObject:@{
+            @"title": NWCountryDisplayName(cc),
+            @"subtitle": [NSString stringWithFormat:@"%@ · %@",
+                        NWLanguageDisplayName(lang), tz],
+            @"value": [NSString stringWithFormat:@"%@_%@", lang, cc],
+            @"tz": tz,
+            @"cc": cc,
+            @"lang": lang,
+        }];
+    }
+    return opts;
+}
+
 // Ligne pays dont le NOM termine le label (reverse geocoding Nominatim :
 // "Philadelphia, Pennsylvania, 19107, United States").
 static NSArray<NSString *> *NWCountryRowForLabel(NSString *label) {
@@ -2390,6 +2500,7 @@ static NSArray<NSString *> *NWCountryRowForLabel(NSString *label) {
 
 // Ecrit la langue et le fuseau DANS le fp du conteneur cid (pas seulement
 // l'actif) : chaque conteneur garde sa propre langue de "telephone".
+__attribute__((unused))
 static void NWSetContainerLocale(NSString *cid, NSString *localeId, NSString *tz) {
     @try {
         if (!cid.length || ![localeId isKindOfClass:[NSString class]] || localeId.length < 5) return;
@@ -2411,6 +2522,41 @@ static void NWSetContainerLocale(NSString *cid, NSString *localeId, NSString *tz
     }
 }
 
+// Regenere l'identite COMPLETE du conteneur cid (appareil aleatoire coherent)
+// et y impose le pays : locale + fuseau. Un conteneur = un telephone unique,
+// mais son identite reste coherente avec le pays choisi (vague 9).
+static void NWRollIdentityForContainer(NSString *cid, NSString *localeId, NSString *tz) {
+    @try {
+        if (!cid.length) return;
+        NSDictionary *st = NWState ?: @{};
+        NSMutableDictionary *containers = [st[@"containers"] mutableCopy];
+        NSMutableDictionary *c = [containers[cid] mutableCopy];
+        if (![c isKindOfClass:[NSMutableDictionary class]]) return;
+        NSMutableDictionary *fp = [c[@"fp"] mutableCopy] ?: [NSMutableDictionary dictionary];
+        NSDictionary *gen = NWGenerateFingerprint();
+        for (NSString *k in @[@"model", @"realMachine", @"idfv", @"idfa", @"deviceName",
+                              @"memGB", @"cpu", @"sysVer", @"deviceId", @"fdid", @"mid",
+                              @"midHeader"]) {
+            id v = gen[k];
+            if (v) fp[k] = v;
+        }
+        if ([localeId isKindOfClass:[NSString class]] && localeId.length >= 5) {
+            fp[@"locale"] = localeId;
+        }
+        if ([tz isKindOfClass:[NSString class]] && tz.length) fp[@"tz"] = tz;
+        c[@"fp"] = fp;
+        containers[cid] = c;
+        NSMutableDictionary *newSt = [st mutableCopy] ?: [NSMutableDictionary dictionary];
+        newSt[@"containers"] = containers;
+        NWSaveState(newSt);          // rafraichit NWActiveFP si c'est l'actif
+        NWPersistState();
+        if ([cid isEqualToString:NWActiveID]) NWApplySystemLanguage();
+        NWLog("identite regeneree pour %@ -> %@ (%@)", cid, fp[@"model"], fp[@"locale"]);
+    } @catch (NSException *e) {
+        NWLog("roll identite conteneur: %@", e.reason);
+    }
+}
+
 // Le pays reconnu s'applique au CONTENEUR cid : fp["locale"] + fp["tz"], et
 // si c'est le conteneur ACTIF, la langue du telephone est poussee tout de
 // suite (hooks NSLocale immediats + AppleLanguages/CFPreferences au restart).
@@ -2425,9 +2571,14 @@ static void NWMapFollowCountry(NSString *cid, NSString *label) {
         NSDictionary *fp = c[@"fp"];
         if ([fp isKindOfClass:[NSDictionary class]]
             && [((NSDictionary *)fp)[@"locale"] isKindOfClass:[NSString class]]
-            && [((NSString *)((NSDictionary *)fp)[@"locale"]) isEqualToString:locId]) return;   // deja bon
-        NWSetContainerLocale(cid, locId, r[2]);
-        if ([cid isEqualToString:NWActiveID]) NWApplySystemLanguage();
+            && [((NSString *)((NSDictionary *)fp)[@"locale"]) isEqualToString:locId]) {
+            // Meme pays : on ne re-roule PAS l'identite (deplacer la carte
+            // dans le meme pays ne doit pas changer l'appareil).
+            if ([cid isEqualToString:NWActiveID]) NWApplySystemLanguage();
+            return;
+        }
+        // Nouveau pays = nouvel appareil aleatoire, mais coherent avec le pays.
+        NWRollIdentityForContainer(cid, locId, r[2]);
         NWLog("conteneur %@ adopte le pays du lieu choisi -> %@ (%@)",
               cid, label, locId);
     } @catch (NSException *e) {
@@ -3293,6 +3444,7 @@ static void NWInstallFloatingButton(void) {
 // le safe-mode.
 // ---------------------------------------------------------------------------
 static UIButton *NWDevicePillButton = nil;
+static UIVisualEffectView *NWDevicePillBlur = nil;
 
 static BOOL NWDevPillEnabled(void) {
     @try {
@@ -3317,15 +3469,30 @@ static void NWEnsureDevPill(UIView *root) {
           forState:UIControlStateNormal];
         [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
         b.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
-        b.backgroundColor = [UIColor colorWithWhite:1 alpha:0.13];
+        // Noir translucide, meme famille visuelle que le bouton flottant
+        // principal (flou sombre + voile noir).
+        b.frame = CGRectMake(0, 0, 120, 28);
+        b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.38];
         b.layer.cornerRadius = 14;
         if (@available(iOS 13.0, *)) b.layer.cornerCurve = kCACornerCurveContinuous;
         b.layer.borderWidth = 1.0;
-        b.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.22].CGColor;
+        b.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
         b.layer.shadowColor = UIColor.blackColor.CGColor;
         b.layer.shadowOpacity = 0.45;
         b.layer.shadowRadius = 10;
         b.layer.shadowOffset = CGSizeMake(0, 3);
+        if (@available(iOS 13.0, *)) {
+            UIVisualEffectView *blur = [[UIVisualEffectView alloc]
+                initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterialDark]];
+            blur.frame = b.bounds;
+            blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            blur.layer.cornerRadius = 14;
+            blur.clipsToBounds = YES;
+            blur.userInteractionEnabled = NO;
+            [b addSubview:blur];
+            [b sendSubviewToBack:blur];
+            NWDevicePillBlur = blur;
+        }
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         // Meme empreinte que l'autre bouton : warning deprecation deja
@@ -3343,6 +3510,7 @@ static void NWEnsureDevPill(UIView *root) {
     CGFloat w = MAX(96.0, fit.width);
     CGFloat h = 28.0;
     NWDevicePillButton.frame = CGRectMake(s.width - w - 14, 54, w, h);
+    if (NWDevicePillBlur) NWDevicePillBlur.frame = NWDevicePillButton.bounds;
 }
 
 
@@ -5227,7 +5395,7 @@ static void NWStartSpin(UIImageView *v) {
     NSString *locId = fp[@"locale"] ?: @"en_US";
     NSString *iso = locId.length >= 3 ? [locId substringFromIndex:locId.length - 2] : @"US";
     [self addRow:country icon:@"flag.fill" title:@"Choose your preferred country"
-           value:[NSString stringWithFormat:@"%@ (%@)", NWFlagEmoji(iso), iso] action:^{
+           value:NWCountryDisplayName(iso) action:^{
         [weakSelf pickPreferredCountry];
     }];
 
@@ -5236,7 +5404,7 @@ static void NWStartSpin(UIImageView *v) {
     UIStackView *gen = [self addRowsCard];
     [self addRow:gen icon:@"plus.forwardslash.minus" title:@"Formulate"
            value:@"Random data for all modules" action:^{
-        NSMutableDictionary *nfp = [NWGenerateFingerprint() mutableCopy];
+        NSMutableDictionary *nfp = [NWGenerateFingerprintKeepingLocale(NWActiveFP) mutableCopy];
         NWUpdateActiveFP(nfp);
         NWReloadAfterStateChange();
         [weakSelf rebuild];
@@ -5249,7 +5417,7 @@ static void NWStartSpin(UIImageView *v) {
     UIStackView *mods = [self addRowsCard];
     [self addRow:mods icon:@"iphone" title:@"Device"
            value:@"Random data for the Device module only" action:^{
-        NSMutableDictionary *nfp = [NWGenerateFingerprint() mutableCopy];
+        NSMutableDictionary *nfp = [NWGenerateFingerprintKeepingLocale(NWActiveFP) mutableCopy];
         NWUpdateActiveFP(nfp);
         NWReloadAfterStateChange();
         [weakSelf rebuild];
@@ -5352,29 +5520,31 @@ static void NWStartSpin(UIImageView *v) {
 }
 
 // Pays preferentiel global (copy Blaze) : ouvre la liste des locales/pays.
+// Vague 9 : noms COMPLETS (France, francais) et choix d'un pays = nouvel
+// appareil aleatoire du pays, langue du telephone comprise.
 - (void)pickPreferredCountry {
-    NSArray *pairs = @[
-        @[@"fr_FR", @"Europe/Paris"], @[@"en_US", @"America/New_York"],
-        @[@"en_GB", @"Europe/London"], @[@"es_ES", @"Europe/Madrid"],
-        @[@"de_DE", @"Europe/Berlin"], @[@"it_IT", @"Europe/Rome"],
-        @[@"ar_SA", @"Asia/Riyadh"], @[@"pt_BR", @"America/Sao_Paulo"],
-        @[@"ja_JP", @"Asia/Tokyo"], @[@"nl_NL", @"Europe/Amsterdam"],
-        @[@"fr_CA", @"America/Montreal"], @[@"en_AU", @"Australia/Sydney"],
-    ];
-    NSMutableArray *opts = [NSMutableArray array];
-    for (NSArray *p in pairs) {
-        NSString *locale = p[0];
-        NSString *iso = [locale substringFromIndex:locale.length - 2];
-        [opts addObject:@{@"title": [NSString stringWithFormat:@"%@ (%@)", NWFlagEmoji(iso), iso],
-                          @"subtitle": [NSString stringWithFormat:@"%@ · %@", p[0], p[1]],
-                          @"value": p[0], @"tz": p[1]}];
-    }
+    NSArray *opts = NWCountryOptions();
     __weak typeof(self) weakSelf = self;
     [self presentOptions:opts selected:(NWActiveFP[@"locale"] ?: @"")
                  heading:@"Preferred Country (global)"
                     pick:^(NSDictionary *opt) {
-        NWUpdateActiveFPKey(@"locale", opt[@"value"]);
-        if (opt[@"tz"]) NWUpdateActiveFPKey(@"tz", opt[@"tz"]);
+        NSString *loc = opt[@"value"];
+        NSString *tz = opt[@"tz"];
+        NSString *newCC = opt[@"cc"];
+        NSString *oldLoc = NWActiveFP[@"locale"];
+        NSString *oldCC = nil;
+        if ([oldLoc isKindOfClass:[NSString class]] && oldLoc.length >= 2) {
+            NSArray *p = [oldLoc componentsSeparatedByString:@"_"];
+            oldCC = p.count > 1 ? p.lastObject : nil;
+        }
+        if (![newCC isEqualToString:oldCC ?: @""]) {
+            // Nouveau pays : identite d'appareil entierement regeneree, mais
+            // avec la langue et le fuseau du pays choisi (aucun conflit).
+            NWRollIdentityForContainer(NWActiveID, loc, tz);
+        } else {
+            NWUpdateActiveFPKey(@"locale", loc);
+            if (tz) NWUpdateActiveFPKey(@"tz", tz);
+        }
         NWApplySystemLanguage();   // pays -> langue du telephone (US = anglais)
         NWReloadAfterStateChange();
         [weakSelf rebuild];
@@ -5440,22 +5610,38 @@ static void NWStartSpin(UIImageView *v) {
 }
 
 - (void)pickLocale {
-    NSArray *pairs = @[
-        @[@"fr_FR", @"Europe/Paris"], @[@"en_US", @"America/New_York"],
-        @[@"en_GB", @"Europe/London"], @[@"es_ES", @"Europe/Madrid"],
-        @[@"de_DE", @"Europe/Berlin"], @[@"it_IT", @"Europe/Rome"],
-        @[@"ar_SA", @"Asia/Riyadh"], @[@"pt_BR", @"America/Sao_Paulo"],
-        @[@"ja_JP", @"Asia/Tokyo"], @[@"nl_NL", @"Europe/Amsterdam"],
-        @[@"fr_CA", @"America/Montreal"], @[@"en_AU", @"Australia/Sydney"],
-    ];
+    // Meme source que "Preferred Country", mais la LANGUE est le titre :
+    // "French — France" au lieu de "fr_FR".
     NSMutableArray *opts = [NSMutableArray array];
-    for (NSArray *p in pairs) {
-        [opts addObject:@{@"title": p[0], @"subtitle": p[1], @"value": p[0], @"tz": p[1]}];
+    for (NSDictionary *o in NWCountryOptions()) {
+        [opts addObject:@{
+            @"title": NWLanguageDisplayName(o[@"lang"]),
+            @"subtitle": [NSString stringWithFormat:@"%@ · %@",
+                          NWCountryDisplayName(o[@"cc"]), o[@"tz"]],
+            @"value": o[@"value"],
+            @"tz": o[@"tz"],
+            @"cc": o[@"cc"],
+            @"lang": o[@"lang"],
+        }];
     }
     __weak typeof(self) weakSelf = self;
     [self presentOptions:opts selected:(NWActiveFP[@"locale"] ?: @"") heading:@"Choose Locale & Language" pick:^(NSDictionary *opt) {
-        NWUpdateActiveFPKey(@"locale", opt[@"value"]);
-        if (opt[@"tz"]) NWUpdateActiveFPKey(@"tz", opt[@"tz"]);
+        NSString *loc = opt[@"value"];
+        NSString *tz = opt[@"tz"];
+        NSString *newCC = opt[@"cc"];
+        NSString *oldLoc = NWActiveFP[@"locale"];
+        NSString *oldCC = nil;
+        if ([oldLoc isKindOfClass:[NSString class]] && oldLoc.length >= 2) {
+            NSArray *p = [oldLoc componentsSeparatedByString:@"_"];
+            oldCC = p.count > 1 ? p.lastObject : nil;
+        }
+        if (![newCC isEqualToString:oldCC ?: @""]) {
+            // Nouveau pays : appareil regenere avec la langue de ce pays.
+            NWRollIdentityForContainer(NWActiveID, loc, tz);
+        } else {
+            NWUpdateActiveFPKey(@"locale", loc);
+            if (tz) NWUpdateActiveFPKey(@"tz", tz);
+        }
         NWApplySystemLanguage();   // locale -> langue du telephone
         [weakSelf rebuild];
         // AppleLanguages change -> Instagram ne se retraduit qu'au rechargement
@@ -5925,6 +6111,65 @@ static void NWStartSpin(UIImageView *v) {
     [self addSection:NWL(@"dev_title", @"Device identity",
                          @"Identite de l'appareil",
                          @"Identidad del dispositivo")];
+    // --- "How it works" : le fonctionnement est explique DANS l'ecran -------
+    UIStackView *how = [self addPaddedCard];
+    UILabel *howTitle = NWLabelMake(NWL(@"dev_how_t", @"How it works",
+                                        @"Comment ca marche", @"Como funciona"),
+                                    14, UIColor.whiteColor, UIFontWeightSemibold);
+    [how addArrangedSubview:howTitle];
+    UILabel *howBody = NWLabelMake(NWL(@"dev_how_b",
+        @"Each container is a different iPhone.\n"
+        @"• Country and language come from the container, or from the city you pick when creating an account.\n"
+        @"• Device ID, Machine ID and the rest are generated automatically for every new container: no conflicts.\n"
+        @"• Mask / Roll only changes this container, never the others.\n"
+        @"• After a country or language change, Instagram must be relaunched to translate.",
+        @"Chaque conteneur est un iPhone different.\n"
+        @"• Le pays et la langue viennent du conteneur, ou de la ville choisie a la creation du compte.\n"
+        @"• Device ID, Machine ID et le reste sont generes automatiquement pour chaque nouveau conteneur : aucun conflit.\n"
+        @"• Mask / Roll ne modifie que ce conteneur, jamais les autres.\n"
+        @"• Apres un changement de pays ou de langue, Instagram doit etre relance pour se traduire.",
+        @"Cada contenedor es un iPhone distinto.\n"
+        @"• El pais y el idioma vienen del contenedor, o de la ciudad elegida al crear la cuenta.\n"
+        @"• Device ID, Machine ID y lo demas se generan automaticamente en cada contenedor: sin conflictos.\n"
+        @"• Mask / Roll solo cambia este contenedor, nunca los otros.\n"
+        @"• Tras cambiar pais o idioma, Instagram debe reiniciarse para traducirse."),
+        12, NWDim(), UIFontWeightRegular);
+    howBody.numberOfLines = 0;
+    [how addArrangedSubview:howBody];
+
+    // --- "This container" : etat reel, pour verifier d'un coup d'oeil --------
+    UIStackView *tc = [self addPaddedCard];
+    UILabel *tcTitle = NWLabelMake(NWL(@"dev_tc_t", @"This container",
+                                        @"Ce conteneur", @"Este contenedor"),
+                                    14, UIColor.whiteColor, UIFontWeightSemibold);
+    [tc addArrangedSubview:tcTitle];
+
+    NSDictionary *cont = NWActiveContainerDict();
+    NSString *cname = [cont[@"name"] isKindOfClass:[NSString class]] ? cont[@"name"] : @"—";
+    NSString *locId = NWActiveFP[@"locale"];
+    NSString *cc = nil, *lang = nil;
+    if ([locId isKindOfClass:[NSString class]] && locId.length >= 2) {
+        NSArray *parts = [locId componentsSeparatedByString:@"_"];
+        lang = parts.firstObject;
+        cc = parts.count > 1 ? parts.lastObject : nil;
+    }
+    NSString *where = @"—";
+    if (cc.length == 2) {
+        where = [NSString stringWithFormat:@"%@ · %@",
+                 NWCountryDisplayName(cc), NWLanguageDisplayName(lang)];
+    }
+    NSString *hw = [NSString stringWithFormat:@"%@ · iOS %@",
+                    NWModelName(NWActiveFP[@"model"]),
+                    NWActiveFP[@"sysVer"] ?: UIDevice.currentDevice.systemVersion];
+    UILabel *tcBody = NWLabelMake([NSString stringWithFormat:
+        @"%@: %@\n%@: %@\n%@: %@",
+        NWL(@"dev_tc_name", @"Container", @"Conteneur", @"Contenedor"), cname,
+        NWL(@"dev_tc_where", @"Country & language", @"Pays & langue", @"Pais e idioma"), where,
+        NWL(@"dev_tc_dev", @"Device", @"Appareil", @"Dispositivo"), hw],
+        12, NWDim(), UIFontWeightRegular);
+    tcBody.numberOfLines = 0;
+    [tc addArrangedSubview:tcBody];
+
     UIStackView *c = [self addRowsCard];
 
     NSString *curID = NWDevDevIDCurrent();
@@ -5998,6 +6243,7 @@ static void NWStartSpin(UIImageView *v) {
             if (v.length) {
                 NWDevSetStr(NWDevKeyDevID, v);
                 [[NSUserDefaults standardUserDefaults] setObject:@YES forKey:NWDevKeyOn];
+                if (NWActiveID) [[NSUserDefaults standardUserDefaults] setObject:NWActiveID forKey:NWDevKeyPinOwner];
                 [[NSUserDefaults standardUserDefaults] synchronize];
                 [weakSelf rebuild];
             }
@@ -6033,6 +6279,7 @@ static void NWStartSpin(UIImageView *v) {
             if (v.length) {
                 NWDevSetStr(NWDevKeyMid, v);
                 [[NSUserDefaults standardUserDefaults] setObject:@YES forKey:NWDevKeyOn];
+                if (NWActiveID) [[NSUserDefaults standardUserDefaults] setObject:NWActiveID forKey:NWDevKeyPinOwner];
                 [[NSUserDefaults standardUserDefaults] synchronize];
                 [weakSelf rebuild];
             }
@@ -6814,33 +7061,41 @@ static BOOL NWDevMaskOn(void)   { return NWDevBool(NWDevKeyOn); }
 static BOOL NWBlockAttest(void) { return NWDevBool(NWDevKeyAttBlock); }
 static BOOL NWSafeModeOn(void)  { return NWDevBool(NWSafeModeKey); }
 
+// Le pin global n'appartient qu'AU conteneur qui l'a cree. Un autre conteneur
+// ne doit jamais heriter de cette identite : sinon deux "telephones" partagent
+// le meme device id (conflit signale en vague 9). Pas de proprietaire = ancien
+// build -> on garde l'ancien comportement global.
+static BOOL NWDevPinActive(void) {
+    if (!NWDevMaskOn()) return NO;
+    NSString *owner = NWDevGetStr(NWDevKeyPinOwner);
+    if (!owner.length) return YES;
+    return (NWActiveID && [owner isEqualToString:NWActiveID]);
+}
+
+static NSString *NWDevPinnedStr(NSString *k) {
+    if (!NWDevPinActive()) return nil;
+    return NWDevGetStr(k);
+}
+
 // Valeur activee : pin global > empreinte du conteneur > nil.
 static NSString *NWDevDevIDCurrent(void) {
-    if (NWDevMaskOn()) {
-        NSString *g = NWDevGetStr(NWDevKeyDevID);
-        if (g) return g;
-    }
+    NSString *g = NWDevPinnedStr(NWDevKeyDevID);
+    if (g) return g;
     return NWFPStr(@"deviceId");
 }
 static NSString *NWDevFDIDCurrent(void) {
-    if (NWDevMaskOn()) {
-        NSString *g = NWDevGetStr(NWDevKeyFDID);
-        if (g) return g;
-    }
+    NSString *g = NWDevPinnedStr(NWDevKeyFDID);
+    if (g) return g;
     return NWFPStr(@"fdid");
 }
 static NSString *NWDevMidCurrent(void) {
-    if (NWDevMaskOn()) {
-        NSString *g = NWDevGetStr(NWDevKeyMid);
-        if (g) return g;
-    }
+    NSString *g = NWDevPinnedStr(NWDevKeyMid);
+    if (g) return g;
     return NWFPStr(@"mid");
 }
 static NSString *NWDevMidHdrCurrent(void) {
-    if (NWDevMaskOn()) {
-        NSString *g = NWDevGetStr(NWDevKeyMidHdr);
-        if (g) return g;
-    }
+    NSString *g = NWDevPinnedStr(NWDevKeyMidHdr);
+    if (g) return g;
     return NWFPStr(@"midHeader");
 }
 
@@ -6852,10 +7107,12 @@ static NSString *NWDevShort(NSString *s) {
 }
 
 // (Re)genere l'empreinte du conteneur actif + les valeurs epinglees globales.
+// La langue / le fuseau du conteneur sont CONSERVES : changer d'appareil ne
+// doit jamais casser le pays choisi (vague 9).
 static void NWDevRollIdentity(BOOL makeMask) {
     @try {
         if (NWActiveID) {
-            NSDictionary *nfp = NWGenerateFingerprint();
+            NSDictionary *nfp = NWGenerateFingerprintKeepingLocale(NWActiveFP);
             if (nfp) { NWActiveFP = nfp; NWUpdateActiveFP(nfp); }
         }
         NSUserDefaults *u = [NSUserDefaults standardUserDefaults];
@@ -6863,24 +7120,38 @@ static void NWDevRollIdentity(BOOL makeMask) {
         [u setObject:[[NSUUID UUID] UUIDString] forKey:NWDevKeyFDID];
         [u setObject:[[NSUUID UUID] UUIDString] forKey:NWDevKeyMid];
         [u setObject:[[NSUUID UUID] UUIDString] forKey:NWDevKeyMidHdr];
+        // Le pin appartient a CE conteneur : les autres gardent leur identite.
+        if (NWActiveID) [u setObject:NWActiveID forKey:NWDevKeyPinOwner];
         if (makeMask) [u setObject:@YES forKey:NWDevKeyOn];
         [u synchronize];
     } @catch (NSException *e) { NWLog("devRoll: %@", e.reason); }
 }
 
-// — getDeviceId : scan GLOBAL des classes, uniqueseaux des classes qui
-// definite le selector avec un retour objet ('@'). Chaque implementation
-// unique est hookiee une fois ; l'implementation reelle est garde par classe.
+// — getDeviceId : scan INCREMENTAL des classes (vague 9). L'ancien scan
+// appelait class_getInstanceMethod sur TOUTES les classes d'un coup, ce qui
+// forcait la realisation de toutes les classes Swift d'Instagram et faisait
+// fermer l'app ~5 s apres le lancement. Ici : class_copyMethodList (qui ne
+// realise PAS la classe), par petits lots de 100 classes toutes les 45 ms
+// sur la main queue, avec un @try par classe.
 static NSMutableDictionary<NSString *, NSValue *> *NWGetIdOrigMap = nil;
+static Class *NWGetIdClasses = NULL;
+static unsigned int NWGetIdClassCount = 0;
+static unsigned int NWGetIdScanIndex = 0;
+static BOOL NWGetIdScanRunning = NO;
+static NSMutableArray<NSValue *> *NWGetIdSeen = nil;
 
 static id NWHook_getDeviceId(id self, SEL _cmd) {
     @try {
-        NSString *p = NWDevMaskOn() ? NWDevDevIDCurrent() : nil;
-        if (p) return p;
+        // 1. L'identite du conteneur passe TOUJOURS en premier (plus de nil
+        // risque pour l'appelant). Si Ghost est OFF, NWFPStr renvoie nil et
+        // on retombe sur l'implementation d'origine (vraie valeur Apple).
+        NSString *p = NWDevDevIDCurrent();
+        if (p.length) return p;
         NSValue *v = nil;
         Class c = object_getClass(self);
         while (c && !v) {
-            v = NWGetIdOrigMap[NSStringFromClass(c)];
+            NSString *cn = NSStringFromClass(c);
+            v = cn ? NWGetIdOrigMap[cn] : nil;
             c = class_getSuperclass(c);
         }
         IMP old = v ? (IMP)v.pointerValue : NULL;
@@ -6892,49 +7163,69 @@ static id NWHook_getDeviceId(id self, SEL _cmd) {
     }
 }
 
-static void NWInstall_getDeviceId(void) {
-    SEL sel = sel_getUid("getDeviceId");
-    unsigned int cn = 0;
-    Class *classes = objc_copyClassList(&cn);
-    if (!classes) return;
-    NSMutableArray<NSValue *> *seen = [NSMutableArray array];
-    NSMutableArray *targets = [NSMutableArray array];
-    for (unsigned int i = 0; i < cn; i++) {
-        Class c = classes[i];
-        Method m = class_getInstanceMethod(c, sel);
-        if (!m) continue;
-        char *rt = method_copyReturnType(m);
-        if (!rt) continue;
-        BOOL isObj = (rt[0] == '@');
-        free(rt);
-        if (!isObj) continue;
-        // classe reelement DEFINISSANTE : on remonte tant que la
-        // superclass a la meme implementation.
-        Class def = c;
-        IMP imp = method_getImplementation(m);
-        Class up = class_getSuperclass(c);
-        while (up) {
-            Method mu = class_getInstanceMethod(up, sel);
-            if (!mu || method_getImplementation(mu) != imp) break;
-            def = up;
-            up = class_getSuperclass(up);
+static void NWScanGetDeviceIdStep(void) {
+    @autoreleasepool {
+        if (!NWGetIdScanRunning || !NWGetIdClasses) return;
+        if (!NWGetIdOrigMap) NWGetIdOrigMap = [NSMutableDictionary dictionary];
+        if (!NWGetIdSeen) NWGetIdSeen = [NSMutableArray array];
+        SEL sel = sel_getUid("getDeviceId");
+        unsigned int end = NWGetIdScanIndex + 100;
+        if (end > NWGetIdClassCount) end = NWGetIdClassCount;
+        for (unsigned int i = NWGetIdScanIndex; i < end; i++) {
+            Class c = NWGetIdClasses[i];
+            @try {
+                unsigned int mc = 0;
+                Method *ml = class_copyMethodList(c, &mc);   // pas de realisation
+                if (!ml) continue;
+                for (unsigned int j = 0; j < mc; j++) {
+                    Method m = ml[j];
+                    if (!sel_isEqual(method_getName(m), sel)) continue;
+                    char *rt = method_copyReturnType(m);
+                    BOOL isObj = (rt && rt[0] == '@');
+                    free(rt);
+                    if (!isObj) continue;
+                    IMP imp = method_getImplementation(m);
+                    NSValue *iv = [NSValue valueWithPointer:imp];
+                    if ([NWGetIdSeen containsObject:iv]) continue;  // deja hookee
+                    [NWGetIdSeen addObject:iv];
+                    NSString *cn = NSStringFromClass(c);
+                    if (!cn) cn = [NSString stringWithUTF8String:class_getName(c)];
+                    if (cn) NWGetIdOrigMap[cn] = iv;
+                    method_setImplementation(m, (IMP)NWHook_getDeviceId);
+                    NWLog("device id : getDeviceId hook (%s)", class_getName(c));
+                }
+                free(ml);
+            } @catch (NSException *e) {
+                NWLog("scan getDeviceId: %@", e.reason);
+            }
         }
-        NSValue *iv = [NSValue valueWithPointer:imp];
-        if ([seen containsObject:iv]) continue;   // inherited alike
-        [seen addObject:iv];
-        [targets addObject:def];
+        NWGetIdScanIndex = end;
+        if (NWGetIdScanIndex < NWGetIdClassCount) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(45 * NSEC_PER_MSEC)),
+                           dispatch_get_main_queue(), ^{ NWScanGetDeviceIdStep(); });
+        } else {
+            NWGetIdScanRunning = NO;
+            if (NWGetIdClasses) free(NWGetIdClasses);
+            NWGetIdClasses = NULL;
+            NWLog("device id : scan termine (%u classes)", NWGetIdClassCount);
+        }
     }
-    free(classes);
-    if (!NWGetIdOrigMap) NWGetIdOrigMap = [NSMutableDictionary dictionary];
-    for (id obj in targets) {
-        Class c = (Class)obj;
-        Method m = class_getInstanceMethod(c, sel);
-        if (!m) continue;
-        IMP old = method_getImplementation(m);
-        NWGetIdOrigMap[NSStringFromClass(c)] = [NSValue valueWithPointer:old];
-        method_setImplementation(m, (IMP)NWHook_getDeviceId);
-        NWLog("device id : getDeviceId hook (%s)", class_getName(c));
+}
+
+static void NWInstall_getDeviceId(void) {
+    if (NWGetIdScanRunning) return;
+    if (NWGetIdClasses) { free(NWGetIdClasses); NWGetIdClasses = NULL; }
+    NWGetIdClassCount = 0;
+    NWGetIdClasses = objc_copyClassList(&NWGetIdClassCount);
+    if (!NWGetIdClasses || !NWGetIdClassCount) {
+        if (NWGetIdClasses) free(NWGetIdClasses);
+        NWGetIdClasses = NULL;
+        return;
     }
+    NWGetIdScanIndex = 0;
+    NWGetIdScanRunning = YES;
+    // On ne scanne jamais dans le chemin d'appel : premier lot au prochain run.
+    dispatch_async(dispatch_get_main_queue(), ^{ NWScanGetDeviceIdStep(); });
 }
 
 // — FBFamilyDeviceID : familyDeviceIDWith...SourceFile/SourceLine (local).
@@ -6944,7 +7235,7 @@ static IMP NWOrig_fdidCached = NULL;
 
 static id NWHook_fdid(id self, SEL _cmd, id cfg, id file, int line) {
     @try {
-        NSString *p = NWDevMaskOn() ? NWDevFDIDCurrent() : nil;
+        NSString *p = NWDevPinnedStr(NWDevKeyFDID);
         if (p) return p;
         if (NWOrig_fdid) return ((id (*)(id, SEL, id, id, int))NWOrig_fdid)(self, _cmd, cfg, file, line);
         return nil;
@@ -6953,7 +7244,7 @@ static id NWHook_fdid(id self, SEL _cmd, id cfg, id file, int line) {
 
 static id NWHook_fdidCached(id self, SEL _cmd, id cfg, id file, int line) {
     @try {
-        NSString *p = NWDevMaskOn() ? NWDevFDIDCurrent() : nil;
+        NSString *p = NWDevPinnedStr(NWDevKeyFDID);
         if (p) return p;
         if (NWOrig_fdidCached) return ((id (*)(id, SEL, id, id, int))NWOrig_fdidCached)(self, _cmd, cfg, file, line);
         return nil;
@@ -7001,7 +7292,7 @@ static id NWHook_udsObject(id self, SEL _cmd, id key) {
     NWUdsInHook = YES;
     id result = nil;
     @try {
-        if (NWDevMaskOn() && NWDevIsMidKey(key)) {
+        if (NWDevPinActive() && NWDevIsMidKey(key)) {
             // mid et midheader ont chacun leur valeur epinglee (repli : mid).
             NSString *p = [key isEqualToString:@"com.instagram.device.midheader"]
                 ? NWDevMidHdrCurrent() : NWDevMidCurrent();
@@ -7022,7 +7313,7 @@ static void NWHook_udsSet(id self, SEL _cmd, id value, id key) {
     }
     NWUdsInHook = YES;
     @try {
-        if (NWDevMaskOn() && NWDevIsMidKey(key)) {
+        if (NWDevPinActive() && NWDevIsMidKey(key)) {
             NWLog("mid : ecriture serveur bloquee (machine id epingle)");
             NWUdsInHook = NO;
             return;
@@ -7039,7 +7330,7 @@ static void NWHook_udsRemove(id self, SEL _cmd, id key) {
     }
     NWUdsInHook = YES;
     @try {
-        if (NWDevMaskOn() && NWDevIsMidKey(key)) {
+        if (NWDevPinActive() && NWDevIsMidKey(key)) {
             NWLog("mid : suppression serveur bloquee (machine id epingle)");
             NWUdsInHook = NO;
             return;
@@ -7183,7 +7474,7 @@ static void NWPresentSafeModeUI(void) {
 
 // Change a chaque build publie : un nouveau dylib re-tente TOUTES les etapes
 // (sinon une etape neutralisee le resterait pour toujours).
-#define NWBuildID @"w8-2"
+#define NWBuildID @"w9-1"
 
 static int NWBootStopAt = 0;      // etapes >= cette valeur : neutralisees
 static int NWBootFaultStage = 0;  // etape responsable de l'echec precedent
