@@ -82,7 +82,7 @@ Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). San
 ### Vague 7 (build actuel) — architecture anti-détection + Device identity
 
 - **Base propre** : `com.burbn.instagram_v454.0.0_sideload_clean.ipa` — les résiduels d'un autre tweak (bundle, dylib, dylib d'injection) ont été retirés de l'archive et les 2 `LC_LOAD_WEAK_DYLIB` réécrits vers `@rpath/Peter.dylib` ; `cryptid=0`, **minOS 15.0**, zéro résidu (strings + Info.plist).
-- **Rebinding de toutes les images** : le rebind GOT (`uname` / `sysctl` / `sysctlbyname` + **`SecItemAdd/CopyMatching/Update/Delete`**) parcourt **toutes** les sections `__got` / `__auth_got` / `__la_symbol_ptr` / `__nl_symbol_ptr` de **toutes les images** déjà chargées **et** de celles chargées ensuite (`_dyld_register_func_for_add_image`), avec exclusion propre de notre image (`dladdr`) et `vm_protect VM_PROT_COPY`.
+- **Rebinding des images de l'app** : le rebind GOT (`uname` / `sysctl` / `sysctlbyname` + **`SecItemAdd/CopyMatching/Update/Delete`**) parcourt les sections `__got` / `__auth_got` / `__la_symbol_ptr` / `__nl_symbol_ptr` des images **de l'app** (binaire principal + frameworks du bundle), déjà chargées **et** celles chargées ensuite (`_dyld_register_func_for_add_image`), avec exclusion propre de notre image (`dladdr`) et `vm_protect VM_PROT_COPY`. **Le dyld shared cache est exclu** (`/System/`, `/usr/lib`) : rebind des libs système = récursion infinie dans nos hooks → crash instantané (correction vague 7b).
 - **Keychain en C** : les appels `SecItem*` faits en C par Instagram passent par des **wrappers** qui réécrivent `kSecAttrAccessGroup` vers le **vrai** groupe du certificat (item bidon → groupe réel) — repli direct vers l'API si pas encore rebindé.
 - **Conteneurs v2** : `-[LSBundleProxy groupContainerURLs]` (merge du faux conteneur) et `-[CKEntitlements initWithEntitlementsDict:]` (entitlement `com.apple.security.application-groups` injecté pour CloudKit), en plus du hook `NSFileManager` d'origine.
 - **Module « Device identity »** (bouton pill flottant haut-droite + ligne dans Support) : `Real • <ID court>`, `Machine ID` / `No machine ID yet`, **Mask everything & relaunch**, **Roll a new fingerprint**, saisie manuelle ID et machine ID, copie des deux, **Block Apple attestation** (DeviceCheck / App Attest, **Off** par défaut), **Relaunch now**, **Hide button until relaunch**. Les hooks couvrent `getDeviceId` (scan global des classes), `FBFamilyDeviceID`, `instagram.mid` / `com.instagram.device.midheader` (NSUserDefaults, écriture serveur bloquée) et l'IDFV (pin conteneur > valeur d'origine).
@@ -94,7 +94,7 @@ Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). San
 ## Installer
 
 1. Télécharger l'IPA : **[Release `nine9wham`](https://github.com/mpouki04-tech/nine9wham/releases/download/nine9wham/nine9wham_instagram_454.ipa)**
-   sha256 : `5111e22086e8c65312a3cf497f9650e1e43ba908853f12460240e0677f2ff62e` (344 232 530 octets)
+   sha256 : `692f956e9cba047b6fb9fa28924af3833c6f4af97b025d13102cd79bae0bc525` (344 232 702 octets)
 2. Ouvrir **Sideloadly** → sélectionner l'IPA → Install (certificat 7 jours, même Apple ID). Sideloadly est ici **uniquement** l'outil d'installation : aucune licence Blaze/Bumble n'est incluse.
 3. Lancer Instagram → le bouton **carré translucide (4 carrés)** apparaît **centré en bas**.
 
