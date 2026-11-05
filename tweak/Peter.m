@@ -7183,7 +7183,7 @@ static void NWPresentSafeModeUI(void) {
 
 // Change a chaque build publie : un nouveau dylib re-tente TOUTES les etapes
 // (sinon une etape neutralisee le resterait pour toujours).
-#define NWBuildID @"w8-1"
+#define NWBuildID @"w8-2"
 
 static int NWBootStopAt = 0;      // etapes >= cette valeur : neutralisees
 static int NWBootFaultStage = 0;  // etape responsable de l'echec precedent
@@ -7219,15 +7219,24 @@ static void NWBootBegin(void) {
         double t0 = [u doubleForKey:NW_BOOT_KEY_T0];
         int last = (int)[u integerForKey:NW_BOOT_KEY_STAGE];
         double now = [NSDate date].timeIntervalSince1970;
-        if (fault > 0) {
+        BOOL failed = (!done && t0 > 0 && (now - t0) < 180.0);
+        if (failed) {
+            if (fault > 0) {
+                // La recuperation a elle-meme echoue : on descend d'une etape
+                // de plus. On finit donc TOUJOURS par atteindre un demarrage
+                // sain, meme si la premiere attribution etait approximative.
+                fault = (fault > 1) ? fault - 1 : 1;
+            } else {
+                // Le lancement precedent n'a jamais atteint la fin : l'etape
+                // qui suit la derniere marque est celle qui a tue l'app.
+                fault = last + 1;
+            }
             NWBootFaultStage = fault;
-        } else if (!done && t0 > 0 && (now - t0) < 180.0) {
-            // Le lancement precedent n'a jamais atteint la fin : l'etape qui
-            // suit la derniere marque est celle qui a tue l'app.
-            NWBootFaultStage = last + 1;
-            [u setInteger:NWBootFaultStage forKey:NW_BOOT_KEY_FAULT];
+            [u setInteger:fault forKey:NW_BOOT_KEY_FAULT];
             NWLog("boot: echec precedent a l'etape %d (%s) -> neutralisee",
                   NWBootFaultStage, NWBootStageName(NWBootFaultStage));
+        } else if (fault > 0) {
+            NWBootFaultStage = fault;
         }
         NWBootStopAt = NWBootFaultStage;
         [u setDouble:now forKey:NW_BOOT_KEY_T0];
