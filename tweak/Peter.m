@@ -21,6 +21,7 @@
 #import <MapKit/MapKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <Security/Security.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
@@ -1622,6 +1623,155 @@ static NSArray<NSString *> *NWListBackups(void) {
     return [sorted copy];
 }
 
+#pragma mark - Transfert de conteneurs (export / import entre telephones)
+
+// Sauvegarde l'etat courant (prefs + cookies) DANS le conteneur actif.
+static void NWSnapshotActive(void);
+
+// Exporte TOUS les conteneurs (empreinte, langue, GPS, prefs, cookies) dans un
+// seul fichier chiffre. Contrairement a "Export backup", l'import FUSIONNE :
+// les conteneurs deja presents sur l'autre telephone sont conserves, les
+// conteneurs importes recoivent un nouvel identifiant en cas de collision.
+// Les prefs + cookies voyagent : les comptes arrivent deja connectes.
+static NSString *NWContainersExport(NSString *password, NSError **outErr) {
+    @try {
+        if (NWActiveID) NWSnapshotActive();
+        NSDictionary *st = NWState ?: @{};
+        NSDictionary *containers = [st[@"containers"] isKindOfClass:[NSDictionary class]]
+            ? st[@"containers"] : @{};
+        NSMutableDictionary *out = [NSMutableDictionary dictionary];
+        for (NSString *cid in containers) {
+            NSDictionary *c = [containers[cid] isKindOfClass:[NSDictionary class]]
+                ? containers[cid] : nil;
+            if (!c) continue;
+            NSMutableDictionary *mc = [c mutableCopy];
+            NSString *dir = NWContainerDir(cid);
+            NSData *prefs = [NSData dataWithContentsOfFile:[dir stringByAppendingPathComponent:@"prefs.plist"]];
+            NSData *cookies = [NSData dataWithContentsOfFile:[dir stringByAppendingPathComponent:@"cookies.plist"]];
+            if (prefs) mc[@"prefsData"] = prefs;
+            if (cookies) mc[@"cookiesData"] = cookies;
+            out[cid] = mc;
+        }
+        NSDictionary *payload = @{
+            @"nine9wham": @1,
+            @"type": @"containers",
+            @"createdAt": @([[NSDate date] timeIntervalSince1970]),
+            @"containers": out,
+        };
+        NSData *plist = [NSPropertyListSerialization dataWithPropertyList:payload
+                                                                  format:NSPropertyListXMLFormat_v1_0
+                                                                 options:0
+                                                                   error:outErr];
+        if (!plist) return nil;
+        NSData *crypt = NWEncryptData(plist, password ?: @"", outErr);
+        if (!crypt) return nil;
+        NSString *name = [NSString stringWithFormat:@"nine9wham_containers_%.0f.nw9c",
+                          [[NSDate date] timeIntervalSince1970]];
+        NSString *path = [NWDocumentsDir() stringByAppendingPathComponent:name];
+        if (![crypt writeToFile:path atomically:YES]) {
+            if (outErr) *outErr = [NSError errorWithDomain:@"nine9wham.containers" code:1 userInfo:nil];
+            return nil;
+        }
+        NWLog("conteneurs exportes: %@ (%lu octets, %lu conteneur(s))",
+              path, (unsigned long)crypt.length, (unsigned long)out.count);
+        return path;
+    } @catch (NSException *e) {
+        NWLog("export conteneurs: %@", e.reason);
+        if (outErr) *outErr = [NSError errorWithDomain:@"nine9wham.containers" code:2 userInfo:nil];
+        return nil;
+    }
+}
+
+// Importe un fichier exporte par NWContainersExport. Retourne le nombre de
+// conteneurs ajoutes (0 = rien d'importable). Ne touche PAS au conteneur actif.
+static NSInteger NWContainersImport(NSURL *url, NSString *password, NSError **outErr) {
+    @try {
+        NSData *crypt = url ? [NSData dataWithContentsOfURL:url] : nil;
+        if (!crypt) {
+            if (outErr) *outErr = [NSError errorWithDomain:@"nine9wham.containers" code:3 userInfo:nil];
+            return 0;
+        }
+        NSData *plist = NWDecryptData(crypt, password ?: @"", outErr);
+        if (!plist) return 0;
+        NSPropertyListFormat fmt = 0;
+        NSError *serr = nil;
+        id obj = [NSPropertyListSerialization propertyListWithData:plist options:0 format:&fmt error:&serr];
+        if (![obj isKindOfClass:[NSDictionary class]]) {
+            if (outErr) *outErr = serr ?: [NSError errorWithDomain:@"nine9wham.containers" code:4 userInfo:nil];
+            return 0;
+        }
+        NSDictionary *incoming = ((NSDictionary *)obj)[@"containers"];
+        if (![incoming isKindOfClass:[NSDictionary class]] || !incoming.count) {
+            if (outErr) *outErr = [NSError errorWithDomain:@"nine9wham.containers" code:5 userInfo:nil];
+            return 0;
+        }
+
+        NSDictionary *st = NWState ?: @{};
+        NSMutableDictionary *containers = [st[@"containers"] isKindOfClass:[NSDictionary class]]
+            ? [st[@"containers"] mutableCopy] : [NSMutableDictionary dictionary];
+        NSInteger n = (NSInteger)containers.count + 1;
+        NSInteger added = 0;
+        for (NSString *srcId in incoming) {
+            NSDictionary *src = [incoming[srcId] isKindOfClass:[NSDictionary class]]
+                ? incoming[srcId] : nil;
+            if (!src) continue;
+            NSString *cid = srcId;
+            while (containers[cid]) { cid = [NSString stringWithFormat:@"c%ld", (long)n++]; }
+
+            NSMutableDictionary *mc = [src mutableCopy];
+            NSData *prefs = mc[@"prefsData"];
+            NSData *cookies = mc[@"cookiesData"];
+            [mc removeObjectForKey:@"prefsData"];
+            [mc removeObjectForKey:@"cookiesData"];
+            mc[@"importedAt"] = @([[NSDate date] timeIntervalSince1970]);
+            if (![mc[@"name"] isKindOfClass:[NSString class]] || ![mc[@"name"] length]) {
+                mc[@"name"] = [NSString stringWithFormat:@"Imported %@", cid];
+            }
+
+            NSString *dir = NWContainerDir(cid);
+            [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                      withIntermediateDirectories:YES attributes:nil error:nil];
+            if ([prefs isKindOfClass:[NSData class]])
+                [prefs writeToFile:[dir stringByAppendingPathComponent:@"prefs.plist"] atomically:YES];
+            if ([cookies isKindOfClass:[NSData class]])
+                [cookies writeToFile:[dir stringByAppendingPathComponent:@"cookies.plist"] atomically:YES];
+            containers[cid] = mc;
+            added++;
+        }
+        NSMutableDictionary *newSt = [st mutableCopy] ?: [NSMutableDictionary dictionary];
+        newSt[@"containers"] = containers;
+        NWSaveState(newSt);
+        NWPersistState();
+        NWLog("conteneurs importes: %ld", (long)added);
+        return added;
+    } @catch (NSException *e) {
+        NWLog("import conteneurs: %@", e.reason);
+        if (outErr) *outErr = [NSError errorWithDomain:@"nine9wham.containers" code:6 userInfo:nil];
+        return 0;
+    }
+}
+
+// Selecteur de fichier pour l'import (le delegate est faible : on le garde).
+@class NWContainerImportPicker;
+static NWContainerImportPicker *NWImportPickerHolder = nil;
+
+@interface NWContainerImportPicker : NSObject <UIDocumentPickerDelegate>
+@property (nonatomic, copy) void (^completion)(NSURL *url);
+@end
+
+@implementation NWContainerImportPicker
+- (void)documentPicker:(UIDocumentPickerViewController *)controller
+    didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    NSURL *u = urls.firstObject;
+    void (^done)(void) = ^{ if (self.completion) self.completion(u); };
+    [controller dismissViewControllerAnimated:YES completion:done];
+}
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
+    (void)controller;
+    if (self.completion) self.completion(nil);
+}
+@end
+
 #pragma mark - Moteur conteneurs
 
 static NSString *NWBundleID(void) {
@@ -1707,6 +1857,13 @@ static NSString *NWCreateContainerWithLocGhost(NSString *name, NSDictionary *loc
     // Nouveau conteneur : modele iPhone 12 aleatoire si compatible avec la puce reale.
     NSString *forced12 = NWRandomIPhone12IfCompatible(fp[@"realMachine"]);
     if (forced12) fp[@"model"] = forced12;
+
+    // Vague 10 : un nouveau conteneur demarre TOUJOURS en anglais (Etats-Unis),
+    // conteneur par defaut compris : c'est la langue "telephone" vue par
+    // Instagram et par Device identity. La ville choisie sur la carte (ou
+    // "Preferred Country") reprend la main juste apres via NWMapFollowCountry.
+    fp[@"locale"] = @"en_US";
+    fp[@"tz"] = @"America/New_York";
 
     // 4. Conteneur vierge : prefs/cookies vides = Instagram redemande tout
     NSString *dir = NWContainerDir(cid);
@@ -3460,6 +3617,87 @@ static BOOL NWDevPillEnabled(void) {
     } @catch (NSException *e) { return YES; }
 }
 
+// Vague 10 : le pill "Device identity" est DEPLACABLE (meme geste que le
+// bouton principal). Sa position est conservee dans l'etat (ui.devX/devY),
+// donc elle survit aux relances et au timer de 2 s qui rafraichit l'overlay.
+@interface NWDevPillView : UIButton
+@property (nonatomic, assign) CGPoint touchStart;
+@property (nonatomic, assign) BOOL dragging;
+@property (nonatomic, copy) void (^onTap)(void);
+@end
+
+@implementation NWDevPillView
+
+- (void)nwSavePosition {
+    UIView *v = self.superview;
+    if (!v) return;
+    NSDictionary *st = NWState ?: @{};
+    NSMutableDictionary *ui = [st[@"ui"] mutableCopy] ?: [NSMutableDictionary dictionary];
+    ui[@"devX"] = @(CGRectGetMinX(self.frame));
+    ui[@"devY"] = @(CGRectGetMinY(self.frame));
+    NSMutableDictionary *newSt = [st mutableCopy] ?: [NSMutableDictionary dictionary];
+    newSt[@"ui"] = ui;
+    NWSaveState(newSt);
+}
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    self.touchStart = [touches.anyObject locationInView:self.superview];
+    self.dragging = NO;
+    [UIView animateWithDuration:0.12 delay:0 options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{ self.transform = CGAffineTransformMakeScale(0.96, 0.96); }
+                     completion:nil];
+    [super touchesBegan:touches withEvent:event];
+}
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    CGPoint p = [touches.anyObject locationInView:self.superview];
+    CGFloat dx = p.x - self.touchStart.x, dy = p.y - self.touchStart.y;
+    if (!self.dragging && (fabs(dx) > 4 || fabs(dy) > 4)) self.dragging = YES;
+    if (self.dragging) {
+        UIView *v = self.superview;
+        CGSize sz = self.bounds.size;
+        CGPoint c = self.center;
+        c.x += dx; c.y += dy;
+        c.x = MIN(MAX(c.x, sz.width / 2.0 + 6),
+                  v.bounds.size.width - sz.width / 2.0 - 6);
+        c.y = MIN(MAX(c.y, sz.height / 2.0 + 18),
+                  v.bounds.size.height - sz.height / 2.0 - 8);
+        self.center = c;
+        self.touchStart = p;
+        static CFTimeInterval lastSave = 0;
+        CFTimeInterval now = CACurrentMediaTime();
+        if (now - lastSave > 0.25) { lastSave = now; [self nwSavePosition]; }
+    }
+    [super touchesMoved:touches withEvent:event];
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [super touchesEnded:touches withEvent:event];
+    BOOL wasDragging = self.dragging;
+    self.dragging = NO;
+    [UIView animateWithDuration:0.18 delay:0 options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{ self.transform = CGAffineTransformIdentity; }
+                     completion:nil];
+    if (!wasDragging) {
+        if (self.onTap) self.onTap();
+        return;
+    }
+    [self nwSavePosition];
+    NWPersistState();
+}
+
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [super touchesCancelled:touches withEvent:event];
+    BOOL wasDragging = self.dragging;
+    self.dragging = NO;
+    [UIView animateWithDuration:0.18 delay:0 options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{ self.transform = CGAffineTransformIdentity; }
+                     completion:nil];
+    if (wasDragging) { [self nwSavePosition]; NWPersistState(); }
+}
+
+@end
+
 static void NWEnsureDevPill(UIView *root) {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{ NWEnsureDevPill(root); });
@@ -3470,7 +3708,7 @@ static void NWEnsureDevPill(UIView *root) {
         return;
     }
     if (!NWDevicePillButton) {
-        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+        NWDevPillView *b = [NWDevPillView buttonWithType:UIButtonTypeSystem];
         [b setTitle:NWL(@"dev_pill", @"Device identity", @"Identite", @"Identidad")
           forState:UIControlStateNormal];
         [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
@@ -3506,16 +3744,26 @@ static void NWEnsureDevPill(UIView *root) {
         b.contentEdgeInsets = UIEdgeInsetsMake(5, 12, 5, 12);
 #pragma clang diagnostic pop
         b.accessibilityLabel = @"Device identity";
-        NWBind(b, ^(id s){ NWOpenDeviceIdentity(); });
+        b.onTap = ^{ NWOpenDeviceIdentity(); };
         NWDevicePillButton = b;
     }
     if (NWDevicePillButton.superview != root) [root addSubview:NWDevicePillButton];
     NWDevicePillButton.hidden = NO;
+    // Ne jamais re-positionner pendant un glisser : le timer de 2 s remettrait
+    // le bouton a son ancienne place en plein deplacement.
+    if (((NWDevPillView *)NWDevicePillButton).dragging) return;
     CGSize s = root.bounds.size;
     CGSize fit = [NWDevicePillButton sizeThatFits:CGSizeMake(CGFLOAT_MAX, 28)];
     CGFloat w = MAX(96.0, fit.width);
     CGFloat h = 28.0;
-    NWDevicePillButton.frame = CGRectMake(s.width - w - 14, 54, w, h);
+    NSDictionary *ui = (NWState ?: @{})[@"ui"];
+    NSNumber *dx = [ui[@"devX"] isKindOfClass:[NSNumber class]] ? ui[@"devX"] : nil;
+    NSNumber *dy = [ui[@"devY"] isKindOfClass:[NSNumber class]] ? ui[@"devY"] : nil;
+    CGFloat x = dx ? dx.doubleValue : (s.width - w - 14);
+    CGFloat y = dy ? dy.doubleValue : 54;
+    x = MAX(6, MIN(x, s.width - w - 6));
+    y = MAX(18, MIN(y, s.height - h - 8));
+    NWDevicePillButton.frame = CGRectMake(x, y, w, h);
     if (NWDevicePillBlur) NWDevicePillBlur.frame = NWDevicePillButton.bounds;
 }
 
@@ -5442,6 +5690,72 @@ static void NWStartSpin(UIImageView *v) {
         [weakSelf promptDeviceName];
     }];
 
+    // --- Section "Containers" (transfert entre telephones) -----------------
+    // Vague 10 : exporter les conteneurs d'un iPhone puis les importer sur un
+    // autre. Le fichier part avec prefs + cookies : les comptes arrivent deja
+    // connectes, aucun compte n'est recree.
+    [self addSection:@"Containers"];
+    UIStackView *ctrans = [self addRowsCard];
+    [self addRow:ctrans icon:@"square.and.arrow.up" title:@"Export containers"
+           value:NWL(@"ct_exp_v", @"Send to another iPhone (encrypted file)",
+                     @"Envoyer vers un autre iPhone (fichier chiffre)",
+                     @"Enviar a otro iPhone (archivo cifrado)") action:^{
+        __strong typeof(weakSelf) s2 = weakSelf;
+        if (!s2) return;
+        [s2 promptBackupPassword:YES completion:^(NSString *pw) {
+            NSError *err = nil;
+            NSString *path = NWContainersExport(pw, &err);
+            if (!path) {
+                NWAlert(NWL(@"err_exp", @"Export error", @"Erreur export", @"Error de exportacion"),
+                        err.localizedDescription ?: NWL(@"fail", @"Failed", @"Echec", @"Fallo"));
+                return;
+            }
+            UIActivityViewController *av = [[UIActivityViewController alloc]
+                initWithActivityItems:@[[NSURL fileURLWithPath:path]] applicationActivities:nil];
+            av.popoverPresentationController.sourceView = s2.view;
+            av.popoverPresentationController.sourceRect =
+                CGRectMake(CGRectGetMidX(s2.view.bounds), s2.view.bounds.size.height - 80, 1, 1);
+            [s2 presentViewController:av animated:YES completion:nil];
+        }];
+    }];
+    [self addRow:ctrans icon:@"square.and.arrow.down" title:@"Import containers"
+           value:NWL(@"ct_imp_v", @"Add containers from a file (merge)",
+                     @"Ajouter des conteneurs depuis un fichier (fusion)",
+                     @"Anadir contenedores desde un archivo (fusion)") action:^{
+        __strong typeof(weakSelf) s2 = weakSelf;
+        if (!s2) return;
+        UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc]
+            initForOpeningContentTypes:@[UTTypeData] asCopy:YES];
+        NWContainerImportPicker *d = [NWContainerImportPicker new];
+        NWImportPickerHolder = d;   // le delegate d'un picker est faible
+        d.completion = ^(NSURL *u) {
+            NWImportPickerHolder = nil;
+            if (!u) return;
+            __strong typeof(weakSelf) s3 = weakSelf;
+            if (!s3) return;
+            [s3 promptBackupPassword:NO completion:^(NSString *pw) {
+                NSError *err = nil;
+                NSInteger n = NWContainersImport(u, pw, &err);
+                if (n > 0) {
+                    [s3 rebuild];
+                    NSString *fmt = NWL(@"ct_imp_ok2",
+                        @"%ld container(s) imported. Tap one to launch it.",
+                        @"%ld conteneur(s) importe(s). Touchez-en un pour le lancer.",
+                        @"%ld contenedor(es) importado(s). Toca uno para iniciarlo.");
+                    NWAlert(NWL(@"ct_imp_ok", @"Containers imported",
+                                @"Conteneurs importes", @"Contenedores importados"),
+                            [NSString stringWithFormat:fmt, (long)n]);
+                } else {
+                    NWAlert(NWL(@"err_imp", @"Import error", @"Erreur import", @"Error de importacion"),
+                            err.localizedDescription ?: NWL(@"fail", @"Failed", @"Echec", @"Fallo"));
+                }
+            }];
+        };
+        picker.delegate = d;
+        picker.allowsMultipleSelection = NO;
+        [s2 presentViewController:picker animated:YES completion:nil];
+    }];
+
     // --- Section "App & Device" (dans Ghost) ---------------------------------
     [self addSection:@"App & Device"];
     UIStackView *ad = [self addRowsCard];
@@ -6754,6 +7068,65 @@ static NSURL *(*NWOrig_containerURL)(id, SEL, NSString *);
 static void NWLoadAccessGroupReal(void) {
     if (NWAccessGroupReal.length || NWAccessGroupTries >= 3) return;
     NWAccessGroupTries++;
+
+    // Vague 10 : la sonde SecItemAdd depend d'un ajout reussi, qui peut etre
+    // refuse si le profil Sideloadly n'accorde pas le groupe attendu. Le shim
+    // RyukGram, lui, lisait directement l'entitlement du certificat
+    // ("application-identifier", cstring "MH9GU9K5PX."). On fait pareil en
+    // premier : c'est la source de verite du profil signe.
+    // ATTENTION : un access group keychain est le plus souvent le prefixe
+    // d'equipe COLLE au bundle id ("MH9GU9K5PX.com.burbn.instagram"). On ne
+    // retire donc PAS le prefixe : on garde la valeur entiere.
+    @try {
+        typedef const struct __NW_SecTask *NWSecTaskRef;
+        NWSecTaskRef (*createTask)(CFAllocatorRef) =
+            (NWSecTaskRef (*)(CFAllocatorRef))dlsym(RTLD_DEFAULT, "SecTaskCreateFromSelf");
+        CFTypeRef (*copyEnt)(NWSecTaskRef, CFStringRef, CFErrorRef *) =
+            (CFTypeRef (*)(NWSecTaskRef, CFStringRef, CFErrorRef *))
+            dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
+        if (createTask && copyEnt) {
+            NWSecTaskRef task = createTask(NULL);
+            if (task) {
+                NSString *appid = nil;
+                CFTypeRef appidRef = copyEnt(task, CFSTR("application-identifier"), NULL);
+                if (appidRef && CFGetTypeID(appidRef) == CFStringGetTypeID()) {
+                    appid = [(__bridge NSString *)appidRef copy];
+                }
+
+                // 1) keychain-access-groups : LE groupe reel du profil. On
+                //    prefere celui qui correspond a application-identifier,
+                //    sinon le premier de la liste.
+                CFTypeRef groups = copyEnt(task, CFSTR("keychain-access-groups"), NULL);
+                if (groups && CFGetTypeID(groups) == CFArrayGetTypeID()) {
+                    CFArrayRef arr = (CFArrayRef)groups;
+                    NSString *first = nil, *match = nil;
+                    for (CFIndex i = 0; i < CFArrayGetCount(arr); i++) {
+                        CFTypeRef g = CFArrayGetValueAtIndex(arr, i);
+                        if (!g || CFGetTypeID(g) != CFStringGetTypeID()) continue;
+                        NSString *gs = (__bridge NSString *)g;
+                        if (!first.length) first = [gs copy];
+                        if (appid.length && [gs isEqualToString:appid]) { match = [gs copy]; break; }
+                    }
+                    NWAccessGroupReal = match.length ? match : first;
+                }
+                if (groups) CFRelease(groups);
+
+                // 2) Repli : application-identifier entier (identique au
+                //    groupe keychain par defaut sur un profil standard).
+                if (!NWAccessGroupReal.length && appid.length) {
+                    NWAccessGroupReal = appid;
+                }
+                if (appidRef) CFRelease(appidRef);
+                CFRelease(task);
+                if (NWAccessGroupReal.length)
+                    NWLog("sideload: access group entitlement = %@", NWAccessGroupReal);
+            }
+        }
+        if (NWAccessGroupReal.length) return;
+    } @catch (NSException *e) {
+        NWLog("sideload entitlement access group: %@", e.reason);
+    }
+
     @try {
         NSDictionary *query = @{
             (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
@@ -7222,6 +7595,19 @@ static void NWScanGetDeviceIdStep(void) {
 }
 
 static void NWInstall_getDeviceId(void) {
+    // Vague 10 : audit des binaires de l'IPA (Instagram 454, FBSharedFramework,
+    // extensions) -> AUCUNE methode ObjC "getDeviceId" n'existe dans l'app.
+    // Le scan ne hookait donc rien, mais objc_copyClassList realisait ~31 000
+    // classes (dont Swift) sur le main thread : c'etait la cause du plantage
+    // ~5 s pendant la creation de compte. Le code reste present (aucun warning
+    // supplementaire) mais n'est plus JAMAIS execute : aucun appel ne pose ce
+    // flag. Pour reactiver un jour : [[NSUserDefaults standardUserDefaults]
+    // setBool:YES forKey:@"nw9.dev.scan.enabled"].
+    if (!NWDevBool(@"nw9.dev.scan.enabled")) {
+        static BOOL once = NO;
+        if (!once) { once = YES; NWLog("device id : scan neutralise (aucune cible getDeviceId dans l'app)"); }
+        return;
+    }
     if (NWGetIdScanRunning) return;
     if (NWGetIdSeen.count > 0) return;   // deja scanne : ne jamais re-hooker
     if (NWGetIdClasses) { free(NWGetIdClasses); NWGetIdClasses = NULL; }
@@ -7489,7 +7875,7 @@ static void NWPresentSafeModeUI(void) {
 
 // Change a chaque build publie : un nouveau dylib re-tente TOUTES les etapes
 // (sinon une etape neutralisee le resterait pour toujours).
-#define NWBuildID @"w9-2"
+#define NWBuildID @"w10-1"
 
 static int NWBootStopAt = 0;      // etapes >= cette valeur : neutralisees
 static int NWBootFaultStage = 0;  // etape responsable de l'echec precedent
