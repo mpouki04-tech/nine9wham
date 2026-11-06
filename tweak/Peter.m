@@ -7248,7 +7248,7 @@ static void NWStartSpin(UIImageView *v) {
            title:NWL(@"rp_copy", @"Copy all", @"Tout copier", @"Copiar todo")
            value:@"Report + crash log" action:^{
         NSString *t = NWReportFullText();
-        UIPasteboard.general.string = t;
+        [UIPasteboard generalPasteboard].string = t;
         NWAlert(NWL(@"rp_cop_t", @"Copied", @"Copié", @"Copiado"),
                 [NSString stringWithFormat:NWL(@"rp_cop",
                     @"Copied — %ld characters.",
