@@ -7399,25 +7399,25 @@ static void NWStartSpin(UIImageView *v) {
                 v.length ? v : NWL(@"dev_no_mid", @"No machine ID yet", @"Aucun ID machine", @"Sin ID de maquina"));
     }];
 
-    // Vague 10-7 : purge manuelle des items keychain herites (preuve en
-    // regardant Reset > Session forensics juste apres).
+    // Vague 11 : purge manuelle des items keychain herites ET fantomes
+    // (preuve en regardant Reset > Session forensics juste apres).
     [self addRow:c icon:@"trash"
-            title:NWL(@"dev_kcp", @"Purge legacy keychain",
-                      @"Purger le keychain legacy", @"Purgar keychain legacy")
+            title:NWL(@"dev_kcp", @"Purge stale keychain",
+                      @"Purger le keychain obsolete", @"Purgar keychain obsoleto")
             value:nil
            action:^{
-        NSUInteger n = NWKeychainPurgeLegacy(@"manual", NULL);
+        NSUInteger nl = NWKeychainPurgeLegacy(@"manual", NULL);
         NSUInteger ng = NWKeychainPurgeGhost(@"manual", NULL);
         NSUInteger np = NWPrefsPurgeGhost(@"manual");
-        NWLog(@"[NW] kc-ghost: manual ghost=%lu prefs=%lu",
-              (unsigned long)ng, (unsigned long)np);
-        NWAlert(NWL(@"dev_kcp", @"Purge legacy keychain",
-                    @"Purger le keychain legacy", @"Purgar keychain legacy"),
+        NWLog(@"[NW] kc-ghost: manual legacy=%lu ghost=%lu prefs=%lu",
+              (unsigned long)nl, (unsigned long)ng, (unsigned long)np);
+        NWAlert(NWL(@"dev_kcp", @"Purge stale keychain",
+                    @"Purger le keychain obsolete", @"Purgar keychain obsoleto"),
                 [NSString stringWithFormat:
-                 NWL(@"dev_kcpd", @"%lu legacy item(s) removed.",
-                     @"%lu item(s) legacy supprime(s).",
-                     @"%lu elemento(s) legacy eliminado(s)."),
-                 (unsigned long)n]);
+                 NWL(@"dev_kcpd", @"%lu item(s) removed (legacy %lu, ghost %lu).",
+                     @"%lu item(s) supprime(s) (legacy %lu, ghost %lu).",
+                     @"%lu elemento(s) eliminado(s) (legacy %lu, ghost %lu)."),
+                 (unsigned long)(nl + ng), (unsigned long)nl, (unsigned long)ng]);
         [weakSelf rebuild];
     }];
 
@@ -8526,7 +8526,7 @@ static id NWWKDefaultDataStore(void) {
 
 static void NWSessionForensicsShow(void) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        NSMutableString *rep = [NSMutableString stringWithString:@"SESSION FORENSICS w10-5\n"];
+        NSMutableString *rep = [NSMutableString stringWithFormat:@"SESSION FORENSICS %@\n", NWBuildID];
         NSMutableArray *found = [NSMutableArray array];
         @try {
             [rep appendFormat:@"conteneur: %@\n", NWActiveID ?: @"(aucun)"];
@@ -8563,7 +8563,7 @@ static void NWSessionForensicsShow(void) {
             // 4. Keychain — jamais isole par conteneur
             NSMutableArray *kc = [NSMutableArray array];
             BOOL kcSession = NO;
-            NSUInteger kcLegacy = 0;
+            NSUInteger kcLegacy = 0, kcGhost = 0;
             NSArray *classes = @[(__bridge id)kSecClassGenericPassword,
                                  (__bridge id)kSecClassInternetPassword];
             for (id cls in classes) {
@@ -8591,6 +8591,19 @@ static void NWSessionForensicsShow(void) {
                             kcLegacy++;
                             NWLog(@"[NW] forensics: kc[%lu] LEGACY", (unsigned long)kc.count);
                         }
+                        BOOL fam = NWGhostFamily(svc) || NWGhostFamily(acc);
+                        BOOL zx = [acc isEqualToString:NWZXAccount()];
+                        if (fam || zx) {
+                            NSData *gd = NWKeychainItemData(cls, svc, acc, ag, srv);
+                            BOOL unreadable = NO;
+                            BOOL ghost = NWKeychainGhostVerdict(svc, acc, gd, &unreadable);
+                            if (ghost) {
+                                kcGhost++;
+                                NWLog(@"[NW] forensics: kc[%lu] GHOST", (unsigned long)kc.count);
+                            } else if (unreadable) {
+                                NWLog(@"[NW] forensics: kc[%lu] UNREADABLE", (unsigned long)kc.count);
+                            }
+                        }
                         if ([svc containsString:@"nine9wham"]) continue;   // notre vault
                         [kc addObject:[NSString stringWithFormat:@"%@ / %@", svc ?: @"-", acc ?: @"-"]];
                         if (NWForensicLooksLikeSession(svc) || NWForensicLooksLikeSession(acc)) kcSession = YES;
@@ -8602,11 +8615,13 @@ static void NWSessionForensicsShow(void) {
             NSString *kcList = kc.count
                 ? [[kc subarrayWithRange:NSMakeRange(0, MIN(kc.count, (NSUInteger)6))] componentsJoinedByString:@" ; "]
                 : @"(vide)";
-            [rep appendFormat:@"4) keychain: %lu items (%lu legacy)%@ — %@\n",
-                (unsigned long)kc.count, (unsigned long)kcLegacy,
+            [rep appendFormat:@"4) keychain: %lu items (%lu legacy, %lu ghost)%@ — %@\n",
+                (unsigned long)kc.count, (unsigned long)kcLegacy, (unsigned long)kcGhost,
                 kcSession?@" [SESSION?]":@"", kcList];
-            if (kcLegacy) [rep appendFormat:@"LEGACY ITEMS PRESENT: %lu (Device identity > Purge legacy keychain)\n",
+            if (kcLegacy) [rep appendFormat:@"LEGACY ITEMS PRESENT: %lu (Device identity > Purge stale keychain)\n",
                 (unsigned long)kcLegacy];
+            if (kcGhost) [rep appendFormat:@"GHOST ITEMS PRESENT: %lu (Device identity > Purge stale keychain)\n",
+                (unsigned long)kcGhost];
 
             // 5. Fichiers qui portent la session
             NSMutableArray *ff = [NSMutableArray array];
@@ -9721,17 +9736,26 @@ static void NWStartUI(void) {
                                                          encoding:NSUTF8StringEncoding
                                                             error:NULL];
                 if (![kcv isEqualToString:NWBuildID]) {
-                    NSUInteger nk = NWKeychainPurgeLegacy(@"boot", NULL);
-                    NSUInteger nkg = NWKeychainPurgeGhost(@"boot", NULL);
+                    BOOL okL = YES, okG = YES;
+                    NSUInteger nl = NWKeychainPurgeLegacy(@"boot", &okL);
+                    NSUInteger ng = NWKeychainPurgeGhost(@"boot", &okG);
                     NSUInteger np = NWPrefsPurgeGhost(@"boot");
-                    NWLog(@"[NW] kc-purge: boot purged=%lu ghost=%lu prefs=%lu",
-                          (unsigned long)nk, (unsigned long)nkg, (unsigned long)np);
-                    [NWBuildID writeToFile:kcf atomically:YES
-                                  encoding:NSUTF8StringEncoding error:NULL];
+                    NWLog(@"[NW] kc-purge: boot legacy=%lu ghost=%lu prefs=%lu",
+                          (unsigned long)nl, (unsigned long)ng, (unsigned long)np);
+                    if (okL && okG) {
+                        [NWBuildID writeToFile:kcf atomically:YES
+                                      encoding:NSUTF8StringEncoding error:NULL];
+                    } else {
+                        NWLog(@"[NW] kc-purge: boot INCOMPLETE legacy=%d ghost=%d", okL, okG);
+                    }
                 }
                 NSString *flag = [NWDocumentsDir() stringByAppendingPathComponent:@"nw9_forensics_done"];
-                if (![[NSFileManager defaultManager] fileExistsAtPath:flag]) {
-                    [[NSData data] writeToFile:flag atomically:YES];
+                NSString *fv = [NSString stringWithContentsOfFile:flag
+                                                         encoding:NSUTF8StringEncoding
+                                                            error:NULL];
+                if (![fv isEqualToString:NWBuildID]) {
+                    [NWBuildID writeToFile:flag atomically:YES
+                                  encoding:NSUTF8StringEncoding error:NULL];
                     NWSessionForensicsShow();
                 }
             } @catch (NSException *e) { (void)e; }

@@ -22,4 +22,23 @@ assert '@"zx"' in src and '@"PluginsInjectGenericEntry"' in src
 assert 'NWKeychainPurgeLegacy(@"boot")' not in src, "appel 1 argument restant"
 assert 'NWKeychainPurgeLegacy(@"reset")' not in src, "appel 1 argument restant"
 assert 'NWKeychainPurgeLegacy(@"manual")' not in src, "appel 1 argument restant"
-print("OK: coeur w11 present")
+# boot
+assert 'NWKeychainPurgeGhost(@"boot", &okG)' in src
+assert 'NWKeychainPurgeLegacy(@"boot", &okL)' in src
+assert 'NWPrefsPurgeGhost(@"boot")' in src
+assert 'if (okL && okG)' in src
+assert 'INCOMPLETE' in src
+# reset
+assert 'NWKeychainPurgeGhost(@"reset"' in src
+assert 'NWPrefsPurgeGhost(@"reset")' in src
+# manuel + UI
+assert 'Purge stale keychain' in src
+assert 'Purger le keychain obsolete' in src
+assert 'Purgar keychain obsoleto' in src
+# forensique
+assert 'SESSION FORENSICS %@\\n' in src
+assert 'GHOST ITEMS PRESENT' in src
+assert 'kcGhost' in src
+# flag build-keyed
+assert 'isEqualToString:NWBuildID' in src
+print("OK: integration w11 presente")
