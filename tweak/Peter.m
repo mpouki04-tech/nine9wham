@@ -1507,8 +1507,61 @@ static void NWReportMaybeRotate(void) {
     } @catch (NSException *e) { (void)e; }
 }
 
-// Clear / Preview / FullText : creees dans la Task 4 (onglet Report) —
-// definir ici produirait des warnings "unused function" en CI intermediaire.
+// Clear / Preview / FullText : creees ici (Task 4, onglet Report) —
+// definir ces en Task 1 aurait produit des warnings "unused function"
+// en CI intermediaire (ruling Task 1).
+
+// Efface le rapport (bouton Clear de l'onglet Report).
+static void NWReportClear(void) {
+    if (NWReportFD < 0) return;
+    pthread_mutex_lock(&NWReportLock);
+    ftruncate(NWReportFD, 0);
+    pthread_mutex_unlock(&NWReportLock);
+}
+
+// Apercu pour l'onglet Report : 60 000 derniers octets. Si la lecture est
+// partielle, la premiere ligne (potentiellement coupee au milieu d'un
+// caractere UTF-8) est ecartee — l'apercu commence par un timestamp complet.
+static NSString *NWReportPreview(void) {
+    @try {
+        NSDictionary *at = [[NSFileManager defaultManager]
+            attributesOfItemAtPath:NWReportPath() error:nil];
+        unsigned long long sz = [at[NSFileSize] unsignedLongLongValue];
+        NSData *d = NWReportReadTail(60000ULL);
+        if (!d.length) return @"(empty)";
+        NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+        if (!s.length) return @"(empty)";
+        if (sz > 60000ULL) {
+            NSRange nl = [s rangeOfString:@"\n"];
+            if (nl.location != NSNotFound && nl.location + 1 < s.length)
+                s = [s substringFromIndex:nl.location + 1];
+        }
+        return s;
+    } @catch (NSException *e) {
+        return [NSString stringWithFormat:@"(read error: %@)", e.reason];
+    }
+}
+
+// Texte complet pour « Copier tout » : rapport entier + rapport de crash.
+static NSString *NWReportFullText(void) {
+    @try {
+        NSMutableString *out = [NSMutableString string];
+        NSData *rep = [NSData dataWithContentsOfFile:NWReportPath()];
+        if (rep.length) {
+            NSString *s = [[NSString alloc] initWithData:rep encoding:NSUTF8StringEncoding];
+            if (s) [out appendString:s];
+        }
+        NSData *crash = [NSData dataWithContentsOfFile:NWCrashLogPath()];
+        if (crash.length) {
+            [out appendString:@"\n\n=== nine9wham_crash.log ===\n"];
+            NSString *cs = [[NSString alloc] initWithData:crash encoding:NSUTF8StringEncoding];
+            if (cs) [out appendString:cs];
+        }
+        return out.length ? out : @"(empty)";
+    } @catch (NSException *e) {
+        return [NSString stringWithFormat:@"(read error: %@)", e.reason];
+    }
+}
 
 // Corps de NWLog (macro l.45) : la sortie console est identique a l'ancien
 // NSLog([nine9wham] ...), et la ligne part DANS le rapport (tag [NW]).
@@ -4938,6 +4991,8 @@ static void NWEnsureDevPill(UIView *root) {
         [self buildProxy];
     } else if ([self.module isEqualToString:@"changelog"]) {
         [self buildChangelog];
+    } else if ([self.module isEqualToString:@"report"]) {
+        [self buildReport];
     } else if ([self.module isEqualToString:@"support"]) {
         [self buildSupport];
     } else if ([self.module isEqualToString:@"deviceid"]) {
@@ -4953,6 +5008,7 @@ static void NWEnsureDevPill(UIView *root) {
         @"location": @"Location Spoofer", @"orbit": @"Location Spoofer",
         @"ghost": @"Ghost", @"containers": @"Containers",
         @"proxy": @"Proxy", @"changelog": @"Changelog",
+        @"report": @"Report",
         @"support": @"Support", @"reset": @"Reset",
         @"deviceid": @"Device identity",
     };
@@ -5506,6 +5562,7 @@ static void NWStartSpin(UIImageView *v) {
         @[@"Containers", @"square.stack.3d.up.fill", @"containers", NWAccent()],
         @[@"App & Device", @"iphone", @"device", NWBlue()],
         @[@"Changelog", @"note.text", @"changelog", NWDim()],
+        @[@"Report", @"doc.text", @"report", NWAccent()],
     ];
 
     for (NSUInteger i = 0; i < mods.count; i += 2) {
@@ -7155,6 +7212,98 @@ static void NWStartSpin(UIImageView *v) {
     UILabel *note = NWLabelMake(@"If you only want to delete a container, do it from the container list.",
                                 11, NWDim(), UIFontWeightRegular);
     [self.content addArrangedSubview:note];
+}
+
+// Onglet Report (vague 10-6) : apercu du journal persistant + copier /
+// partager / effacer. Aucun acces a la fenetre racine : popover ancre sur
+// self.view (pattern existant).
+- (void)buildReport {
+    __weak typeof(self) weakSelf = self;
+
+    [self addSection:@"Report"];
+    UILabel *hint = NWLabelMake(NWL(@"rp_hint", @"Full log — copy it and send it as is.",
+                                    @"Journal complet — copiez-le tel quel et envoyez-le.",
+                                    @"Registro completo — cópialo tal cual y envíalo."),
+                                11, NWDim(), UIFontWeightRegular);
+    [self.content addArrangedSubview:hint];
+
+    // Apercu (60 000 derniers octets) : non editable, monospaced, style Blaze.
+    UITextView *tv = [[UITextView alloc] init];
+    tv.text = NWReportPreview();
+    tv.editable = NO;
+    tv.selectable = YES;
+    tv.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+    tv.textColor = NWDim();
+    tv.backgroundColor = NWCardGlass();
+    tv.layer.cornerRadius = 12;
+    tv.textContainerInset = UIEdgeInsetsMake(8, 8, 8, 8);
+    tv.translatesAutoresizingMaskIntoConstraints = NO;
+    [tv.heightAnchor constraintEqualToConstant:320].active = YES;
+    [self.content addArrangedSubview:tv];
+
+    UIStackView *card = [self addRowsCard];
+
+    // Copier tout : rapport complet + fichier de crash.
+    [self addRow:card icon:@"doc.on.doc"
+           title:NWL(@"rp_copy", @"Copy all", @"Tout copier", @"Copiar todo")
+           value:@"Report + crash log" action:^{
+        NSString *t = NWReportFullText();
+        UIPasteboard.general.string = t;
+        NWAlert(NWL(@"rp_cop_t", @"Copied", @"Copié", @"Copiado"),
+                [NSString stringWithFormat:NWL(@"rp_cop",
+                    @"Copied — %ld characters.",
+                    @"Copié — %ld caractères.",
+                    @"Copiado — %ld caracteres."), (long)t.length]);
+    }];
+
+    // Partager : popover ancre sur self.view HORS du bloc (sourceView ne
+    // depend pas de weakSelf — Review Focus 4, pattern l.5378).
+    UIView *shareAnchor = self.view;
+    [self addRow:card icon:@"square.and.arrow.up"
+           title:NWL(@"rp_share", @"Share", @"Partager", @"Compartir")
+           value:@"Send the report" action:^{
+        __strong typeof(weakSelf) self2 = weakSelf;
+        if (!self2) return;
+        UIActivityViewController *av = [[UIActivityViewController alloc]
+            initWithActivityItems:@[NWReportFullText()] applicationActivities:nil];
+        av.popoverPresentationController.sourceView = shareAnchor;
+        av.popoverPresentationController.sourceRect =
+            CGRectMake(CGRectGetMidX(shareAnchor.bounds),
+                       shareAnchor.bounds.size.height - 80, 1, 1);
+        [self2 presentViewController:av animated:YES completion:nil];
+    }];
+
+    // Effacer : confirmation en 3 voies (rapport / tout / annuler).
+    [self addRow:card icon:@"trash.fill"
+           title:NWL(@"rp_clear", @"Clear", @"Effacer", @"Borrar")
+           value:@"Erase report" action:^{
+        __strong typeof(weakSelf) self2 = weakSelf;
+        if (!self2) return;
+        UIAlertController *a = [UIAlertController
+            alertControllerWithTitle:NWL(@"rp_clr_t", @"Clear report", @"Effacer le rapport", @"Borrar informe")
+            message:NWL(@"rp_clr_m", @"Erase the report only, or also the crash log?",
+                        @"Effacer le rapport seul, ou aussi le journal de crash ?",
+                        @"¿Borrar solo el informe, o también el registro de crash?")
+            preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:NWL(@"rp_clr_r", @"Clear report", @"Effacer le rapport", @"Borrar informe")
+                                              style:UIAlertActionStyleDestructive
+                                            handler:^(UIAlertAction *act) {
+            (void)act;
+            NWReportClear();
+            [weakSelf rebuild];
+        }]];
+        [a addAction:[UIAlertAction actionWithTitle:NWL(@"rp_clr_a", @"Clear everything", @"Tout effacer", @"Borrar todo")
+                                              style:UIAlertActionStyleDestructive
+                                            handler:^(UIAlertAction *act) {
+            (void)act;
+            NWReportClear();
+            [[NSFileManager defaultManager] removeItemAtPath:NWCrashLogPath() error:nil];
+            [weakSelf rebuild];
+        }]];
+        [a addAction:[UIAlertAction actionWithTitle:NWL(@"cancel", @"Cancel", @"Annuler", @"Cancelar")
+                                              style:UIAlertActionStyleCancel handler:nil]];
+        [self2 presentViewController:a animated:YES completion:nil];
+    }];
 }
 
 - (void)promptBackupPassword:(BOOL)isExport completion:(void (^)(NSString *password))completion {
