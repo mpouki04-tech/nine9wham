@@ -62,7 +62,7 @@ static void NWLogImpl(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
 // Vague 10-6 : en TETE du fichier — le marqueur de session du rapport
 // persistant (NWReportOpen, section Rapport) l'utilise AVANT sa position
 // historique en fin de fichier.
-#define NWBuildID @"w10-7"
+#define NWBuildID @"w11"
 #define NWDevKeyOn       @"nw9.dev.on"         // masque global
 #define NWDevKeyPinOwner @"nw9.dev.pin.owner"  // conteneur proprietaire du pin
 #define NWSafeModeKey    @"nw9.safe.mode"      // safe-mode one-shot
@@ -1599,7 +1599,10 @@ static NSData *NWKeychainItemData(id cls, NSString *svc, NSString *acc, NSString
     q[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitOne;
     CFTypeRef res = NULL;
     OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &res);
-    if (st != errSecSuccess || !res) return nil;
+    if (st != errSecSuccess || !res) {
+        if (res) CFRelease(res);
+        return nil;
+    }
     NSData *data = nil;
     if (CFGetTypeID(res) == CFDataGetTypeID()) {
         data = (__bridge_transfer NSData *)res;
