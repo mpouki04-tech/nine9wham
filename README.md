@@ -655,7 +655,8 @@ dans notre IPA (conflit de tweak écarte).
   jamais dans le binaire), test insensible a la casse sur
   service/account/accessGroup.
 - **`NWKeychainPurgeLegacy(trigger)`** : enum `SecItemCopyMatching`
-  (generic passwords, `MatchLimitAll`), filtres dans l'ordre — pas de
+  (generic + internet passwords — les **mêmes 2 classes** que la
+  forensique, `MatchLimitAll`), filtres dans l'ordre — pas de
   marqueur -> ignore ; `nine9wham` -> skip vault ; sinon
   `SecItemDelete` stricte (classe+service+account[+group]). Chaque item
   loggue `[NW] kc-purge: [trigger] deleted service=… account=…` ->
@@ -666,7 +667,7 @@ dans notre IPA (conflit de tweak écarte).
   flag de purge efface aussi) ; (3) bouton **Device identity >
   Purge legacy keychain** avec compteur dans l'alerte.
 - **Forensique enrichie** : inventaire COMPLET du keychain logue dans
-  le Report (`[NW] forensics: kc[i] service=… account=…` + marque
+  le Report (`[NW] forensics: kc[i] service=… account=… server=…` + marque
   `LEGACY`), ligne 4 = `keychain N items (M legacy)`, mention
   `LEGACY ITEMS PRESENT: M` tant qu'il en reste.
 
