@@ -1408,9 +1408,11 @@ static BOOL NWKeychainIsLegacyKC(NSString *service, NSString *account, NSString 
 }
 
 // Supprime les items herites ; loggue CHAQUE item via NWLog (preuve dans
-// le Report). Renvoie le nombre d'items supprimes.
-static NSUInteger NWKeychainPurgeLegacy(NSString *trigger) {
+// le Report). Renvoie le nombre d'items supprimes. `complete` reste YES
+// seulement si l'enumeration et toutes les suppressions ont abouti.
+static NSUInteger NWKeychainPurgeLegacy(NSString *trigger, BOOL *complete) {
     if (!trigger.length) trigger = @"?";
+    if (complete) *complete = YES;
     // Fix de revue (vague 10-7) : les DEUX memes classes que la
     // forensique — un item internet-password herite serait sinon detecte
     // ("LEGACY PRESENT") mais jamais supprimable.
@@ -1428,6 +1430,7 @@ static NSUInteger NWKeychainPurgeLegacy(NSString *trigger) {
         if (st == errSecItemNotFound) continue;
         if (st != errSecSuccess || !res) {
             NWLog("[NW] kc-purge: [%@] enum err %d", trigger, (int)st);
+            if (complete) *complete = NO;
             if (res) CFRelease(res);
             continue;
         }
@@ -1477,12 +1480,274 @@ static NSUInteger NWKeychainPurgeLegacy(NSString *trigger) {
             } else {
                 NWLog("[NW] kc-purge: [%@] FAIL %d service=%@ server=%@",
                       trigger, (int)d, svc, srv);
+                if (complete) *complete = NO;
             }
         }
     }
     NWLog("[NW] kc-purge: [%@] done legacy=%lu purged=%lu",
           trigger, (unsigned long)legacy, (unsigned long)purged);
     return purged;
+}
+
+#pragma mark - Purge keychain fantome (vague 11)
+
+// PK du compte fantome, construit par arithmetique : aucun litteral du
+// PK ne doit exister dans le binaire (check_markers.py).
+static NSString *NWGhostPK(void) {
+    static NSString *pk = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        unsigned long long v = 61516ULL * 1000000ULL + 395224ULL;
+        pk = [NSString stringWithFormat:@"%llu", v];
+    });
+    return pk;
+}
+
+// Compte injecte par l'ancien shim RyukGram ("zx" + nom du hook). Le
+// contigu ne doit jamais exister dans le binaire.
+static NSString *NWZXAccount(void) {
+    static NSString *acc = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        acc = [@"zx" stringByAppendingString:@"PluginsInjectGenericEntry"];
+    });
+    return acc;
+}
+
+// Familles natives qui memorisent le dernier compte (ghost inclus) :
+// login one-tap, comptes persistants, dernier utilisateur connecte.
+static BOOL NWGhostFamily(NSString *s) {
+    if (!s.length) return NO;
+    static NSArray<NSString *> *families = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        families = @[
+            @"device_based_login.growth",
+            @"cloud_based_login.growth",
+            @"persistent_accounts.growth",
+            @"com.instagram.users.persistent_accounts",
+            @"com.instagram.users.last_logged_in_user_pk",
+            @"last_logged_in_user_pk",
+        ];
+    });
+    for (NSString *f in families) {
+        if ([s rangeOfString:f options:NSCaseInsensitiveSearch].location != NSNotFound)
+            return YES;
+    }
+    return NO;
+}
+
+// Vrai si la data contient le PK en ASCII, ou en entier 8 octets BE/LE.
+static BOOL NWDataHasGhostPK(NSData *d, NSString *pk) {
+    if (!d.length || !pk.length) return NO;
+    NSData *ascii = [pk dataUsingEncoding:NSUTF8StringEncoding];
+    if (ascii.length
+        && [d rangeOfData:ascii options:0 range:NSMakeRange(0, d.length)].location != NSNotFound)
+        return YES;
+    unsigned long long v = strtoull(pk.UTF8String, NULL, 10);
+    if (v == 0 || d.length < 8) return NO;
+    uint64_t be = CFSwapInt64HostToBig((uint64_t)v);
+    uint64_t le = CFSwapInt64HostToLittle((uint64_t)v);
+    const uint8_t *bytes = (const uint8_t *)d.bytes;
+    for (NSUInteger i = 0; i + 8 <= d.length; i++) {
+        if (!memcmp(bytes + i, &be, 8) || !memcmp(bytes + i, &le, 8)) return YES;
+    }
+    return NO;
+}
+
+// Vrai si une valeur de prefs contient le PK (string, number, data, sinon
+// description : couvre les tableaux/dictionnaires plist).
+static BOOL NWValueHasGhostPK(id v, NSString *pk) {
+    if (!v || !pk.length) return NO;
+    if ([v isKindOfClass:[NSString class]])
+        return [v rangeOfString:pk].location != NSNotFound;
+    if ([v isKindOfClass:[NSNumber class]])
+        return [[v stringValue] rangeOfString:pk].location != NSNotFound;
+    if ([v isKindOfClass:[NSData class]])
+        return NWDataHasGhostPK((NSData *)v, pk);
+    NSString *desc = [v description];
+    return [desc rangeOfString:pk].location != NSNotFound;
+}
+
+// Verdict pour un item de famille/zx. `unreadable` signale une data
+// manquante : on ne supprime jamais a l'aveugle et la purge est incomplete.
+static BOOL NWKeychainGhostVerdict(NSString *svc, NSString *acc, NSData *data, BOOL *unreadable) {
+    NSString *pk = NWGhostPK();
+    BOOL zx = [acc isEqualToString:NWZXAccount()];
+    BOOL fam = NWGhostFamily(svc) || NWGhostFamily(acc);
+    if (!fam && !zx) return NO;
+    if (acc && [acc rangeOfString:pk].location != NSNotFound) return YES;
+    if (svc && [svc rangeOfString:@"device_based_login.growth"
+                          options:NSCaseInsensitiveSearch].location != NSNotFound
+        && [acc hasPrefix:[pk stringByAppendingString:@"-"]]) return YES;
+    if (!data) {
+        if (unreadable) *unreadable = YES;
+        return NO;
+    }
+    return NWDataHasGhostPK(data, pk);
+}
+
+// Data d'un item, avec requete d'identite stricte (jamais la classe seule).
+static NSData *NWKeychainItemData(id cls, NSString *svc, NSString *acc, NSString *ag, NSString *srv) {
+    NSMutableDictionary *q = [NSMutableDictionary dictionary];
+    q[(__bridge id)kSecClass] = cls;
+    if (svc) q[(__bridge id)kSecAttrService] = svc;
+    if (srv) q[(__bridge id)kSecAttrServer] = srv;
+    if (acc) q[(__bridge id)kSecAttrAccount] = acc;
+    if (ag)  q[(__bridge id)kSecAttrAccessGroup] = ag;
+    q[(__bridge id)kSecReturnData] = @YES;
+    q[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitOne;
+    CFTypeRef res = NULL;
+    OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &res);
+    if (st != errSecSuccess || !res) return nil;
+    NSData *data = nil;
+    if (CFGetTypeID(res) == CFDataGetTypeID()) {
+        data = (__bridge_transfer NSData *)res;
+    } else if (CFGetTypeID(res) == CFDictionaryGetTypeID()) {
+        NSDictionary *dict = (__bridge_transfer NSDictionary *)res;
+        id value = dict[(__bridge id)kSecValueData];
+        if ([value isKindOfClass:[NSData class]]) data = value;
+    } else {
+        CFRelease(res);
+    }
+    return data;
+}
+
+// Supprime les items de famille/zx qui portent le PK fantome. Un item
+// partage (data contient le PK) est supprime EN ENTIER : aucune reecriture
+// de blob opaque. `complete` passe a NO si un item cible reste illisible
+// ou si une suppression echoue (le flag de boot ne sera pas ecrit).
+static NSUInteger NWKeychainPurgeGhost(NSString *trigger, BOOL *complete) {
+    if (!trigger.length) trigger = @"?";
+    if (complete) *complete = YES;
+    NSArray *classes = @[(__bridge id)kSecClassGenericPassword,
+                         (__bridge id)kSecClassInternetPassword];
+    NSUInteger candidates = 0, purged = 0;
+    for (id cls in classes) {
+        NSDictionary *q = @{
+            (__bridge id)kSecClass: cls,
+            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
+            (__bridge id)kSecReturnAttributes: @YES,
+        };
+        CFTypeRef res = NULL;
+        OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &res);
+        if (st == errSecItemNotFound) continue;
+        if (st != errSecSuccess || !res) {
+            NWLog("[NW] kc-ghost: [%@] enum err %d", trigger, (int)st);
+            if (complete) *complete = NO;
+            if (res) CFRelease(res);
+            continue;
+        }
+        NSArray *items;
+        if (CFGetTypeID(res) == CFArrayGetTypeID()) {
+            items = (__bridge_transfer NSArray *)res;
+        } else {
+            items = @[(__bridge NSDictionary *)res];
+            CFRelease(res);
+        }
+        for (NSDictionary *it in items) {
+            if (![it isKindOfClass:[NSDictionary class]]) continue;
+            NSString *svc = [it[(__bridge id)kSecAttrService] isKindOfClass:[NSString class]]
+                ? it[(__bridge id)kSecAttrService] : nil;
+            NSString *acc = [it[(__bridge id)kSecAttrAccount] isKindOfClass:[NSString class]]
+                ? it[(__bridge id)kSecAttrAccount] : nil;
+            NSString *ag  = [it[(__bridge id)kSecAttrAccessGroup] isKindOfClass:[NSString class]]
+                ? it[(__bridge id)kSecAttrAccessGroup] : nil;
+            NSString *srv = [it[(__bridge id)kSecAttrServer] isKindOfClass:[NSString class]]
+                ? it[(__bridge id)kSecAttrServer] : nil;
+            // (a) jamais notre vault
+            if ((svc && [svc rangeOfString:@"nine9wham" options:NSCaseInsensitiveSearch].location != NSNotFound)
+                || (acc && [acc rangeOfString:@"nine9wham" options:NSCaseInsensitiveSearch].location != NSNotFound)
+                || (svc && [svc hasPrefix:@"nw9."])) {
+                continue;
+            }
+            BOOL fam = NWGhostFamily(svc) || NWGhostFamily(acc);
+            BOOL zx = [acc isEqualToString:NWZXAccount()];
+            if (!fam && !zx) continue;
+            candidates++;
+            // (b) requete d'identite vide = classe seule : interdit
+            if (!svc.length && !srv.length && !acc.length) {
+                NWLog("[NW] kc-ghost: [%@] SKIP identity service=%@ account=%@", trigger, svc, acc);
+                continue;
+            }
+            NSData *data = NWKeychainItemData(cls, svc, acc, ag, srv);
+            BOOL unreadable = NO;
+            BOOL ghost = NWKeychainGhostVerdict(svc, acc, data, &unreadable);
+            if (!ghost) {
+                if (unreadable) {
+                    NWLog("[NW] kc-ghost: [%@] UNREADABLE service=%@ account=%@", trigger, svc, acc);
+                    if (complete) *complete = NO;
+                }
+                continue;
+            }
+            // (c) requete stricte : classe + attributs d'identite enumeres
+            NSMutableDictionary *dq = [NSMutableDictionary dictionary];
+            dq[(__bridge id)kSecClass] = cls;
+            if (svc) dq[(__bridge id)kSecAttrService] = svc;
+            if (srv) dq[(__bridge id)kSecAttrServer] = srv;
+            if (acc) dq[(__bridge id)kSecAttrAccount] = acc;
+            if (ag)  dq[(__bridge id)kSecAttrAccessGroup] = ag;
+            OSStatus d = SecItemDelete((__bridge CFDictionaryRef)dq);
+            if (d == errSecSuccess) {
+                purged++;
+                NWLog("[NW] kc-ghost: [%@] deleted service=%@ account=%@ server=%@",
+                      trigger, svc, acc, srv);
+            } else if (d == errSecItemNotFound) {
+                NWLog("[NW] kc-ghost: [%@] missing service=%@ account=%@ server=%@",
+                      trigger, svc, acc, srv);
+            } else {
+                NWLog("[NW] kc-ghost: [%@] FAIL %d service=%@ server=%@",
+                      trigger, (int)d, svc, srv);
+                if (complete) *complete = NO;
+            }
+        }
+    }
+    NWLog("[NW] kc-ghost: [%@] done candidates=%lu purged=%lu",
+          trigger, (unsigned long)candidates, (unsigned long)purged);
+    return purged;
+}
+
+static NSString *NWBundleID(void);   // definie plus bas (section conteneurs)
+
+// Retire des prefs (domaine bundle + suites nw9.*) les cles qui memorisent
+// le PK fantome. La data keychain reste la source de verite ; les prefs
+// sont une defense en profondeur (one-tap / dernier utilisateur).
+static NSUInteger NWPrefsPurgeGhost(NSString *trigger) {
+    if (!trigger.length) trigger = @"?";
+    NSString *pk = NWGhostPK();
+    NSMutableArray<NSString *> *domains = [NSMutableArray array];
+    NSString *bundle = NWBundleID();
+    if (bundle.length) [domains addObject:bundle];
+    NSString *prefsDir = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject
+                          stringByAppendingPathComponent:@"Preferences"];
+    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:prefsDir error:nil] ?: @[];
+    for (NSString *f in files) {
+        if ([f hasPrefix:@"nw9."]) {
+            NSString *name = [f stringByDeletingPathExtension];
+            if (name.length && ![domains containsObject:name]) [domains addObject:name];
+        }
+    }
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    NSUInteger removed = 0;
+    for (NSString *domain in domains) {
+        NSDictionary *dom = [ud persistentDomainForName:domain] ?: @{};
+        NSMutableDictionary *mutable = nil;
+        for (NSString *key in dom.allKeys) {
+            BOOL target = [key isEqualToString:@"com.instagram.users.persistent_accounts"]
+                || [key isEqualToString:@"com.instagram.users.last_logged_in_user_pk"]
+                || [key rangeOfString:@"last_logged_in_user_pk"
+                              options:NSCaseInsensitiveSearch].location != NSNotFound;
+            if (!target) continue;
+            if (!NWValueHasGhostPK(dom[key], pk)) continue;
+            if (!mutable) mutable = [dom mutableCopy];
+            [mutable removeObjectForKey:key];
+            removed++;
+            NWLog("[NW] kc-ghost: [%@] prefs %@ removed %@", trigger, domain, key);
+        }
+        if (mutable) [ud setPersistentDomain:mutable forName:domain];
+    }
+    NWLog("[NW] kc-ghost: [%@] prefs removed=%lu", trigger, (unsigned long)removed);
+    return removed;
 }
 
 #pragma mark - Backup & Restore (survie re-install Sideloadly / mise a jour)
@@ -7141,7 +7406,11 @@ static void NWStartSpin(UIImageView *v) {
                       @"Purger le keychain legacy", @"Purgar keychain legacy")
             value:nil
            action:^{
-        NSUInteger n = NWKeychainPurgeLegacy(@"manual");
+        NSUInteger n = NWKeychainPurgeLegacy(@"manual", NULL);
+        NSUInteger ng = NWKeychainPurgeGhost(@"manual", NULL);
+        NSUInteger np = NWPrefsPurgeGhost(@"manual");
+        NWLog(@"[NW] kc-ghost: manual ghost=%lu prefs=%lu",
+              (unsigned long)ng, (unsigned long)np);
         NWAlert(NWL(@"dev_kcp", @"Purge legacy keychain",
                     @"Purger le keychain legacy", @"Purgar keychain legacy"),
                 [NSString stringWithFormat:
@@ -7541,8 +7810,11 @@ static void NWStartSpin(UIImageView *v) {
         NWLog(@"reset : %ld suite(s) nw9.* supprimee(s)", (long)nwSuiteN);
         // Vague 10-7 : purge des items keychain herites avant le exit —
         // le flag de purge est efface aussi (re-verifie au prochain boot).
-        NSUInteger nkp = NWKeychainPurgeLegacy(@"reset");
-        NWLog(@"[NW] kc-purge: reset purged=%lu", (unsigned long)nkp);
+        NSUInteger nkp = NWKeychainPurgeLegacy(@"reset", NULL);
+        NSUInteger nkg = NWKeychainPurgeGhost(@"reset", NULL);
+        NSUInteger nkpp = NWPrefsPurgeGhost(@"reset");
+        NWLog(@"[NW] kc-purge: reset purged=%lu ghost=%lu prefs=%lu",
+              (unsigned long)nkp, (unsigned long)nkg, (unsigned long)nkpp);
         [[NSFileManager defaultManager]
             removeItemAtPath:[NWDocumentsDir() stringByAppendingPathComponent:@"nw9_kcpurge_done"]
                        error:nil];
@@ -9449,8 +9721,11 @@ static void NWStartUI(void) {
                                                          encoding:NSUTF8StringEncoding
                                                             error:NULL];
                 if (![kcv isEqualToString:NWBuildID]) {
-                    NSUInteger nk = NWKeychainPurgeLegacy(@"boot");
-                    NWLog(@"[NW] kc-purge: boot purged=%lu", (unsigned long)nk);
+                    NSUInteger nk = NWKeychainPurgeLegacy(@"boot", NULL);
+                    NSUInteger nkg = NWKeychainPurgeGhost(@"boot", NULL);
+                    NSUInteger np = NWPrefsPurgeGhost(@"boot");
+                    NWLog(@"[NW] kc-purge: boot purged=%lu ghost=%lu prefs=%lu",
+                          (unsigned long)nk, (unsigned long)nkg, (unsigned long)np);
                     [NWBuildID writeToFile:kcf atomically:YES
                                   encoding:NSUTF8StringEncoding error:NULL];
                 }
