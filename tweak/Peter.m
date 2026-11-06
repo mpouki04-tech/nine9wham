@@ -1472,8 +1472,20 @@ static void NWReportAppendLine(const char *tag, NSString *msg) {
     } @catch (NSException *e) { (void)e; }
 }
 
-// Append de texte brut (blocs crash) : creee dans la Task 3 (rapporteur) —
-// definir ici produirait un warning "unused function" en CI intermediaire.
+// Append de texte brut (blocs crash) : meme protocole que
+// NWReportAppendLine, un seul write() — creee ici (Task 3) plutot qu'en
+// Task 1 pour ne pas produire de warning "unused function" en CI
+// intermediaire (ruling Task 1).
+static void NWReportAppendRaw(NSString *text) {
+    if (!text.length) return;
+    if (NWReportFD < 0) NWReportOpen();
+    if (NWReportFD < 0) return;
+    NSData *d = [text dataUsingEncoding:NSUTF8StringEncoding];
+    if (!d.length) return;
+    pthread_mutex_lock(&NWReportLock);
+    ssize_t w = write(NWReportFD, d.bytes, d.length); (void)w;
+    pthread_mutex_unlock(&NWReportLock);
+}
 
 // Rotation : au-dela de 2 Mo on garde le Mo final (apercu + copie restent
 // utilisables, le fichier ne grossit plus). Appelée au boot et au flush 15 s.
@@ -1574,6 +1586,14 @@ static void NWCrashExceptionHandler(NSException *e);
 static void NWCrashWStr(int fd, const char *s) {
     if (fd >= 0 && s) { ssize_t w = write(fd, s, strlen(s)); (void)w; }
 }
+// Miroir vague 10-6 : meme ecriture sur le fichier de crash ET sur le
+// rapport persistant (fd deja ouvert, O_APPEND) — paires write() pures,
+// AUCUN lock dans ce chemin (le handler signal ne doit jamais prendre
+// NWReportLock : Review Focus 1/2).
+static void NWCrashWBoth(int fd, const char *s) {
+    NWCrashWStr(fd, s);
+    if (NWReportFD >= 0 && s) { ssize_t w = write(NWReportFD, s, strlen(s)); (void)w; }
+}
 static void NWCrashWHex(int fd, unsigned long long v) {
     static const char *hx = "0123456789abcdef";
     char b[20];
@@ -1589,7 +1609,7 @@ static void NWCrashSignal(int sig, siginfo_t *si, void *ctx) {
     (void)ctx;
     int fd = NWCrashPathC[0] ? open(NWCrashPathC, O_WRONLY | O_APPEND | O_CREAT, 0644) : -1;
     if (fd >= 0) {
-        NWCrashWStr(fd, "\n=== nine9wham CRASH (signal) ===\nsignal: ");
+        NWCrashWBoth(fd, "\n=== nine9wham CRASH (signal) ===\nsignal: ");
         const char *nm = "UNKNOWN";
         switch (sig) {
             case SIGSEGV: nm = "SIGSEGV"; break;
@@ -1598,14 +1618,33 @@ static void NWCrashSignal(int sig, siginfo_t *si, void *ctx) {
             case SIGILL:  nm = "SIGILL";  break;
             case SIGFPE:  nm = "SIGFPE";  break;
         }
-        NWCrashWStr(fd, nm);
-        NWCrashWStr(fd, "\nsi_addr: 0x");
+        NWCrashWBoth(fd, nm);
+        NWCrashWBoth(fd, "\nsi_addr: 0x");
+        // Hex du rapport : NWCrashWHex n'ecrit que sur fd — on double via
+        // NWCrashWBoth pour le bloc crash deja en-tete, puis hex rapport.
         NWCrashWHex(fd, si ? (unsigned long long)(uintptr_t)si->si_addr : 0);
-        NWCrashWStr(fd, "\n");
+        if (NWReportFD >= 0) NWCrashWHex(NWReportFD, si ? (unsigned long long)(uintptr_t)si->si_addr : 0);
+        NWCrashWBoth(fd, "\n");
         void *frames[64];
         int n = backtrace(frames, 64);
-        if (n > 0) backtrace_symbols_fd(frames, n, fd);
+        if (n > 0) {
+            backtrace_symbols_fd(frames, n, fd);
+            // Filet de secours rapport : si le fd de crash n'a pas ete
+            // ouvert (NWCrashPathC vide), la pile part quand meme ici.
+            if (NWReportFD >= 0) backtrace_symbols_fd(frames, n, NWReportFD);
+        }
         close(fd);
+    } else if (NWReportFD >= 0) {
+        // Pas de fichier de crash ouvrable : le rapport reçoit quand meme
+        // le bloc signal (c'est le canal qui survivra au plantage).
+        NWCrashWBoth(-1, "\n=== nine9wham CRASH (signal) ===\nsignal: ");
+        NWCrashWBoth(-1, sig == SIGSEGV ? "SIGSEGV" : sig == SIGABRT ? "SIGABRT" :
+                         sig == SIGBUS ? "SIGBUS" : sig == SIGILL ? "SIGILL" :
+                         sig == SIGFPE ? "SIGFPE" : "UNKNOWN");
+        NWCrashWBoth(-1, "\n");
+        void *frames[64];
+        int n = backtrace(frames, 64);
+        if (n > 0) backtrace_symbols_fd(frames, n, NWReportFD);
     }
     struct sigaction dfl;
     memset(&dfl, 0, sizeof(dfl));
@@ -1627,7 +1666,17 @@ static void NWCrashExceptionHandler(NSException *e) {
             [s appendString:line];
             [s appendString:@"\n"];
         }
-        [s writeToFile:NWCrashLogPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        // Vague 10-6 : plus d'ecriture atomique (= ecrasement a chaque
+        // crash) — append sur le rapport ET sur le fichier de crash.
+        NWReportAppendRaw(s);
+        {
+            NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
+            if (d.length) {
+                int cfd = open(NWCrashLogPath().fileSystemRepresentation,
+                               O_WRONLY | O_APPEND | O_CREAT, 0644);
+                if (cfd >= 0) { ssize_t w = write(cfd, d.bytes, d.length); (void)w; close(cfd); }
+            }
+        }
         NWLog("exception non catchee: %@ — %@", e.name, e.reason);
     } @catch (NSException *x) { (void)x; }
     if (NWPrevExceptionHandler && NWPrevExceptionHandler != NWCrashExceptionHandler) {
