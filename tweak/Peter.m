@@ -7793,6 +7793,8 @@ static BOOL NWDevIsMidKey(id key) {
 static NSString *NWSandboxSuiteName(NSString *name) {
     if (![name isKindOfClass:[NSString class]] || !name.length) return name;
     if (![name hasPrefix:@"group."]) return name;
+    // Ne jamais detourner les suites des frameworks Apple eux-memes.
+    if ([name hasPrefix:@"group.com.apple."]) return name;
     return [NSString stringWithFormat:@"nw9.%@.%@", NWActiveID ?: @"shared", name];
 }
 
