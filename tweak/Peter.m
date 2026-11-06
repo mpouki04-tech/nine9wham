@@ -12,6 +12,7 @@
 //  Compilation (voir .github/workflows/build.yml) :
 //    xcrun -sdk iphoneos clang -arch arm64 -fobjc-arc -dynamiclib \
 //      -framework Foundation -framework UIKit -framework CoreLocation \
+//      -framework WebKit \
 //      -install_name @rpath/Peter.dylib -o Peter.dylib Peter.m
 //
 
@@ -21,6 +22,7 @@
 #import <MapKit/MapKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <Security/Security.h>
+#import <WebKit/WebKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -83,6 +85,7 @@ static void NWEnsureDevPill(UIView *root);
 static void NWOpenDeviceIdentity(void);
 static void NWCloseMenu(void);
 static void NWPresentSafeModeUI(void);
+static void NWSessionForensicsShow(void);   // vague 10-5 (diagnostic session)
 
 #pragma mark - Chemins
 
@@ -120,6 +123,15 @@ static NSDictionary *NWState = nil;          // snapshot en memoire
 static NSString     *NWActiveID = nil;
 static NSDictionary *NWActiveFP = nil;       // empreinte du conteneur actif
 static NSDictionary *NWActiveLoc = nil;      // localisation fake du conteneur actif
+
+// Vague 10-5 : apres une BASCULE de conteneur, Instagram est toujours
+// connectee en memoire et reecrit ses cookies/prefs dans le magasin
+// partage. Un snapshot (timer 15 s / flush a l'arriere-plan) copierait
+// alors la session de l'ancien conteneur DANS le nouveau — c'est
+// exactement « le meme compte dans chaque conteneur ». On ne sauve donc
+// plus rien jusqu'au prochain lancement (le flag est en memoire : il
+// disparait avec le processus, c'est exactement la fenetre desiree).
+static BOOL NWNoSnapshot = NO;
 
 static NSDictionary *NWLoadState(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:NWStatePath()];
@@ -1801,6 +1813,10 @@ static NSString *NWBundleID(void) {
 // Sauvegarde l'etat courant (prefs + cookies) DANS le conteneur actif.
 static void NWSnapshotActive(void) {
     if (!NWActiveID) return;
+    if (NWNoSnapshot) {
+        NWLog("snapshot ignore : conteneur change, relance requise");
+        return;
+    }
     NSString *dir = NWContainerDir(NWActiveID);
     // Jamais d'exception : ce tour est appele en tache de fond (timer 15 s).
     @try {
@@ -6220,6 +6236,9 @@ static void NWStartSpin(UIImageView *v) {
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"Yes, I'm sure!" style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
         NWSwitchContainer(cid);
+        // Vague 10-5 : plus de snapshot jusqu'au relancement — Instagram est
+        // encore connectee et ecrirait SON compte dans le conteneur cible.
+        NWNoSnapshot = YES;
         [weakSelf rebuild];
         NWAskRelaunch([NSString stringWithFormat:@"The container %@", name]);
     }]];
@@ -6889,6 +6908,14 @@ static void NWStartSpin(UIImageView *v) {
         [weakSelf confirmReset];
     }];
 
+    // Vague 10-5 : inventaire des magasins de session (diagnostic).
+    [self addRow:card icon:@"magnifyingglass"
+           title:NWL(@"foren", @"Session forensics",
+                     @"Forensique de session", @"Forense de sesion")
+           value:@"Where is the login stored?" action:^{
+        NWSessionForensicsShow();
+    }];
+
     UILabel *note = NWLabelMake(@"If you only want to delete a container, do it from the container list.",
                                 11, NWDim(), UIFontWeightRegular);
     [self.content addArrangedSubview:note];
@@ -6926,13 +6953,41 @@ static void NWStartSpin(UIImageView *v) {
         [NSUserDefaults.standardUserDefaults removePersistentDomainForName:NWBundleID()];
         [NSUserDefaults.standardUserDefaults synchronize];
         [NSHTTPCookieStorage.sharedHTTPCookieStorage removeCookiesSinceDate:[NSDate dateWithTimeIntervalSince1970:0]];
+        // Vague 10-5 : le reset effacait prefs + cookies + notre dossier,
+        // mais PAS les magasins hors swap — d'ou « le compte est toujours
+        // la ». On efface aussi :
+        //  - les suites redirigees nw9.<conteneur>.group.* (fichiers
+        //    Library/Preferences, hors domaine du bundle) ;
+        //  - les donnees webview (WKWebsiteDataStore : cookies + localStorage
+        //    des webviews, magasin distinct de NSHTTPCookieStorage).
+        // Le keychain n'est pas touche (machine id / attestation) : la
+        // forensique de session (Reset -> Session forensics) dit s'il y vit
+        // un compte, capture d'ecran a l'appui.
+        NSString *nwPrefDir = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject
+                               stringByAppendingPathComponent:@"Preferences"];
+        NSArray *nwPrefs = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:nwPrefDir error:nil];
+        NSInteger nwSuiteN = 0;
+        for (NSString *f in nwPrefs) {
+            if ([f hasPrefix:@"nw9."]) {
+                if ([[NSFileManager defaultManager] removeItemAtPath:[nwPrefDir stringByAppendingPathComponent:f] error:nil]) nwSuiteN++;
+            }
+        }
+        [[WKWebsiteDataStore defaultWebsiteDataStore]
+            removeDataOfTypes:[WKWebsiteDataStore allWebsiteDataTypes]
+            modifiedSince:[NSDate dateWithTimeIntervalSince1970:0]
+            completionHandler:^(NSError *e) { NWLog(@"reset donnees webview: %@", e ?: @"ok"); }];
+        NWLog(@"reset : %ld suite(s) nw9.* supprimee(s)", (long)nwSuiteN);
+        // La forensique se rejoue au lancement suivant (flag en Documents).
+        [[NSFileManager defaultManager]
+            removeItemAtPath:[NWDocumentsDir() stringByAppendingPathComponent:@"nw9_forensics_done"]
+                       error:nil];
         NWVaultDelete();
         NWState = @{};
         NWActiveID = nil;
         NWActiveFP = nil;
         NWActiveLoc = nil;
         NWLog("reset complet effectue");
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ exit(0); });
     }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
@@ -7586,6 +7641,157 @@ static void NWFlushOnExit(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Vague 10-5 : forensique de session (diagnostic).
+// Notre swap ne couvre que DEUX magasins (domaine du bundle + cookies
+// partages) alors que la session connectee peut vivre ailleurs (suites
+// nw9.*, keychain, webview). Cette sonde inventorie tout et rend un
+// VERDICT : une capture d'ecran suffit pour savoir ou agir.
+// ---------------------------------------------------------------------------
+
+static NSArray<NSString *> *NWForensicSessionKeys(NSDictionary *dom) {
+    NSMutableArray *out = [NSMutableArray array];
+    for (id k in dom) {
+        if (![k isKindOfClass:[NSString class]]) continue;
+        NSString *lk = ((NSString *)k).lowercaseString;
+        if ([lk containsString:@"user"] || [lk containsString:@"account"] ||
+            [lk containsString:@"session"] || [lk containsString:@"logged"] ||
+            [lk containsString:@"cookie"]) {
+            [out addObject:k];
+            if (out.count >= 5) break;
+        }
+    }
+    return out;
+}
+
+static BOOL NWForensicLooksLikeSession(NSString *s) {
+    if (!s.length) return NO;
+    NSString *l = s.lowercaseString;
+    return ([l containsString:@"user"] || [l containsString:@"session"] ||
+            [l containsString:@"login"] || [l containsString:@"auth"] ||
+            [l containsString:@"cookie"] || [l containsString:@"instagram"]);
+}
+
+static void NWSessionForensicsShow(void) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSMutableString *rep = [NSMutableString stringWithString:@"SESSION FORENSICS w10-5\n"];
+        NSMutableArray *found = [NSMutableArray array];
+        @try {
+            [rep appendFormat:@"conteneur: %@\n", NWActiveID ?: @"(aucun)"];
+
+            // 1. Cookies partages — NOTRE swap n2
+            NSArray *ck = NSHTTPCookieStorage.sharedHTTPCookieStorage.cookies;
+            NSMutableSet *nm = [NSMutableSet set];
+            for (NSHTTPCookie *c in ck) if (c.name.length) [nm addObject:c.name.lowercaseString];
+            BOOL hasSid = [nm containsObject:@"sessionid"];
+            BOOL hasDsu = [nm containsObject:@"ds_user_id"];
+            [rep appendFormat:@"1) cookies partages: %lu (sessionid=%@ ds_user=%@)\n",
+                (unsigned long)ck.count, hasSid?@"OUI":@"non", hasDsu?@"OUI":@"non"];
+            if (hasSid || hasDsu) [found addObject:@"cookies partages"];
+
+            // 2. Prefs du domaine du bundle — NOTRE swap n1
+            NSDictionary *dom = [NSUserDefaults.standardUserDefaults persistentDomainForName:NWBundleID()] ?: @{};
+            NSArray *uk = NWForensicSessionKeys(dom);
+            [rep appendFormat:@"2) prefs bundle: %lu cles, session=%@\n",
+                (unsigned long)dom.count, uk.count ? [uk componentsJoinedByString:@","] : @"aucune"];
+            if (uk.count) [found addObject:@"prefs bundle"];
+
+            // 3. Suites redirigees nw9.* (fichiers hors domaine du bundle)
+            NSString *pd = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject
+                            stringByAppendingPathComponent:@"Preferences"];
+            NSArray *fs = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:pd error:nil] ?: @[];
+            NSMutableArray *su = [NSMutableArray array];
+            for (NSString *f in fs) if ([f hasPrefix:@"nw9."]) [su addObject:[f stringByDeletingPathExtension]];
+            [rep appendFormat:@"3) suites nw9.*: %@\n", su.count ? [su componentsJoinedByString:@","] : @"(aucune)"];
+            for (NSString *s in su) {
+                NSDictionary *sd = [NSUserDefaults.standardUserDefaults persistentDomainForName:s] ?: @{};
+                if (NWForensicSessionKeys(sd).count) { [found addObject:@"suites nw9.*"]; break; }
+            }
+
+            // 4. Keychain — jamais isole par conteneur
+            NSMutableArray *kc = [NSMutableArray array];
+            BOOL kcSession = NO;
+            NSArray *classes = @[(__bridge id)kSecClassGenericPassword,
+                                 (__bridge id)kSecClassInternetPassword];
+            for (id cls in classes) {
+                NSDictionary *q = @{(__bridge id)kSecClass: cls,
+                                    (__bridge id)kSecReturnAttributes: @YES,
+                                    (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll};
+                CFTypeRef res = NULL;
+                OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &res);
+                if (st == errSecSuccess && res) {
+                    NSArray *items = (CFGetTypeID(res) == CFArrayGetTypeID())
+                                   ? (__bridge NSArray *)res : @[(__bridge id)res];
+                    for (id it in items) {
+                        if (![it isKindOfClass:[NSDictionary class]]) continue;
+                        NSDictionary *di = (NSDictionary *)it;
+                        NSString *svc = [di[(__bridge id)kSecAttrService] description];
+                        NSString *acc = [di[(__bridge id)kSecAttrAccount] description];
+                        if (!svc.length && !acc.length) continue;
+                        if ([svc containsString:@"nine9wham"]) continue;   // notre vault
+                        [kc addObject:[NSString stringWithFormat:@"%@ / %@", svc ?: @"-", acc ?: @"-"]];
+                        if (NWForensicLooksLikeSession(svc) || NWForensicLooksLikeSession(acc)) kcSession = YES;
+                    }
+                }
+                if (res) CFRelease(res);
+            }
+            if (kcSession) [found addObject:@"keychain"];
+            NSString *kcList = kc.count
+                ? [[kc subarrayWithRange:NSMakeRange(0, MIN(kc.count, (NSUInteger)6))] componentsJoinedByString:@" ; "]
+                : @"(vide)";
+            [rep appendFormat:@"4) keychain: %lu items%@ — %@\n",
+                (unsigned long)kc.count, kcSession?@" [SESSION?]":@"", kcList];
+
+            // 5. Fichiers qui portent la session
+            NSMutableArray *ff = [NSMutableArray array];
+            NSString *lib = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject;
+            NSArray *dirs = @[pd, [lib stringByAppendingPathComponent:@"Application Support"]];
+            NSData *n1 = [@"sessionid" dataUsingEncoding:NSUTF8StringEncoding];
+            NSData *n2 = [@"ds_user_id" dataUsingEncoding:NSUTF8StringEncoding];
+            for (NSString *d in dirs) {
+                NSArray *lf = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:d error:nil] ?: @[];
+                for (NSString *f in lf) {
+                    if (ff.count >= 4) break;
+                    NSString *p = [d stringByAppendingPathComponent:f];
+                    NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
+                    if ([attr fileSize] > 3 * 1024 * 1024) continue;
+                    NSData *data = [NSData dataWithContentsOfFile:p];
+                    if (!data.length) continue;
+                    NSRange a = [data rangeOfData:n1 options:0 range:NSMakeRange(0, data.length)];
+                    NSRange b = [data rangeOfData:n2 options:0 range:NSMakeRange(0, data.length)];
+                    if (a.location != NSNotFound || b.location != NSNotFound) {
+                        [ff addObject:[d.lastPathComponent stringByAppendingPathComponent:f]];
+                    }
+                }
+            }
+            [rep appendFormat:@"5) fichiers session: %@\n",
+                ff.count ? [ff componentsJoinedByString:@", "] : @"(aucun)"];
+        } @catch (NSException *e) {
+            [rep appendFormat:@"erreur: %@\n", e.reason];
+        }
+
+        // 6. WKWebsiteDataStore (magasin des webviews, asynchrone)
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block NSArray *wkNames = nil;
+        [[WKWebsiteDataStore defaultWebsiteDataStore].httpCookieStore
+            getAllCookies:^(NSArray<NSHTTPCookie *> *cookies) {
+                wkNames = [cookies valueForKey:@"name"];
+                dispatch_semaphore_signal(sem);
+            }];
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)));
+        BOOL wkSid = NO;
+        for (NSString *n in wkNames) if ([n.lowercaseString isEqualToString:@"sessionid"]) wkSid = YES;
+        [rep appendFormat:@"6) webview cookies: %lu (sessionid=%@)\n",
+            (unsigned long)wkNames.count, wkSid?@"OUI":@"non"];
+        if (wkSid) [found addObject:@"webview"];
+
+        [rep appendFormat:@"\nVERDICT: %@", found.count
+            ? [found componentsJoinedByString:@" + "] : @"AUCUNE SESSION (deconnecte)"];
+        NWLog(@"forensique: %@", rep);
+        dispatch_async(dispatch_get_main_queue(), ^{ NWAlert(@"Session forensics", rep); });
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Device identity — identite PAR APPAREIL (device id, family device id,
 // vendor id, machine id = mid) + blocage de l'attestation Apple.
 // Portefeuille : les cles EPINGLEES sont les NOTRES (prefixe nw9.*) ; la
@@ -8146,7 +8352,7 @@ static void NWPresentSafeModeUI(void) {
 
 // Change a chaque build publie : un nouveau dylib re-tente TOUTES les etapes
 // (sinon une etape neutralisee le resterait pour toujours).
-#define NWBuildID @"w10-4"
+#define NWBuildID @"w10-5"
 
 static int NWBootStopAt = 0;      // etapes >= cette valeur : neutralisees
 static int NWBootFaultStage = 0;  // etape responsable de l'echec precedent
@@ -8429,11 +8635,28 @@ static void NWStartCore(void) {
 
         NWLog("demarrage - Instagram %@", UIDevice.currentDevice.systemVersion);
 
-        // --- Etape 5. Etat : lecture SEULE du disque au constructeur
-        //     (vague 10-4) — la restauration complete tourne sur la queue
-        //     principale dans NWStartUI : avant main(), NSUserDefaults /
-        //     cookies / keychain ne sont pas fiables.
-        if (!NWBootSkip(5)) NWLoadStateReadonly();
+        // --- Etape 5. Etat au constructeur (vague 10-5) :
+        //     (a) lecture SEULE de state.plist (hooks empreinte),
+        //     (b) PUIS purge + restauration du conteneur actif AVANT main().
+        //     Pourquoi ici (et plus seulement sur la queue principale) :
+        //     UIApplicationMain appelle application:didFinishLaunching AVANT
+        //     que la queue principale ne vide les blocs dispaches depuis le
+        //     constructeur. Instagram lit donc les cookies/prefs AVANT la
+        //     restauration de NWStartUI et reconstruit sa session a partir du
+        //     magasin partag encore sale -> « compte par defaut » au lancement.
+        //     On restaure ici (best-effort, @try) puis de nouveau sur la queue
+        //     principale (idempotent) : les deux passages doivent passer.
+        if (!NWBootSkip(5)) {
+            NWLoadStateReadonly();
+            // Uniquement si l'etat existe deja : la CREATION d'un premier
+            // conteneur (empreinte, UIDevice) reste sur la queue principale.
+            // Restaurer ici ne fait que de la lecture/ecriture fichier +
+            // NSUserDefaults + cookies, et c'est CE passage qui doit courir
+            // AVANT que Instagram ne lise le magasin partage.
+            @try {
+                if (NWState[@"containers"]) NWBootstrapState();
+            } @catch (NSException *e) { NWLog("etat au constructeur: %@", e.reason); }
+        }
         NWBootMark(5);
 
         // --- Etape 6. Hooks d'empreinte + fake GPS
@@ -8485,13 +8708,15 @@ static void NWStartUI(void) {
             return;
         }
 
-        // --- Etape 5 (suite, vague 10-4). Restauration COMPLETE de l'etat :
+        // --- Etape 5 (suite, vague 10-5). Restauration COMPLETE de l'etat :
         //     vault keychain si re-install, migrations, prefs + cookies du
-        //     conteneur actif, langue systeme. Ces operations touchent
-        //     NSUserDefaults / NSHTTPCookieStorage / keychain : elles doivent
-        //     tourner SUR LA QUEUE PRINCIPALE apres main() (en w10-3 elles
-        //     tournaient au constructeur dyld AVANT main() : restauration
-        //     silencieusement perdue -> conteneurs non isoles + crash).
+        //     conteneur actif, langue systeme. SECOND PASSAGE (idempotent) :
+        //     le premier a lieu au constructeur (vague 10-5) parce que
+        //     UIApplicationMain appelle didFinishLaunching AVANT de vider la
+        //     file principale — sans ce passage initial, Instagram lit les
+        //     cookies/prefs avant nous et garde la session du magasin partage
+        //     (« compte par defaut » au lancement). Ce passage, lui, tourne
+        //     apres main() ou NSUserDefaults/cookies/keychain sont fiables.
         if (!NWBootSkip(5)) {
             @try { NWBootstrapState(); }
             @catch (NSException *e) { NWLog("etat/conteneurs: %@", e.reason); }
@@ -8597,6 +8822,20 @@ static void NWStartUI(void) {
                        dispatch_get_main_queue(), ^{
             @try {
                 NWPresentLastCrashAlert();
+            } @catch (NSException *e) { (void)e; }
+        });
+
+        // Vague 10-5 : forensique de session UNE FOIS par installation
+        // (flag dans Documents, efface par le reset) — capture d'ecran
+        // = ou vit la session connectee. Rejouable depuis Reset.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                NSString *flag = [NWDocumentsDir() stringByAppendingPathComponent:@"nw9_forensics_done"];
+                if (![[NSFileManager defaultManager] fileExistsAtPath:flag]) {
+                    [[NSData data] writeToFile:flag atomically:YES];
+                    NWSessionForensicsShow();
+                }
             } @catch (NSException *e) { (void)e; }
         });
     }
