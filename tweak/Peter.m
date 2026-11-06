@@ -917,6 +917,11 @@ static OSStatus NWHook_SecItemAdd(CFDictionaryRef q, CFTypeRef *r);
 static OSStatus NWHook_SecItemCopyMatching(CFDictionaryRef q, CFTypeRef *r);
 static OSStatus NWHook_SecItemUpdate(CFDictionaryRef q, CFDictionaryRef attrs, CFTypeRef *r);
 static OSStatus NWHook_SecItemDelete(CFDictionaryRef q);
+// Vague 10-3 : SecTaskCopyValueForEntitlement (chemin C direct du SDK Meta,
+// exactement pour ce que fait le shim de reference). Le corps est dans la
+// section Sideload v2, juste apres NWAppGroupIDs.
+static CFTypeRef NWHook_SecTaskCopy(void *task, CFStringRef ent);
+static CFTypeRef (*NWOrig_SecTaskCopy)(void *, CFStringRef);
 // Pointeurs reels (tentative ici, assignes par le rebinding ; la definition
 // suit dans la section Sideload v2) :
 static OSStatus (*NWSecReal_Add)(CFDictionaryRef, CFTypeRef *);
@@ -926,28 +931,31 @@ static OSStatus (*NWSecReal_Delete)(CFDictionaryRef);
 
 typedef struct { const char *name; void *want; void *repl; void **orig; } NWRebindTarget;
 
-static NWRebindTarget NWRbTargets[7];
+static NWRebindTarget NWRbTargets[8];
 static int NWRbTargetsCount = 0;
 
 static void NWRbFillTargets(void) {
     if (NWRbTargetsCount) return;
-    static const char *n7[7] = { "uname", "sysctlbyname", "sysctl",
+    static const char *n8[8] = { "uname", "sysctlbyname", "sysctl",
                                  "SecItemAdd", "SecItemCopyMatching",
-                                 "SecItemUpdate", "SecItemDelete" };
-    static void *r7[7] = { (void *)NWHook_uname, (void *)NWHook_sysctlbyname, (void *)NWHook_sysctl,
+                                 "SecItemUpdate", "SecItemDelete",
+                                 "SecTaskCopyValueForEntitlement" };
+    static void *r8[8] = { (void *)NWHook_uname, (void *)NWHook_sysctlbyname, (void *)NWHook_sysctl,
                            (void *)NWHook_SecItemAdd, (void *)NWHook_SecItemCopyMatching,
-                           (void *)NWHook_SecItemUpdate, (void *)NWHook_SecItemDelete };
-    static void **o7[7] = { (void **)&NWOrig_uname, (void **)&NWOrig_sysctlbyname, (void **)&NWOrig_sysctl,
+                           (void *)NWHook_SecItemUpdate, (void *)NWHook_SecItemDelete,
+                           (void *)NWHook_SecTaskCopy };
+    static void **o8[8] = { (void **)&NWOrig_uname, (void **)&NWOrig_sysctlbyname, (void **)&NWOrig_sysctl,
                             (void **)&NWSecReal_Add, (void **)&NWSecReal_CopyMatching,
-                            (void **)&NWSecReal_Update, (void **)&NWSecReal_Delete };
-    for (int i = 0; i < 7; i++) {
-        NWRbTargets[i].name = n7[i];
-        NWRbTargets[i].want = dlsym(RTLD_DEFAULT, n7[i]);
-        NWRbTargets[i].repl = r7[i];
-        NWRbTargets[i].orig = o7[i];
-        if (!NWRbTargets[i].want) NWLog("rebind: symbole absent = %s", n7[i]);
+                            (void **)&NWSecReal_Update, (void **)&NWSecReal_Delete,
+                            (void **)&NWOrig_SecTaskCopy };
+    for (int i = 0; i < 8; i++) {
+        NWRbTargets[i].name = n8[i];
+        NWRbTargets[i].want = dlsym(RTLD_DEFAULT, n8[i]);
+        NWRbTargets[i].repl = r8[i];
+        NWRbTargets[i].orig = o8[i];
+        if (!NWRbTargets[i].want) NWLog("rebind: symbole absent = %s", n8[i]);
     }
-    NWRbTargetsCount = 7;
+    NWRbTargetsCount = 8;
 }
 
 // Hook d'ajout d'image donne par dyld. Recurrence = idempotent : un slot
@@ -1022,14 +1030,26 @@ static void NWRbImage(const struct mach_header *mh, intptr_t slide) {
     (void)patched;
 }
 
-// Point d'entree historique (cree au demarrage).
+// Point d'entree historique (cree au demarrage, DESORMAIS appele au
+// constructeur dyld vague 10-3 : avant TOUT code d'Instagram).
 static void NWRebindGOT(void) {
-    NWRbFillTargets();
     static BOOL armed = NO;
     if (armed) return;
     armed = YES;
+    NWRbFillTargets();
+    // Vague 10-3 (correctif du point faible historique) : le replay dyld a
+    // l'enregistrement depend de l'etat interne de dyld — on ne le subit
+    // plus. On balaye EXPLICITEMENT chaque image deja chargee (binaire
+    // principal + frameworks du bundle), PUIS on s'arme pour les images
+    // futures. C'est exactement la sequence du shim de reference
+    // (constructeur : boucle images + _dyld_register_func_for_add_image).
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const struct mach_header *mh = _dyld_get_image_header(i);
+        if (mh) NWRbImage(mh, _dyld_get_image_vmaddr_slide(i));
+    }
     _dyld_register_func_for_add_image(NWRbImage);
-    NWLog("rebind app : 7 cibles SecItem*/sysctl/uname, images de l'app uniquement (shared cache exclu)");
+    NWLog("rebind app : 8 cibles SecItem*/SecTask/sysctl/uname, %u images balayees + add_image arme", n);
 }
 
 #pragma mark - Fake GPS (localisation par conteneur)
@@ -7248,6 +7268,60 @@ static NSArray<NSString *> *NWAppGroupIDs(void) {
     return a;
 }
 
+// Vague 10-3 : SecTaskCopyValueForEntitlement, chemin C DIRECT du SDK Meta
+// (implemente chez eux : le shim de reference importe ce symbole). En
+// sideloading, la reponse REELLE pour com.apple.security.application-groups
+// est vide (le certificat personnel ne porte aucun entitlement de groupe) :
+// les SDK Meta decident alors que l'app n'a AUCUN groupe et des chemins
+// entiers (CKContainer, keychain famille, keystore App Attest) partent en
+// erreur fatale. On repond ICI avec TOUS nos groupes : c'est le meme effet
+// que le hook CKEntitlements, mais sur le chemin C qui n'est pas couvert
+// par un swizzle. Pour toute autre cle : la reponse reelle est transmise
+// telle quelle.
+static CFTypeRef NWHook_SecTaskCopy(void *task, CFStringRef ent) {
+    static dispatch_once_t onceST;
+    static CFTypeRef (*realCopy)(void *, CFStringRef) = NULL;
+    dispatch_once(&onceST, ^{
+        realCopy = (CFTypeRef (*)(void *, CFStringRef))
+            dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
+    });
+    CFTypeRef real = NULL;
+    @try {
+        if (realCopy) real = realCopy(task, ent);
+    } @catch (NSException *e) {
+        NWLog("sectask copy reel : %@", e.reason);
+    }
+    @try {
+        NSString *key = ent ? (__bridge NSString *)ent : nil;
+        if (![key isKindOfClass:[NSString class]] ||
+            ![key isEqualToString:@"com.apple.security.application-groups"]) return real;
+        // La reponse attendue est un CFArray de CFString (+1). On fusionne
+        // les groupes reels (silencieux en general) avec nos 13 groupes.
+        NSMutableArray *gs = [NSMutableArray array];
+        if (real && CFGetTypeID(real) == CFArrayGetTypeID()) {
+            for (NSString *g in (__bridge NSArray *)real) {
+                if ([g isKindOfClass:[NSString class]] && g.length) [gs addObject:g];
+            }
+        }
+        for (NSString *gid in NWAppGroupIDs()) {
+            if (![gs containsObject:gid]) [gs addObject:gid];
+        }
+        if (real) {
+            // Copy... = le recepteur recupere une reference +1 : la reponse
+            // remplacee est la notre, on ferme la reponse reelle.
+            CFRelease(real);
+        }
+        static dispatch_once_t onceLog;
+        dispatch_once(&onceLog, ^{
+            NWLog("sectask : entitlement app-groups spoofe (%lu groupes)", (unsigned long)gs.count);
+        });
+        return CFBridgingRetain(gs);
+    } @catch (NSException *e) {
+        NWLog("sectask copy : %@", e.reason);
+        return real;
+    }
+}
+
 // Conteneur de groupe FACTICE (dossier dans Documents) : utilise a la fois
 // par le hook NSFileManager (REPLI 1, historique) et par LSBundleProxy.
 static NSURL *NWFakeGroupContainerURL(NSString *gid) {
@@ -7991,7 +8065,7 @@ static void NWInstallDeviceIdentity(void) {
         if (NWDevPillHiddenNow) [u removeObjectForKey:NWDevKeyHidePill];
 
         // getDeviceId (scan global des classes) est appele 6 s plus tard,
-        // hors du chemin critique : voir etape 9 dans NWStartTweaks.
+        // hors du chemin critique : voir etape 9 dans NWStartUI.
         NWInstall_FBFamilyDeviceID();
         NWInstall_UdsHooks();
         NWInstallAttestation();
@@ -8044,10 +8118,11 @@ static void NWPresentSafeModeUI(void) {
 #define NW_BOOT_KEY_FAULT @"nw9.boot.fault"
 #define NW_BOOT_KEY_BUILD @"nw9.boot.build"
 #define NW_BOOT_KEY_ALERT @"nw9.boot.alert"
+#define NW_BOOT_KEY_CRLAST @"nw9.cralert.mtime"   // vague 10-3 : heure du rapport deja affiche
 
 // Change a chaque build publie : un nouveau dylib re-tente TOUTES les etapes
 // (sinon une etape neutralisee le resterait pour toujours).
-#define NWBuildID @"w10-2"
+#define NWBuildID @"w10-3"
 
 static int NWBootStopAt = 0;      // etapes >= cette valeur : neutralisees
 static int NWBootFaultStage = 0;  // etape responsable de l'echec precedent
@@ -8191,7 +8266,76 @@ static void NWPresentBootRecoveryUI(void) {
     }
 }
 
-static void NWStartTweaks(void) {
+// Vague 10-3 : le RAPPORT DE CRASH du lancement precedent est affiche DANS
+// l'app au lancement suivant. Plus besoin de fournir le moindre log : une
+// capture d'ecran de cette alerte montre nom, raison et pile du plantage.
+// Une seule fois par rapport (on memorise l'heure du fichier) ; si l'UI
+// n'est pas presente a ce moment, une seconde tentative part 10 s plus
+// tard — le rapport est rejoue au lancement suivant tant qu'il est intact.
+static void NWPresentLastCrashAlert(void) {
+    @try {
+        NSString *path = NWCrashLogPath();
+        NSString *log = [NSString stringWithContentsOfFile:path
+                                                  encoding:NSUTF8StringEncoding error:nil];
+        if (!log.length) return;
+        NSDictionary *at = [[NSFileManager defaultManager]
+            attributesOfItemAtPath:path error:nil];
+        NSDate *mt = at[NSFileModificationDate];
+        if (!mt) return;
+        double mtime = mt.timeIntervalSince1970;
+        NSUserDefaults *u = NSUserDefaults.standardUserDefaults;
+        double diff = mtime - [u doubleForKey:NW_BOOT_KEY_CRLAST];
+        if (diff < 0) diff = -diff;
+        if (diff < 2.0) return;
+
+        UIViewController *top = NWTopVC();
+        if (!top || top.presentedViewController) return;
+
+        // Fin de rapport uniquement : la pile est a la fin, et une alerte
+        // doit rester lisible — on borne le texte a 1200 caracteres.
+        NSString *tail = log.length > 1200
+            ? [@"(...) " stringByAppendingString:[log substringFromIndex:log.length - 1200]]
+            : log;
+        NSString *fmt = NWL(@"cr_try",
+            @"The previous session crashed. This report shows the exact reason. Take a screenshot of it.",
+            @"La derniere session a plante. Ce rapport montre la raison exacte. Faites-en une capture d'ecran.",
+            @"La sesion anterior fallo. Este informe muestra la razon exacta. Toma una captura de pantalla.");
+        UIAlertController *a = [UIAlertController
+            alertControllerWithTitle:NWL(@"cr_try_t", @"Last crash report", @"Dernier rapport de plantage", @"Ultimo informe de fallo")
+                              message:[NSString stringWithFormat:@"%@\n\n%@", fmt, tail]
+                       preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction
+            actionWithTitle:NWL(@"ok", @"OK", @"OK", @"OK")
+            style:UIAlertActionStyleDefault handler:nil]];
+        [a addAction:[UIAlertAction
+            actionWithTitle:NWL(@"cr_del", @"Delete report", @"Supprimer le rapport", @"Borrar el informe")
+            style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
+                @try {
+                    [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+                    [[NSUserDefaults standardUserDefaults] removeObjectForKey:NW_BOOT_KEY_CRLAST];
+                    [[NSUserDefaults standardUserDefaults] synchronize];
+                } @catch (NSException *e2) { (void)e2; }
+            }]];
+        [top presentViewController:a animated:YES completion:nil];
+        [u setDouble:mtime forKey:NW_BOOT_KEY_CRLAST];
+        [u synchronize];
+    } @catch (NSException *e) {
+        NWLog("crash alert : %@", e.reason);
+    }
+}
+
+// Vague 10-3 : le boot est SPLITTE en deux.
+//  - NWStartCore : pose TOUTES les protections NON-UI de maniere SYNCHRONE
+//    au constructeur dyld — rapporteur de crash, fix sideload + keychain,
+//    device identity, empreinte/GPS, rebinding GOT, proxy — comme le shim
+//    de reference qui installe ses hooks pendant le chargement. Quand la
+//    premiere ligne d'Instagram s'execute, les hooks C (SecItem*, SecTask*)
+//    sont DEJA poses : c'est la difference decisive avec w10-2, ou le
+//    rebinding n'etait pose qu'une fois le run loop tourne.
+//  - NWStartUI : bouton flottant + pill, timers de maintenance, alertes —
+//    tout ce qui exige le run loop principal, planifie juste apres sur la
+//    queue principale.
+static void NWStartCore(void) {
     @autoreleasepool {
         NWBootBegin();
 
@@ -8199,16 +8343,6 @@ static void NWStartTweaks(void) {
         //     capturer le plantage a la creation de compte (nom + raison + pile).
         if (!NWBootSkip(1)) NWInstallCrashReporter();
         NWBootMark(1);
-
-        // --- Etape 2. UI D'ABORD (vague 8) : bouton flottant + pill poses
-        //     avant les hooks. Si une etape ulterieure tue l'app, la garde la
-        //     neutralise au lancement suivant et l'app reste utilisable.
-        //     C'est aussi la preuve visible que le dylib est bien charge.
-        if (!NWBootSkip(2)) {
-            @try { NWInstallFloatingButton(); }
-            @catch (NSException *e) { NWLog("ui: %@", e.reason); }
-        }
-        NWBootMark(2);
 
         // --- Etape 3. Sideload fix : conteneur de groupe + accessGroup keychain.
         //     Sans cela Instagram plante a l'inscription en sideloading
@@ -8219,15 +8353,12 @@ static void NWStartTweaks(void) {
         // --- SAFE MODE (vague 7) : si l'utilisateur a demande la coupe
         //     totale (Support -> "Disable all tweaks & relaunch"), on
         //     n'installe AUCUN hook empreinte/GPS/rebind/proxy/UI et on
-        //     propose la reactivation. Le fix sideload + le rapporteur de
-        //     crash restent actifs : sans eux l'app ne peut pas demarrer.
+        //     propose la reactivation (alerte posee dans NWStartUI). Le
+        //     fix sideload + le rapporteur de crash restent actifs : sans
+        //     eux l'app ne peut pas demarrer.
         if (NWSafeModeOn()) {
             NWLog("SAFE MODE : hooks empreinte/GPS/rebind/UI non installes");
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                @try { NWPresentSafeModeUI(); } @catch (NSException *e) { NWLog("safe: %@", e.reason); }
-            });
-            NWBootFinish();
+            for (int s = 4; s <= 8; s++) NWBootMark(s);
             return;
         }
 
@@ -8271,6 +8402,33 @@ static void NWStartTweaks(void) {
             }
         }
         NWBootMark(8);
+
+        NWLog("noyau w10-3 pose au constructeur dyld : rapporteur, sideload fix, identity, empreinte+GPS, rebind GOT, proxy");
+    }
+}
+
+// Vague 10-3 : seconde moitie du boot — TOUT ce qui a besoin du run loop
+// principal. On ne pose RIEN d'UI au constructeur : au moment des
+// initialisateurs dyld, aucune fenetre d'application n'existe encore.
+static void NWStartUI(void) {
+    @autoreleasepool {
+        // SAFE MODE : aucun hook UI, aucune timer — alerte + fin de garde.
+        if (NWSafeModeOn()) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                @try { NWPresentSafeModeUI(); } @catch (NSException *e) { NWLog("safe: %@", e.reason); }
+            });
+            NWBootFinish();
+            return;
+        }
+
+        // --- Etape 2. UI : bouton flottant + pill des que le run loop tourne.
+        //     C'est aussi la preuve visible que le dylib est bien charge.
+        if (!NWBootSkip(2)) {
+            @try { NWInstallFloatingButton(); }
+            @catch (NSException *e) { NWLog("ui: %@", e.reason); }
+        }
+        NWBootMark(2);
 
         // Repositionnement du bouton une fois l'etat charge.
         if (!NWBootSkip(2)) {
@@ -8346,27 +8504,46 @@ static void NWStartTweaks(void) {
             }
         });
 
-        // Diagnostic de recuperation, une fois l'UI en place.
-        if (NWBootFaultStage > 0) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                @try { NWPresentBootRecoveryUI(); } @catch (NSException *e) { (void)e; }
-            });
-        }
+        // Diagnostics une fois l'UI en place :
+        //  - mode recuperation si une etape est neutralisee,
+        //  - vague 10-3 : RAPPORT DU DERNIER CRASH affiche dans l'app (une
+        //    capture d'ecran suffit — plus besoin de fournir de logs).
+        // Deux tirs (3 s puis 10 s) ; si l'app n'est pas prete au premier,
+        // le second passe, sinon le rapport est rejoue au lancement suivant.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                NWPresentBootRecoveryUI();
+                NWPresentLastCrashAlert();
+            } @catch (NSException *e) { (void)e; }
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                NWPresentLastCrashAlert();
+            } @catch (NSException *e) { (void)e; }
+        });
     }
 }
 
-// Constructeur dyld : ZERO travail ici (ni Foundation, ni I/O, ni UIKit, ni
-// scan de classes pendant le verrou dyld). On ne fait que planifier le
-// demarrage sur la queue principale ; c'est la seule operation qui ne peut
-// pas echouer ni bloquer dyld.
+// Constructeur dyld (vague 10-3, modele shim de reference) : les hooks
+// doivent etre poses PENDANT le chargement — donc ICI, synchrone, AVANT
+// main() et avant la premiere ligne d'Instagram. Fondation/ObjC runtime
+// sont deja prets a ce moment (toutes les images sont chargees et liees
+// avant tout initialisateur). Seule la PARTIE UI part sur la queue
+// principale (fenetres inexistantes a ce stade).
 __attribute__((constructor))
 static void NWInit(void) {
+    @try {
+        NWStartCore();   // synchrone : rapporteur, sideload fix, identity, empreinte+GPS, rebind GOT, proxy
+    } @catch (NSException *e) {
+        NWLog("demarrage noyau : %@", e.reason);
+    }
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            NWStartTweaks();
+            NWStartUI(); // bouton flottant, timers, notifications, alertes
         } @catch (NSException *e) {
-            NWLog("demarrage: %@", e.reason);
+            NWLog("demarrage UI: %@", e.reason);
         }
     });
 }
