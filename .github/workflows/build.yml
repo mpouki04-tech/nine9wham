@@ -15,8 +15,8 @@ permissions:
 env:
   BASE_TAG: base
   OUT_TAG: nine9wham
-  BASE_IPA: com.burbn.instagram_v454.0.0_sideload_clean.ipa
-  OUT_IPA: nine9wham_instagram_454.ipa
+  BASE_IPA: com.burbn.instagram_v449.0.0_sideload_clean.ipa
+  OUT_IPA: nine9wham_instagram_449.ipa
 
 jobs:
   build:
@@ -80,9 +80,8 @@ jobs:
       - name: Nettoyer les residus RyukGram (ressources)
         run: |
           set -euo pipefail
-          # La base (release "base") vient de RyukGram : 4 ressources de
-          # l'extension Safari affichent encore l'ancien nom. Le binaire
-          # Instagram n'est PAS touche (byte-identique, 0 occurrence).
+          # La base 449 est deja nettoyee : 0 occurrence attendue. Le script
+          # reste en garde-fou (si une ressource RyukGram reapparaissait).
           python3 scripts/strip_ryukgram.py "$RUNNER_TEMP/ipa"
 
       - name: Repacker l'IPA
