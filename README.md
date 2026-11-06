@@ -403,7 +403,7 @@ non fourni, comme dans l'IPA de reference), `cryptid=0`, binaire Instagram
 **534 752 o** contenant `w10-2` et les nouveaux hooks, aucun residu RyukGram.
 CI : run `42142236664`, succes, **13 warnings** (identiques a la reference).
 
-### Vague 10-3 (build actuel) — hooks C poses AVANT Instagram + rapport de crash affiche dans l'app
+### Vague 10-3 — hooks C poses AVANT Instagram + rapport de crash affiche dans l'app
 
 **Analyse binaire du shim de reference.** Desassemblage complet du
 `zxPluginsInject.dylib` de l'IPA RyukGram (88 768 o, constructor `__init_offsets`
@@ -448,3 +448,66 @@ binaire Instagram **toujours byte-identique** a la reference (sha256
 `fdf2faf8...`), `Peter.dylib` **535 744 o** contenant `w10-3` et
 `SecTaskCopyValueForEntitlement`, aucun residu RyukGram. CI : run
 `42149924437`, succes, **13 warnings** (identiques, memes types).
+
+### Vague 10-4 (build actuel) — conteneurs isoles + crash elimine (garde de boot honnete)
+
+**Symptomes.** Depuis la vague 10-3 : (1) un compte « par defaut »
+reapparait a chaque lancement ; (2) choisir la langue d'un conteneur met
+aussi le conteneur defaut dans cette langue ; (3) plantages reguliers,
+dont a la creation de compte. Exigence : chaque conteneur doit rester
+STRICTEMENT isole (langue comprise) et le crash doit regle une bonne fois
+pour toute.
+
+**Cause racine unique (etablie par lecture du code, pas par essai).** La
+garde de boot neutralise une etape quand l'app est fermee AVANT la marque
+finale : « fault = derniere marque + 1 ». L'ordre reel d'execution est
+1,3,4,5,6,7,8 au constructeur puis 2 (UI) puis 9 (scan) : la marque ETAIT
+NON MONOTONE — ecrire 2 apres 8 faisait descendre la valeur, donc
+« derniere + 1 » = 3. Toute fermeture en moins de 6 s (done=NO, sans
+preuve de plantage) desactivait donc 3,4,5,6,7,8,9 POUR TOUT LE BUILD :
+  - etape 3 coupe -> fix sideload absent -> plantage a la creation de
+    compte ;
+  - etape 5 coupe -> `NWBootstrapState` jamais execute -> conteneurs non
+    isoles (compte/langue du dernier conteneur visibles partout).
+Second point : en 10-3 la restauration complete tournait au CONSTRUCTEUR
+dyld AVANT main() (NSUserDefaults / cookies / keychain non fiables a ce
+moment-la) : elle etait silencieusement perdue.
+
+**Correctifs.**
+- `NWBootMark` MONOTONE : il n'ecrit que si `stage > courant`. La marque
+  ne redescend plus, donc une erreur n'atteint plus que l'etape 9 (scan),
+  jamais les etapes essentielles.
+- Condition `failed` exigeant la PREUVE d'un plantage (`rpt > t0`, le
+  rapport doit etre plus recent que le lancement precedent). Une
+  fermeture rapide n'ecrit aucun rapport -> plus de faux crash.
+- Etape 5 SCINDEE : `NWLoadStateReadonly()` (lecture seule de
+  `state.plist`) au constructeur, pour que les hooks empreinte servent la
+  bonne valeur des la premiere ligne ; `NWBootstrapState()` complet (vault
+  keychain, prefs, cookies, langue systeme) sur la QUEUE PRINCIPALE dans
+  `NWStartUI` — retour de l'ordre de la vague 10-2, seule version ou les
+  conteneurs fonctionnaient.
+- Use-after-free corrige dans `NWHook_SecTaskCopy` : `CFRelease(real)`
+  apres construction de la reponse (le `@catch` ne rend plus un pointeur
+  libere).
+- `@try` autour des etapes nues 1/3/7 : une exception n'aborterait plus
+  tout le core (sinon l'etat ne serait jamais charge = conteneurs non
+  isoles).
+- `NWBuildID w10-4` (remet aussi `fault` a zero au premier lancement).
+
+**Residus RyukGram elimines (7 occurrences).** Le binaire Instagram n'en
+contient AUCUNE (verifie sur 394 Mo), mais 4 ressources de l'extension
+Safari affichaient encore l'ancien nom (« Open in RyukGram »). Nouveau
+`scripts/strip_ryukgram.py` (fichiers UTF-8 uniquement ; un residu binaire
+fait echouer le build), etape CI entre injection et repackage, et
+assertion `verify_ipa.py` balayant TOUS les fichiers de l'IPA avant
+publication (0 residu exigé).
+
+**IPA publiee (release `nine9wham`)** : `nine9wham_instagram_454.ipa` —
+**343 784 939 octets**, sha256
+`656d96904b4cd2597d32b9aa033e9067be3e2aebf0ba80c5eb39644ba7092dc0`.
+Contenu verifie : 3258 fichiers, **0 residu RyukGram** (noms + contenu,
+binaire compris), `cryptid=0`, binaire Instagram **byte-identique** a la
+reference (sha256 `fdf2faf8...`), `Peter.dylib` **535 632 o** contenant
+`w10-4` et `SecTaskCopyValueForEntitlement`. CI : runs `42205864242`
+puis `42208711359` (nettoyage), succes, **13 warnings** (identiques : memes
+types, decalages +21 / +76 exactement expliques par les insertions).
