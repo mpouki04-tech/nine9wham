@@ -952,33 +952,43 @@ static OSStatus (*NWSecReal_CopyMatching)(CFDictionaryRef, CFTypeRef *);
 static OSStatus (*NWSecReal_Update)(CFDictionaryRef, CFDictionaryRef, CFTypeRef *);
 static OSStatus (*NWSecReal_Delete)(CFDictionaryRef);
 
+// Vague 10-6 : capture des NSLog/NSLogv du code Instagram -> rapport [IG].
+// Corps dans la section Rapport (apres NWLogImpl) ; table NWRbTargets 8 -> 10.
+static void NWHook_NSLog(NSString *format, ...);
+static void NWHook_NSLogv(NSString *format, va_list args);
+static void (*NWOrig_NSLog)(NSString *format, ...);
+static void (*NWOrig_NSLogv)(NSString *format, va_list args);
+
 typedef struct { const char *name; void *want; void *repl; void **orig; } NWRebindTarget;
 
-static NWRebindTarget NWRbTargets[8];
+static NWRebindTarget NWRbTargets[10];
 static int NWRbTargetsCount = 0;
 
 static void NWRbFillTargets(void) {
     if (NWRbTargetsCount) return;
-    static const char *n8[8] = { "uname", "sysctlbyname", "sysctl",
+    static const char *n8[10] = { "uname", "sysctlbyname", "sysctl",
                                  "SecItemAdd", "SecItemCopyMatching",
                                  "SecItemUpdate", "SecItemDelete",
-                                 "SecTaskCopyValueForEntitlement" };
-    static void *r8[8] = { (void *)NWHook_uname, (void *)NWHook_sysctlbyname, (void *)NWHook_sysctl,
+                                 "SecTaskCopyValueForEntitlement",
+                                 "NSLog", "NSLogv" };
+    static void *r8[10] = { (void *)NWHook_uname, (void *)NWHook_sysctlbyname, (void *)NWHook_sysctl,
                            (void *)NWHook_SecItemAdd, (void *)NWHook_SecItemCopyMatching,
                            (void *)NWHook_SecItemUpdate, (void *)NWHook_SecItemDelete,
-                           (void *)NWHook_SecTaskCopy };
-    static void **o8[8] = { (void **)&NWOrig_uname, (void **)&NWOrig_sysctlbyname, (void **)&NWOrig_sysctl,
-                            (void **)&NWSecReal_Add, (void **)&NWSecReal_CopyMatching,
-                            (void **)&NWSecReal_Update, (void **)&NWSecReal_Delete,
-                            (void **)&NWOrig_SecTaskCopy };
-    for (int i = 0; i < 8; i++) {
+                           (void *)NWHook_SecTaskCopy,
+                           (void *)NWHook_NSLog, (void *)NWHook_NSLogv };
+    static void **o8[10] = { (void **)&NWOrig_uname, (void **)&NWOrig_sysctlbyname, (void **)&NWOrig_sysctl,
+                             (void **)&NWSecReal_Add, (void **)&NWSecReal_CopyMatching,
+                             (void **)&NWSecReal_Update, (void **)&NWSecReal_Delete,
+                             (void **)&NWOrig_SecTaskCopy,
+                             (void **)&NWOrig_NSLog, (void **)&NWOrig_NSLogv };
+    for (int i = 0; i < 10; i++) {
         NWRbTargets[i].name = n8[i];
         NWRbTargets[i].want = dlsym(RTLD_DEFAULT, n8[i]);
         NWRbTargets[i].repl = r8[i];
         NWRbTargets[i].orig = o8[i];
         if (!NWRbTargets[i].want) NWLog("rebind: symbole absent = %s", n8[i]);
     }
-    NWRbTargetsCount = 8;
+    NWRbTargetsCount = 10;
 }
 
 // Hook d'ajout d'image donne par dyld. Recurrence = idempotent : un slot
@@ -1499,6 +1509,49 @@ static void NWLogImpl(NSString *fmt, ...) {
     va_end(args);
     NWReportAppendLine("NW", s);
     NSLog(@"%@", s);
+}
+
+// ---- Capture NSLog / NSLogv du code Instagram (tag [IG]) ----
+// Garde anti-recursion partagee (Review Focus 2) : si notre append declenche
+// un NSLog interne (ou un re-entree via Foundation), on court-circuite
+// directement vers l'original SANS re-ecrire dans le rapport.
+static __thread BOOL NWInReportHook = NO;
+
+// NSLogv : on formate une copie (va_copy) pour le rapport, puis on laisse
+// l'original consommer le va_list d'origine (jamais consomme avant).
+static void NWHook_NSLogv(NSString *format, va_list args) {
+    if (NWInReportHook || !format) {
+        if (NWOrig_NSLogv) NWOrig_NSLogv(format, args);
+        return;
+    }
+    NWInReportHook = YES;
+    va_list copy;
+    va_copy(copy, args);
+    NSString *s = [[NSString alloc] initWithFormat:format arguments:copy];
+    va_end(copy);
+    NWReportAppendLine("IG", s);
+    NWInReportHook = NO;
+    if (NWOrig_NSLogv) NWOrig_NSLogv(format, args);
+}
+
+// NSLog variadique : meme protocole ; forwarding via NWOrig_NSLogv
+// (NSLog(f, vl) == NSLogv(f, vl) — un variadic ne se retransmet pas tel
+// quel). Si NWOrig_NSLogv est NULL, pas de forwarding : la ligne est deja
+// dans le rapport.
+static void NWHook_NSLog(NSString *format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    if (!NWInReportHook && format) {
+        NWInReportHook = YES;
+        va_list copy;
+        va_copy(copy, ap);
+        NSString *s = [[NSString alloc] initWithFormat:format arguments:copy];
+        va_end(copy);
+        NWReportAppendLine("IG", s);
+        NWInReportHook = NO;
+    }
+    if (NWOrig_NSLogv) NWOrig_NSLogv(format, ap);
+    va_end(ap);
 }
 
 #pragma mark - Rapporteur de crash (preuves, pas de suppositions)
