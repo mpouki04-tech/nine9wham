@@ -7219,6 +7219,35 @@ static CFDictionaryRef NWKeychainRemapAccessGroup(CFDictionaryRef q) {
     }
 }
 
+// Vague 10-2 : TOUS les groupes d'app que les SDK Meta lisent (releves dans
+// Instagram + FBSharedFramework). En sideloading le certificat personnel ne
+// porte AUCUN entitlement com.apple.security.application-groups : chaque
+// groupContainerURL... renvoie nil, y compris le groupe App Attest
+// (group.com.facebook.family.appattestation) dont le keystore est exige a
+// l'inscription. On fabrique donc un conteneur pour CHACUN d'eux.
+static NSArray<NSString *> *NWAppGroupIDs(void) {
+    static NSArray<NSString *> *a = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        a = @[
+            @"group.com.burbn.instagram",
+            @"group.com.burbn.family",
+            @"group.com.facebook.family",
+            @"group.com.facebook.family.appattestation",
+            @"group.com.facebook.family.instagramtokenshare.key",
+            @"group.com.facebook.family.instagramtokenshare.service",
+            @"group.com.facebook.Bishop",
+            @"group.com.facebook.Messenger",
+            @"group.com.facebook.msysstorage",
+            @"group.com.facebook.internal.lantern",
+            @"group.metaplatforms.family",
+            @"group.meta.bizapp.instagram.work.token",
+            @"group.meta.workaccounts.login.sdk",
+        ];
+    });
+    return a;
+}
+
 // Conteneur de groupe FACTICE (dossier dans Documents) : utilise a la fois
 // par le hook NSFileManager (REPLI 1, historique) et par LSBundleProxy.
 static NSURL *NWFakeGroupContainerURL(NSString *gid) {
@@ -7244,8 +7273,8 @@ static NSDictionary *NWHook_groupContainers(id self, SEL _cmd) {
         NSDictionary *real = NWOrig_groupContainers ? NWOrig_groupContainers(self, _cmd) : nil;
         NSMutableDictionary *m = [real isKindOfClass:[NSDictionary class]]
             ? [real mutableCopy] : [NSMutableDictionary dictionary];
-        NSString *gid = @"group.com.burbn.instagram";
-        if (!m[gid]) {
+        for (NSString *gid in NWAppGroupIDs()) {
+            if (m[gid]) continue;
             NSURL *u = NWFakeGroupContainerURL(gid);
             if (u) {
                 m[gid] = u;
@@ -7272,8 +7301,8 @@ static id NWHook_ckEnt(id self, SEL _cmd, NSDictionary *d) {
         NSString *key = @"com.apple.security.application-groups";
         NSMutableArray *gs = [m[key] isKindOfClass:[NSArray class]]
             ? [m[key] mutableCopy] : [NSMutableArray array];
-        if (![gs containsObject:@"group.com.burbn.instagram"]) {
-            [gs addObject:@"group.com.burbn.instagram"];
+        for (NSString *gid in NWAppGroupIDs()) {
+            if (![gs containsObject:gid]) [gs addObject:gid];
         }
         m[key] = gs;
         return NWOrig_ckEnt(self, _cmd, m);
@@ -7283,11 +7312,43 @@ static id NWHook_ckEnt(id self, SEL _cmd, NSDictionary *d) {
     }
 }
 
+// Vague 10-2 : dernier repli. Si le keychain refuse encore (-34018
+// errSecMissingEntitlement ou -50 errSecParam, et -25300 errSecItemNotFound en
+// lecture), on retire COMPLETEMENT kSecAttrAccessGroup : le systeme attribue
+// alors le groupe par defaut du certificat, toujours autorise.
+static CFDictionaryRef NWKeychainStripAccessGroup(CFDictionaryRef q) {
+    @try {
+        if (!q || CFGetTypeID(q) != CFDictionaryGetTypeID()) return NULL;
+        if (!CFDictionaryContainsKey(q, kSecAttrAccessGroup)) return NULL;
+        NSMutableDictionary *m = [(__bridge NSDictionary *)q mutableCopy];
+        [m removeObjectForKey:(__bridge id)kSecAttrAccessGroup];
+        return CFBridgingRetain(m);
+    } @catch (NSException *e) {
+        NWLog("strip accessGroup: %@", e.reason);
+        return NULL;
+    }
+}
+
+static BOOL NWKeychainErrNeedsStrip(OSStatus st, BOOL reading) {
+    if (st == -34018 /* errSecMissingEntitlement */) return YES;
+    if (st == -50 /* errSecParam */) return YES;
+    if (reading && st == -25300 /* errSecItemNotFound */) return YES;
+    return NO;
+}
+
 static OSStatus NWHook_SecItemAdd(CFDictionaryRef q, CFTypeRef *r) {
     CFDictionaryRef qq = NWKeychainRemapAccessGroup(q);
     OSStatus st = NWSecReal_Add ? NWSecReal_Add(qq ? qq : q, r)
                                 : SecItemAdd(qq ? qq : q, r);
     if (qq) CFRelease(qq);
+    if (NWKeychainErrNeedsStrip(st, NO)) {
+        CFDictionaryRef qs = NWKeychainStripAccessGroup(q);
+        if (qs) {
+            st = NWSecReal_Add ? NWSecReal_Add(qs, r) : SecItemAdd(qs, r);
+            CFRelease(qs);
+            NWLog("keychain add : retry sans access group -> %d", (int)st);
+        }
+    }
     return st;
 }
 
@@ -7296,6 +7357,15 @@ static OSStatus NWHook_SecItemCopyMatching(CFDictionaryRef q, CFTypeRef *r) {
     OSStatus st = NWSecReal_CopyMatching ? NWSecReal_CopyMatching(qq ? qq : q, r)
                                          : SecItemCopyMatching(qq ? qq : q, r);
     if (qq) CFRelease(qq);
+    if (NWKeychainErrNeedsStrip(st, YES)) {
+        CFDictionaryRef qs = NWKeychainStripAccessGroup(q);
+        if (qs) {
+            st = NWSecReal_CopyMatching ? NWSecReal_CopyMatching(qs, r)
+                                        : SecItemCopyMatching(qs, r);
+            CFRelease(qs);
+            NWLog("keychain copy : retry sans access group -> %d", (int)st);
+        }
+    }
     return st;
 }
 
@@ -7306,6 +7376,15 @@ static OSStatus NWHook_SecItemUpdate(CFDictionaryRef q, CFDictionaryRef attrs, C
     OSStatus st = NWSecReal_Update ? NWSecReal_Update(qq ? qq : q, attrs, r)
                                    : SecItemUpdate(qq ? qq : q, attrs);
     if (qq) CFRelease(qq);
+    if (NWKeychainErrNeedsStrip(st, NO)) {
+        CFDictionaryRef qs = NWKeychainStripAccessGroup(q);
+        if (qs) {
+            st = NWSecReal_Update ? NWSecReal_Update(qs, attrs, r)
+                                  : SecItemUpdate(qs, attrs);
+            CFRelease(qs);
+            NWLog("keychain update : retry sans access group -> %d", (int)st);
+        }
+    }
     return st;
 }
 
@@ -7314,6 +7393,14 @@ static OSStatus NWHook_SecItemDelete(CFDictionaryRef q) {
     OSStatus st = NWSecReal_Delete ? NWSecReal_Delete(qq ? qq : q)
                                    : SecItemDelete(qq ? qq : q);
     if (qq) CFRelease(qq);
+    if (NWKeychainErrNeedsStrip(st, NO)) {
+        CFDictionaryRef qs = NWKeychainStripAccessGroup(q);
+        if (qs) {
+            st = NWSecReal_Delete ? NWSecReal_Delete(qs) : SecItemDelete(qs);
+            CFRelease(qs);
+            NWLog("keychain delete : retry sans access group -> %d", (int)st);
+        }
+    }
     return st;
 }
 
@@ -7437,7 +7524,19 @@ static BOOL NWDevBool(NSString *k) {
 }
 
 static BOOL NWDevMaskOn(void)   { return NWDevBool(NWDevKeyOn); }
-static BOOL NWBlockAttest(void) { return NWDevBool(NWDevKeyAttBlock); }
+
+// Vague 10-2 : blocage par DEFAUT. Une app sideloadee n'a jamais l'entitlement
+// com.apple.developer.devicecheck.appattest-environment : l'attestation ne
+// peut pas aboutir et le keystore App Attest d'Instagram reste vide -> crash
+// a la saisie du prenom. On repond donc "non supporte" tant que l'utilisateur
+// n'a pas explicitement remis le blocage sur Off.
+static BOOL NWBlockAttest(void) {
+    @try {
+        NSUserDefaults *u = [NSUserDefaults standardUserDefaults];
+        if ([u objectForKey:NWDevKeyAttBlock] == nil) return YES;   // defaut
+        return [u boolForKey:NWDevKeyAttBlock];
+    } @catch (NSException *e) { return YES; }
+}
 static BOOL NWSafeModeOn(void)  { return NWDevBool(NWSafeModeKey); }
 
 // Le pin global n'appartient qu'AU conteneur qui l'a cree. Un autre conteneur
@@ -7685,6 +7784,32 @@ static BOOL NWDevIsMidKey(id key) {
             [key isEqualToString:@"com.instagram.device.midheader"]);
 }
 
+// Vague 10-2 : suites NSUserDefaults des groupes d'app. En sideloading,
+// [[NSUserDefaults alloc] initWithSuiteName:@"group..."] peut renvoyer nil
+// (pas d'entitlement) : le SDK Facebook croit alors que son magasin partage
+// n'existe pas. On redirige chaque suite de groupe vers une suite SANDBOX
+// stable, propre au conteneur -> les lectures/ecritures fonctionnent et les
+// conteneurs ne partagent pas leurs donnees.
+static NSString *NWSandboxSuiteName(NSString *name) {
+    if (![name isKindOfClass:[NSString class]] || !name.length) return name;
+    if (![name hasPrefix:@"group."]) return name;
+    return [NSString stringWithFormat:@"nw9.%@.%@", NWActiveID ?: @"shared", name];
+}
+
+static id (*NWOrig_udsInitSuite)(id, SEL, NSString *);
+static id NWHook_udsInitSuite(id self, SEL _cmd, NSString *name) {
+    NSString *n = NWSandboxSuiteName(name);
+    if (![n isEqualToString:name]) NWLog("uds suite redirect %@ -> %@", name, n);
+    return NWOrig_udsInitSuite ? NWOrig_udsInitSuite(self, _cmd, n) : nil;
+}
+
+static id (*NWOrig_udsInitSuiteC)(id, SEL, NSString *, id);
+static id NWHook_udsInitSuiteC(id self, SEL _cmd, NSString *name, id container) {
+    NSString *n = NWSandboxSuiteName(name);
+    if (![n isEqualToString:name]) NWLog("uds suite redirect %@ -> %@", name, n);
+    return NWOrig_udsInitSuiteC ? NWOrig_udsInitSuiteC(self, _cmd, n, container) : nil;
+}
+
 static id (*NWOrig_udsObject)(id, SEL, id);
 static id NWHook_udsObject(id self, SEL _cmd, id key) {
     if (NWUdsInHook) {
@@ -7742,6 +7867,11 @@ static void NWHook_udsRemove(id self, SEL _cmd, id key) {
 }
 
 static void NWInstall_UdsHooks(void) {
+    NWSwizzle([NSUserDefaults class], @selector(initWithSuiteName:),
+              (IMP)NWHook_udsInitSuite, &NWOrig_udsInitSuite);
+    // Variante privee utilisee par les appex de Meta (si elle existe).
+    NWSwizzle([NSUserDefaults class], @selector(initWithSuiteName:container:),
+              (IMP)NWHook_udsInitSuiteC, &NWOrig_udsInitSuiteC);
     NWSwizzle([NSUserDefaults class], @selector(objectForKey:),
               (IMP)NWHook_udsObject, &NWOrig_udsObject);
     NWSwizzle([NSUserDefaults class], @selector(setObject:forKey:),
@@ -7752,7 +7882,21 @@ static void NWInstall_UdsHooks(void) {
 }
 
 // — atestation Apple : DCDevice (DeviceCheck) + DCAppAttestService.
-// Requete : handler(nil, error) quand le blocage est actif. OFF par defaut.
+// Bloquee PAR DEFAUT (vague 10-2) : isSupported -> NO, et les generateurs
+// repondent handler(nil, error). Ainsi Instagram emprunte ses chemins
+// "appAttestationNotSupported" au lieu d'un keystore vide qui plante.
+static BOOL (*NWOrig_dcSupported)(id, SEL);
+static BOOL NWHook_dcSupported(id self, SEL _cmd) {
+    if (NWBlockAttest()) return NO;
+    return NWOrig_dcSupported ? NWOrig_dcSupported(self, _cmd) : NO;
+}
+
+static BOOL (*NWOrig_aaSupported)(id, SEL);
+static BOOL NWHook_aaSupported(id self, SEL _cmd) {
+    if (NWBlockAttest()) return NO;
+    return NWOrig_aaSupported ? NWOrig_aaSupported(self, _cmd) : NO;
+}
+
 static void (*NWOrig_dcToken)(id, SEL, void (^)(NSData *, NSError *));
 static void NWHook_dcToken(id self, SEL _cmd, void (^h)(NSData *, NSError *)) {
     @try {
@@ -7774,8 +7918,7 @@ static void NWHook_dcToken(id self, SEL _cmd, void (^h)(NSData *, NSError *)) {
 
 static void (*NWOrig_attest)(id, SEL, NSString *, NSData *, void (^)(id, NSError *));
 static void NWHook_attest(id self, SEL _cmd, NSString *keyID, NSData *dataHash,
-                          void (^h)(id, NSError *)) {
-    @try {
+                          void (^h)(id, NSError *)) {    @try {
         if (NWBlockAttest()) {
             NWLog("attestation (AppAttest) bloquee");
             if (h) {
@@ -7792,20 +7935,47 @@ static void NWHook_attest(id self, SEL _cmd, NSString *keyID, NSData *dataHash,
     if (NWOrig_attest) NWOrig_attest(self, _cmd, keyID, dataHash, h);
 }
 
+// App Attest : generation de cle. Meme reponse quand le blocage est actif
+// (RyukGram hooke aussi cette methode : sans elle le keystore reste vide).
+static void (*NWOrig_attestKeyGen)(id, SEL, void (^)(NSString *, NSError *));
+static void NWHook_attestKeyGen(id self, SEL _cmd, void (^h)(NSString *, NSError *)) {
+    @try {
+        if (NWBlockAttest()) {
+            NWLog("attestation (AppAttest generateKey) bloquee");
+            if (h) {
+                NSError *err = [NSError errorWithDomain:@"nine9wham.device" code:9001
+                                                userInfo:@{ NSLocalizedDescriptionKey:
+                        NWL(@"att_block", @"Apple attestation blocked by user",
+                            @"Attestation Apple bloquee par l'utilisateur",
+                            @"Atestacion Apple bloqueada por el usuario") }];
+                h(nil, err);
+            }
+            return;
+        }
+    } @catch (NSException *e) { NWLog("attestKeyGen: %@", e.reason); }
+    if (NWOrig_attestKeyGen) NWOrig_attestKeyGen(self, _cmd, h);
+}
+
 static void NWInstallAttestation(void) {
     Class dc = NSClassFromString(@"DCDevice");
     if (dc) {
+        NWSwizzle(object_getClass(dc), @selector(isSupported),
+                  (IMP)NWHook_dcSupported, &NWOrig_dcSupported);
         NWSwizzle(dc, @selector(generateTokenWithCompletionHandler:),
                   (IMP)NWHook_dcToken, &NWOrig_dcToken);
-        NWLog("attestation : DCDevice hook pose");
+        NWLog("attestation : DCDevice hook pose (isSupported + token)");
     } else {
         NWLog("attestation : DCDevice absent");
     }
     Class aa = NSClassFromString(@"DCAppAttestService");
     if (aa) {
+        NWSwizzle(object_getClass(aa), @selector(isSupported),
+                  (IMP)NWHook_aaSupported, &NWOrig_aaSupported);
         NWSwizzle(aa, @selector(attestKey:clientDataHash:completionHandler:),
                   (IMP)NWHook_attest, &NWOrig_attest);
-        NWLog("attestation : DCAppAttestService hook pose");
+        NWSwizzle(aa, @selector(generateKeyWithCompletionHandler:),
+                  (IMP)NWHook_attestKeyGen, &NWOrig_attestKeyGen);
+        NWLog("attestation : DCAppAttestService hook pose (isSupported + attestKey + generateKey)");
     } else {
         NWLog("attestation : DCAppAttestService absent");
     }
@@ -7875,7 +8045,7 @@ static void NWPresentSafeModeUI(void) {
 
 // Change a chaque build publie : un nouveau dylib re-tente TOUTES les etapes
 // (sinon une etape neutralisee le resterait pour toujours).
-#define NWBuildID @"w10-1"
+#define NWBuildID @"w10-2"
 
 static int NWBootStopAt = 0;      // etapes >= cette valeur : neutralisees
 static int NWBootFaultStage = 0;  // etape responsable de l'echec precedent
