@@ -1386,16 +1386,17 @@ static NSString *NWLegacyMarker(unichar c0, unichar c1, unichar c2, unichar c3) 
     return [NSString stringWithCharacters:buf length:4];
 }
 
-// Vrai si (service|account|accessGroup) contient un marqueur legacy.
+// Vrai si (service|account|accessGroup|server) contient un marqueur legacy.
 // Ne teste JAMAIS nos propres suites ("nw9."/"nine9wham") : toujours NO.
-static BOOL NWKeychainIsLegacyKC(NSString *service, NSString *account, NSString *ag) {
+static BOOL NWKeychainIsLegacyKC(NSString *service, NSString *account, NSString *ag, NSString *server) {
     static NSString *mRyg = nil, *mRyuk = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         mRyg  = NWLegacyMarker('r', 'y', 'g', '_');   // marqueur RyukGram
         mRyuk = NWLegacyMarker('r', 'y', 'u', 'k');   // "ryuk"
     });
-    NSArray<NSString *> *fields = @[ service ?: @"", account ?: @"", ag ?: @"" ];
+    NSArray<NSString *> *fields = @[ service ?: @"", account ?: @"",
+                                    ag ?: @"", server ?: @"" ];
     NSArray<NSString *> *markers = @[ mRyg, mRyuk ];
     for (NSString *f in fields) {
         for (NSString *m in markers) {
@@ -1410,55 +1411,73 @@ static BOOL NWKeychainIsLegacyKC(NSString *service, NSString *account, NSString 
 // le Report). Renvoie le nombre d'items supprimes.
 static NSUInteger NWKeychainPurgeLegacy(NSString *trigger) {
     if (!trigger.length) trigger = @"?";
-    NSDictionary *q = @{
-        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
-        (__bridge id)kSecReturnAttributes: @YES,
-    };
-    CFTypeRef res = NULL;
-    OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &res);
-    if (st == errSecItemNotFound) {
-        NWLog("[NW] kc-purge: [%@] no generic passwords", trigger);
-        return 0;
-    }
-    if (st != errSecSuccess || !res) {
-        NWLog("[NW] kc-purge: [%@] enum err %d", trigger, (int)st);
-        return 0;
-    }
-    NSArray *items = (__bridge_transfer NSArray *)res;
+    // Fix de revue (vague 10-7) : les DEUX memes classes que la
+    // forensique — un item internet-password herite serait sinon detecte
+    // ("LEGACY PRESENT") mais jamais supprimable.
+    NSArray *classes = @[(__bridge id)kSecClassGenericPassword,
+                         (__bridge id)kSecClassInternetPassword];
     NSUInteger legacy = 0, purged = 0;
-    for (NSDictionary *it in items) {
-        if (![it isKindOfClass:[NSDictionary class]]) continue;
-        NSString *svc = [it[(__bridge id)kSecAttrService] isKindOfClass:[NSString class]]
-            ? it[(__bridge id)kSecAttrService] : nil;
-        NSString *acc = [it[(__bridge id)kSecAttrAccount] isKindOfClass:[NSString class]]
-            ? it[(__bridge id)kSecAttrAccount] : nil;
-        NSString *ag  = [it[(__bridge id)kSecAttrAccessGroup] isKindOfClass:[NSString class]]
-            ? it[(__bridge id)kSecAttrAccessGroup] : nil;
-        // (a) pas de marqueur legacy -> on n'y touche pas
-        if (!NWKeychainIsLegacyKC(svc, acc, ag)) continue;
-        legacy++;
-        // (b) garde-fou : on ne supprime JAMAIS notre propre vault
-        if ((svc && [svc rangeOfString:@"nine9wham" options:NSCaseInsensitiveSearch].location != NSNotFound)
-            || (acc && [acc rangeOfString:@"nine9wham" options:NSCaseInsensitiveSearch].location != NSNotFound)) {
-            NWLog("[NW] kc-purge: [%@] SKIP vault service=%@ account=%@", trigger, svc, acc);
+    for (id cls in classes) {
+        NSDictionary *q = @{
+            (__bridge id)kSecClass: cls,
+            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
+            (__bridge id)kSecReturnAttributes: @YES,
+        };
+        CFTypeRef res = NULL;
+        OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &res);
+        if (st == errSecItemNotFound) continue;
+        if (st != errSecSuccess || !res) {
+            NWLog("[NW] kc-purge: [%@] enum err %d", trigger, (int)st);
+            if (res) CFRelease(res);
             continue;
         }
-        // (c) requete de suppression stricte : classe + service + account
-        if (!svc && !acc) continue;
-        NSMutableDictionary *dq = [NSMutableDictionary dictionary];
-        dq[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
-        if (svc) dq[(__bridge id)kSecAttrService] = svc;
-        if (acc) dq[(__bridge id)kSecAttrAccount] = acc;
-        if (ag)  dq[(__bridge id)kSecAttrAccessGroup] = ag;
-        OSStatus d = SecItemDelete((__bridge CFDictionaryRef)dq);
-        if (d == errSecSuccess) {
-            purged++;
-            NWLog("[NW] kc-purge: [%@] deleted service=%@ account=%@", trigger, svc, acc);
-        } else if (d == errSecItemNotFound) {
-            NWLog("[NW] kc-purge: [%@] missing service=%@ account=%@", trigger, svc, acc);
+        NSArray *items;
+        if (CFGetTypeID(res) == CFArrayGetTypeID()) {
+            items = (__bridge_transfer NSArray *)res;
         } else {
-            NWLog("[NW] kc-purge: [%@] FAIL %d service=%@", trigger, (int)d, svc);
+            items = @[(__bridge NSDictionary *)res];
+            CFRelease(res);
+        }
+        for (NSDictionary *it in items) {
+            if (![it isKindOfClass:[NSDictionary class]]) continue;
+            NSString *svc = [it[(__bridge id)kSecAttrService] isKindOfClass:[NSString class]]
+                ? it[(__bridge id)kSecAttrService] : nil;
+            NSString *acc = [it[(__bridge id)kSecAttrAccount] isKindOfClass:[NSString class]]
+                ? it[(__bridge id)kSecAttrAccount] : nil;
+            NSString *ag  = [it[(__bridge id)kSecAttrAccessGroup] isKindOfClass:[NSString class]]
+                ? it[(__bridge id)kSecAttrAccessGroup] : nil;
+            NSString *srv = [it[(__bridge id)kSecAttrServer] isKindOfClass:[NSString class]]
+                ? it[(__bridge id)kSecAttrServer] : nil;
+            // (a) pas de marqueur legacy -> on n'y touche pas
+            if (!NWKeychainIsLegacyKC(svc, acc, ag, srv)) continue;
+            legacy++;
+            // (b) garde-fou : on ne supprime JAMAIS notre propre vault
+            if ((svc && [svc rangeOfString:@"nine9wham" options:NSCaseInsensitiveSearch].location != NSNotFound)
+                || (acc && [acc rangeOfString:@"nine9wham" options:NSCaseInsensitiveSearch].location != NSNotFound)) {
+                NWLog("[NW] kc-purge: [%@] SKIP vault service=%@ account=%@", trigger, svc, acc);
+                continue;
+            }
+            // (c) requete de suppression stricte : la classe enumeree +
+            // ses attributs d'identite (jamais la classe seule).
+            if (!svc.length && !srv.length && !acc.length) continue;
+            NSMutableDictionary *dq = [NSMutableDictionary dictionary];
+            dq[(__bridge id)kSecClass] = cls;
+            if (svc) dq[(__bridge id)kSecAttrService] = svc;
+            if (srv) dq[(__bridge id)kSecAttrServer] = srv;
+            if (acc) dq[(__bridge id)kSecAttrAccount] = acc;
+            if (ag)  dq[(__bridge id)kSecAttrAccessGroup] = ag;
+            OSStatus d = SecItemDelete((__bridge CFDictionaryRef)dq);
+            if (d == errSecSuccess) {
+                purged++;
+                NWLog("[NW] kc-purge: [%@] deleted service=%@ account=%@ server=%@",
+                      trigger, svc, acc, srv);
+            } else if (d == errSecItemNotFound) {
+                NWLog("[NW] kc-purge: [%@] missing service=%@ account=%@ server=%@",
+                      trigger, svc, acc, srv);
+            } else {
+                NWLog("[NW] kc-purge: [%@] FAIL %d service=%@ server=%@",
+                      trigger, (int)d, svc, srv);
+            }
         }
     }
     NWLog("[NW] kc-purge: [%@] done legacy=%lu purged=%lu",
@@ -8290,12 +8309,13 @@ static void NWSessionForensicsShow(void) {
                         NSString *svc = [di[(__bridge id)kSecAttrService] description];
                         NSString *acc = [di[(__bridge id)kSecAttrAccount] description];
                         NSString *ag  = [di[(__bridge id)kSecAttrAccessGroup] description];
+                        NSString *srv = [di[(__bridge id)kSecAttrServer] description];
                         if (!svc.length && !acc.length) continue;
                         // Vague 10-7 : inventaire COMPLET dans le Report
                         // (une ligne par item — c'est la preuve demandee).
-                        NWLog(@"[NW] forensics: kc[%lu] service=%@ account=%@",
-                              (unsigned long)kc.count, svc ?: @"-", acc ?: @"-");
-                        if (NWKeychainIsLegacyKC(svc, acc, ag)) {
+                        NWLog(@"[NW] forensics: kc[%lu] service=%@ account=%@ server=%@",
+                              (unsigned long)kc.count, svc ?: @"-", acc ?: @"-", srv ?: @"-");
+                        if (NWKeychainIsLegacyKC(svc, acc, ag, srv)) {
                             kcLegacy++;
                             NWLog(@"[NW] forensics: kc[%lu] LEGACY", (unsigned long)kc.count);
                         }
