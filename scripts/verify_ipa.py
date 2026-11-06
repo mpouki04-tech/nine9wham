@@ -11,9 +11,13 @@ Checks:
   - presence de Frameworks/Peter.dylib
   - LC_RPATH "@executable_path/Frameworks" present
 """
+import re
 import struct
 import sys
 import zipfile
+
+# Vague 10-4 : aucun residu du nom d'origine dans TOUTE l'IPA.
+RYUK = re.compile(rb"ryukgram", re.IGNORECASE)
 
 LC_LOAD_WEAK_DYLIB = 0x80000018
 LC_RPATH = 0x8000001C
@@ -70,11 +74,16 @@ def main():
     dylib = z.read("Payload/Instagram.app/Frameworks/Peter.dylib")
     assert struct.unpack_from("<I", dylib, 0)[0] == 0xFEEDFACF, "Peter.dylib invalide"
 
+    # Vague 10-4 : balayage de TOUS les fichiers (binaire 394 Mo compris).
+    residus = [n for n in names if RYUK.search(z.read(n))]
+    assert not residus, "residus RyukGram: %s" % residus
+
     print("OK: IPA valide")
     print("  entrees      : %d" % len(names))
     print("  weak dylibs  : %d (dont Peter)" % len(weak))
     print("  rpaths       : %s" % rpaths)
     print("  Peter.dylib  : %d octets" % len(dylib))
+    print("  residus RyukGram : 0 (balayage de %d fichiers)" % len(names))
     return 0
 
 

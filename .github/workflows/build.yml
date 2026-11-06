@@ -76,6 +76,14 @@ jobs:
           codesign --force --sign - --timestamp=none "$APP/Frameworks/Peter.dylib"
           echo "Framework copie + signe (ad-hoc)"
 
+      - name: Nettoyer les residus RyukGram (ressources)
+        run: |
+          set -euo pipefail
+          # La base (release "base") vient de RyukGram : 4 ressources de
+          # l'extension Safari affichent encore l'ancien nom. Le binaire
+          # Instagram n'est PAS touche (byte-identique, 0 occurrence).
+          python3 scripts/strip_ryukgram.py "$RUNNER_TEMP/ipa"
+
       - name: Repacker l'IPA
         run: |
           set -euo pipefail
