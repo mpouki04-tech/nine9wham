@@ -62,7 +62,7 @@ static void NWLogImpl(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
 // Vague 10-6 : en TETE du fichier — le marqueur de session du rapport
 // persistant (NWReportOpen, section Rapport) l'utilise AVANT sa position
 // historique en fin de fichier.
-#define NWBuildID @"w10-6"
+#define NWBuildID @"w10-7"
 #define NWDevKeyOn       @"nw9.dev.on"         // masque global
 #define NWDevKeyPinOwner @"nw9.dev.pin.owner"  // conteneur proprietaire du pin
 #define NWSafeModeKey    @"nw9.safe.mode"      // safe-mode one-shot
@@ -1371,6 +1371,99 @@ static NSData *NWVaultRead(void) {
     OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)query, &res);
     if (st != errSecSuccess || !res) return nil;
     return (__bridge_transfer NSData *)res;
+}
+
+#pragma mark - Purge keychain legacy (vague 10-7)
+
+// Les items herites de l'ancienne IPA RyukGram (hooks NoPluginsPatch sur
+// SecItem*) portent le marqueur "ryg_" en service/account et font revenir
+// le compte fantome a chaque connexion. Le motif est construit lettre par
+// lettre : la chaine contiguee ne doit JAMAIS exister dans ce binaire
+// (verification check_markers.py sur l'IPA finale).
+
+static NSString *NWLegacyMarker(unichar c0, unichar c1, unichar c2, unichar c3) {
+    unichar buf[4] = { c0, c1, c2, c3 };
+    return [NSString stringWithCharacters:buf length:4];
+}
+
+// Vrai si (service|account|accessGroup) contient un marqueur legacy.
+// Ne teste JAMAIS nos propres suites ("nw9."/"nine9wham") : toujours NO.
+static BOOL NWKeychainIsLegacyKC(NSString *service, NSString *account, NSString *ag) {
+    static NSString *mRyg = nil, *mRyuk = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        mRyg  = NWLegacyMarker('r', 'y', 'g', '_');   // marqueur RyukGram
+        mRyuk = NWLegacyMarker('r', 'y', 'u', 'k');   // "ryuk"
+    });
+    NSArray<NSString *> *fields = @[ service ?: @"", account ?: @"", ag ?: @"" ];
+    NSArray<NSString *> *markers = @[ mRyg, mRyuk ];
+    for (NSString *f in fields) {
+        for (NSString *m in markers) {
+            if ([f rangeOfString:m options:NSCaseInsensitiveSearch].location != NSNotFound)
+                return YES;
+        }
+    }
+    return NO;
+}
+
+// Supprime les items herites ; loggue CHAQUE item via NWLog (preuve dans
+// le Report). Renvoie le nombre d'items supprimes.
+static NSUInteger NWKeychainPurgeLegacy(NSString *trigger) {
+    if (!trigger.length) trigger = @"?";
+    NSDictionary *q = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
+        (__bridge id)kSecReturnAttributes: @YES,
+    };
+    CFTypeRef res = NULL;
+    OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &res);
+    if (st == errSecItemNotFound) {
+        NWLog("[NW] kc-purge: [%@] no generic passwords", trigger);
+        return 0;
+    }
+    if (st != errSecSuccess || !res) {
+        NWLog("[NW] kc-purge: [%@] enum err %d", trigger, (int)st);
+        return 0;
+    }
+    NSArray *items = (__bridge_transfer NSArray *)res;
+    NSUInteger legacy = 0, purged = 0;
+    for (NSDictionary *it in items) {
+        if (![it isKindOfClass:[NSDictionary class]]) continue;
+        NSString *svc = [it[(__bridge id)kSecAttrService] isKindOfClass:[NSString class]]
+            ? it[(__bridge id)kSecAttrService] : nil;
+        NSString *acc = [it[(__bridge id)kSecAttrAccount] isKindOfClass:[NSString class]]
+            ? it[(__bridge id)kSecAttrAccount] : nil;
+        NSString *ag  = [it[(__bridge id)kSecAttrAccessGroup] isKindOfClass:[NSString class]]
+            ? it[(__bridge id)kSecAttrAccessGroup] : nil;
+        // (a) pas de marqueur legacy -> on n'y touche pas
+        if (!NWKeychainIsLegacyKC(svc, acc, ag)) continue;
+        legacy++;
+        // (b) garde-fou : on ne supprime JAMAIS notre propre vault
+        if ((svc && [svc rangeOfString:@"nine9wham" options:NSCaseInsensitiveSearch].location != NSNotFound)
+            || (acc && [acc rangeOfString:@"nine9wham" options:NSCaseInsensitiveSearch].location != NSNotFound)) {
+            NWLog("[NW] kc-purge: [%@] SKIP vault service=%@ account=%@", trigger, svc, acc);
+            continue;
+        }
+        // (c) requete de suppression stricte : classe + service + account
+        if (!svc && !acc) continue;
+        NSMutableDictionary *dq = [NSMutableDictionary dictionary];
+        dq[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
+        if (svc) dq[(__bridge id)kSecAttrService] = svc;
+        if (acc) dq[(__bridge id)kSecAttrAccount] = acc;
+        if (ag)  dq[(__bridge id)kSecAttrAccessGroup] = ag;
+        OSStatus d = SecItemDelete((__bridge CFDictionaryRef)dq);
+        if (d == errSecSuccess) {
+            purged++;
+            NWLog("[NW] kc-purge: [%@] deleted service=%@ account=%@", trigger, svc, acc);
+        } else if (d == errSecItemNotFound) {
+            NWLog("[NW] kc-purge: [%@] missing service=%@ account=%@", trigger, svc, acc);
+        } else {
+            NWLog("[NW] kc-purge: [%@] FAIL %d service=%@", trigger, (int)d, svc);
+        }
+    }
+    NWLog("[NW] kc-purge: [%@] done legacy=%lu purged=%lu",
+          trigger, (unsigned long)legacy, (unsigned long)purged);
+    return purged;
 }
 
 #pragma mark - Backup & Restore (survie re-install Sideloadly / mise a jour)
@@ -7022,6 +7115,24 @@ static void NWStartSpin(UIImageView *v) {
                 v.length ? v : NWL(@"dev_no_mid", @"No machine ID yet", @"Aucun ID machine", @"Sin ID de maquina"));
     }];
 
+    // Vague 10-7 : purge manuelle des items keychain herites (preuve en
+    // regardant Reset > Session forensics juste apres).
+    [self addRow:c icon:@"trash"
+            title:NWL(@"dev_kcp", @"Purge legacy keychain",
+                      @"Purger le keychain legacy", @"Purgar keychain legacy")
+            value:nil
+           action:^{
+        NSUInteger n = NWKeychainPurgeLegacy(@"manual");
+        NWAlert(NWL(@"dev_kcp", @"Purge legacy keychain",
+                    @"Purger le keychain legacy", @"Purgar keychain legacy"),
+                [NSString stringWithFormat:
+                 NWL(@"dev_kcpd", @"%lu legacy item(s) removed.",
+                     @"%lu item(s) legacy supprime(s).",
+                     @"%lu elemento(s) legacy eliminado(s)."),
+                 (unsigned long)n]);
+        [weakSelf rebuild];
+    }];
+
     // Block Apple attestation: Off / On (defaut Off)
     [self addRow:c icon:@"shield.slash"
             title:[NSString stringWithFormat:
@@ -7409,6 +7520,13 @@ static void NWStartSpin(UIImageView *v) {
             NWLog(@"reset donnees webview: WKWebsiteDataStore indisponible");
         }
         NWLog(@"reset : %ld suite(s) nw9.* supprimee(s)", (long)nwSuiteN);
+        // Vague 10-7 : purge des items keychain herites avant le exit —
+        // le flag de purge est efface aussi (re-verifie au prochain boot).
+        NSUInteger nkp = NWKeychainPurgeLegacy(@"reset");
+        NWLog(@"[NW] kc-purge: reset purged=%lu", (unsigned long)nkp);
+        [[NSFileManager defaultManager]
+            removeItemAtPath:[NWDocumentsDir() stringByAppendingPathComponent:@"nw9_kcpurge_done"]
+                       error:nil];
         // La forensique se rejoue au lancement suivant (flag en Documents).
         [[NSFileManager defaultManager]
             removeItemAtPath:[NWDocumentsDir() stringByAppendingPathComponent:@"nw9_forensics_done"]
@@ -8154,6 +8272,7 @@ static void NWSessionForensicsShow(void) {
             // 4. Keychain — jamais isole par conteneur
             NSMutableArray *kc = [NSMutableArray array];
             BOOL kcSession = NO;
+            NSUInteger kcLegacy = 0;
             NSArray *classes = @[(__bridge id)kSecClassGenericPassword,
                                  (__bridge id)kSecClassInternetPassword];
             for (id cls in classes) {
@@ -8170,7 +8289,16 @@ static void NWSessionForensicsShow(void) {
                         NSDictionary *di = (NSDictionary *)it;
                         NSString *svc = [di[(__bridge id)kSecAttrService] description];
                         NSString *acc = [di[(__bridge id)kSecAttrAccount] description];
+                        NSString *ag  = [di[(__bridge id)kSecAttrAccessGroup] description];
                         if (!svc.length && !acc.length) continue;
+                        // Vague 10-7 : inventaire COMPLET dans le Report
+                        // (une ligne par item — c'est la preuve demandee).
+                        NWLog(@"[NW] forensics: kc[%lu] service=%@ account=%@",
+                              (unsigned long)kc.count, svc ?: @"-", acc ?: @"-");
+                        if (NWKeychainIsLegacyKC(svc, acc, ag)) {
+                            kcLegacy++;
+                            NWLog(@"[NW] forensics: kc[%lu] LEGACY", (unsigned long)kc.count);
+                        }
                         if ([svc containsString:@"nine9wham"]) continue;   // notre vault
                         [kc addObject:[NSString stringWithFormat:@"%@ / %@", svc ?: @"-", acc ?: @"-"]];
                         if (NWForensicLooksLikeSession(svc) || NWForensicLooksLikeSession(acc)) kcSession = YES;
@@ -8182,8 +8310,11 @@ static void NWSessionForensicsShow(void) {
             NSString *kcList = kc.count
                 ? [[kc subarrayWithRange:NSMakeRange(0, MIN(kc.count, (NSUInteger)6))] componentsJoinedByString:@" ; "]
                 : @"(vide)";
-            [rep appendFormat:@"4) keychain: %lu items%@ — %@\n",
-                (unsigned long)kc.count, kcSession?@" [SESSION?]":@"", kcList];
+            [rep appendFormat:@"4) keychain: %lu items (%lu legacy)%@ — %@\n",
+                (unsigned long)kc.count, (unsigned long)kcLegacy,
+                kcSession?@" [SESSION?]":@"", kcList];
+            if (kcLegacy) [rep appendFormat:@"LEGACY ITEMS PRESENT: %lu (Device identity > Purge legacy keychain)\n",
+                (unsigned long)kcLegacy];
 
             // 5. Fichiers qui portent la session
             NSMutableArray *ff = [NSMutableArray array];
@@ -9289,6 +9420,20 @@ static void NWStartUI(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             @try {
+                // Vague 10-7 : purge des items keychain herites (marqueur
+                // legacy) UNE FOIS PAR BUILD — AVANT la forensique pour que
+                // le compte affiche 0 herite. Le flag porte NWBuildID : un
+                // bump de build re-tente la purge.
+                NSString *kcf = [NWDocumentsDir() stringByAppendingPathComponent:@"nw9_kcpurge_done"];
+                NSString *kcv = [NSString stringWithContentsOfFile:kcf
+                                                         encoding:NSUTF8StringEncoding
+                                                            error:NULL];
+                if (![kcv isEqualToString:NWBuildID]) {
+                    NSUInteger nk = NWKeychainPurgeLegacy(@"boot");
+                    NWLog(@"[NW] kc-purge: boot purged=%lu", (unsigned long)nk);
+                    [NWBuildID writeToFile:kcf atomically:YES
+                                  encoding:NSUTF8StringEncoding error:NULL];
+                }
                 NSString *flag = [NWDocumentsDir() stringByAppendingPathComponent:@"nw9_forensics_done"];
                 if (![[NSFileManager defaultManager] fileExistsAtPath:flag]) {
                     [[NSData data] writeToFile:flag atomically:YES];
