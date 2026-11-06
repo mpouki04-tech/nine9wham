@@ -616,13 +616,19 @@ systeme, non accessible sans entitlement) ; aucun upload réseau du
 rapport — c'est l'utilisateur qui le copie-colle.
 
 **IPA publiee (release `nine9wham`)** : `nine9wham_instagram_454.ipa` —
-**343 796 384 octets**, sha256
-`c920614d79faf09998e1add3aad0838f677e85478c5416f39197abef19b68cd2`.
+**343 797 111 octets**, sha256
+`f31a40da31261ba37b91202308e9eecb62b9c39c3c711a9dc0979050a5860b43`.
 Contenu verifie : 3258 fichiers, **0 residu RyukGram**, `cryptid=0`, 154
 dylibs, binaire Instagram **byte-identique** a la reference (sha256
-`fdf2faf8...`), `Peter.dylib` **556 544 o** contenant `w10-6` et
-`nine9wham_report.txt`. CI : runs `42227446636` (17 warnings — 4 helpers
-deplaces vers leurs tasks pour garder les CI intermediaires a 13) puis
-`42228689116`, `42229341246`, `42229938609`, `42230958480` (1 erreur
-`UIPasteboard.general`, corrigee en `generalPasteboard`) puis
-`42231209238` succes, **13 warnings identiques**.
+`fdf2faf8...`), `Peter.dylib` **573 088 o** contenant `w10-6` et
+`nine9wham_report.txt`. Revue finale de branche : 1 majeur (decodage
+UTF-8 avant ecartement de la 1re ligne -> apercu/copie pouvaient rendre
+`(empty)` — corrige : coupure au niveau octets, rotation alignee sur
+frontiere de ligne, repli Latin-1) + 5 mineurs (lock a l'ouverture lazy,
+6 chaines neuves passees a `NWL`, borne `snprintf`, rotation au boot,
+message de rebind 8 -> 10 cibles), tous corriges. CI : runs
+`42227446636` (17 warnings — 4 helpers deplaces vers leurs tasks pour
+garder les CI intermediaires a 13) puis `42228689116`, `42229341246`,
+`42229938609`, `42230958480` (1 erreur `UIPasteboard.general`, corrigee
+en `generalPasteboard`) puis `42231209238` et `42238509100` succes,
+**13 warnings identiques**.
