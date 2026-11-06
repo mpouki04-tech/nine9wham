@@ -685,8 +685,12 @@ prenom a la creation d'un compte ; (4) en cas de crash : Report ->
 Copy all.
 
 **IPA publiee (release `nine9wham`)** : `nine9wham_instagram_454.ipa` —
-verifiee `verify_w10_7.py` (RESULT: OK) : `cryptid=0`, 154 dylibs,
+**343 799 499 octets**, sha256
+`54b0b0b8a65a8a849ae650f44c1c02673c02bb38bf7f1f282c212621873734ce`.
+Verifiee `verify_w10_7.py` (RESULT: OK) : 3258 fichiers, `cryptid=0`, 154 dylibs,
 binaire Instagram **byte-identique** a la reference (sha256
-`fdf2faf8...`), `Peter.dylib` contenant `w10-7`, `nw9_kcpurge_done`,
-`kc-purge`, **0 residu RyukGram** (`check_markers.py`). CI : run
-`42265851626` succes, **13 warnings identiques**.
+`fdf2faf8...`), `Peter.dylib` **573 728 o** contenant `w10-7`,
+`nw9_kcpurge_done`, `kc-purge`, **0 residu RyukGram**
+(`check_markers.py`). CI : runs `42265851626` puis `42271788266`
+(revue finale : purge sur les 2 classes) succes, **13 warnings
+identiques** a chaque run.
