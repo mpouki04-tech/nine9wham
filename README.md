@@ -402,3 +402,49 @@ non fourni, comme dans l'IPA de reference), `cryptid=0`, binaire Instagram
 **byte-identique** a w10-1 (sha256 `fdf2faf8...`), `Peter.dylib`
 **534 752 o** contenant `w10-2` et les nouveaux hooks, aucun residu RyukGram.
 CI : run `42142236664`, succes, **13 warnings** (identiques a la reference).
+
+### Vague 10-3 (build actuel) — hooks C poses AVANT Instagram + rapport de crash affiche dans l'app
+
+**Analyse binaire du shim de reference.** Desassemblage complet du
+`zxPluginsInject.dylib` de l'IPA RyukGram (88 768 o, constructor `__init_offsets`
+a `0x4000`, symtab 84 symboles) : il installe ses hooks PENDANT le chargement —
+`_dyld_register_func_for_add_image` + balayage de toutes les images deja
+chargees, `SecItemAdd/CopyMatching/Update`, `SecTaskCopyValueForEntitlement`
++ `SecTaskCreateFromSelf`. Deux manques equivalaient chez nous a ne rien
+installer du tout : (1) `NWRebindGOT` s'armait sur la queue PRINCIPALE,
+apres le run loop = apres les premiers appels keychain de l'app ; (2) la
+passe n'etait pas forcee par un balayage explicite des images deja liees.
+
+**Noyau pose au constructeur dyld.** Tout ce qui n'est pas UI est pose de
+maniere SYNCHRONE dans `NWInit` (constructor) — rapporteur de crash, fix
+sideload, device identity, empreinte+GPS, **rebind GOT**, proxy NSURLSession :
+quand la premiere ligne d'Instagram s'execute, les hooks C sont DEJA poses.
+Seule la partie UI (bouton flottant, pill, timers, alertes) part sur la
+queue principale.
+
+**Rebind GOT effectif.** `NWRebindGOT` balaye maintenant EXPLICITEMENT
+chaque image deja chargee (`_dyld_image_count` / `_dyld_get_image_header`,
+filtre shared cache conserve), puis s'arme pour les images futures. Il y a
+desormais **8 cibles** : `SecItem*` (4), `uname/sysctl/sysctlbyname`, et
+**`SecTaskCopyValueForEntitlement`**.
+
+**Hook C des entitlements.** `SecTaskCopyValueForEntitlement` (chemin C
+direct des SDK Meta, non couvert par un swizzle) repond la liste COMPLETE
+des 13 groupes d'app sur la cle `com.apple.security.application-groups` :
+c'est le meme effet que le hook `CKEntitlements`, avec pour toute autre cle
+la reponse reelle transmise telle quelle.
+
+**Le rapport du dernier plantage s'affiche TOUT SEUL.** Au lancement
+suivant un crash, l'app montre le rapport `nine9wham_crash.log` (nom,
+raison, pile) dans une alerte — une capture d'ecran suffit, plus besoin de
+fournir de logs. Deux tirs (3 s puis 10 s), une seule fois par rapport,
+supprimable depuis l'alerte.
+
+**IPA publiee (release `nine9wham`)** : `nine9wham_instagram_454.ipa` —
+**343 784 134 octets**, sha256
+`6a13e5b5b558fa27733bff6b899eeb0139d52fa8dda68d3db70325368bb36c0b`
+(digest GitHub identique). Contenu verifie : 3258 fichiers, `cryptid=0`,
+binaire Instagram **toujours byte-identique** a la reference (sha256
+`fdf2faf8...`), `Peter.dylib` **535 744 o** contenant `w10-3` et
+`SecTaskCopyValueForEntitlement`, aucun residu RyukGram. CI : run
+`42149924437`, succes, **13 warnings** (identiques, memes types).
