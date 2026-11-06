@@ -2074,6 +2074,27 @@ static void NWBootstrapState(void) {
     }
 }
 
+// Vague 10-4 : lecture SEULE de l'etat au constructeur dyld. Seule l'I/O
+// fichier est faite ici (state.plist) pour que les hooks empreinte servent
+// la bonne valeur des la premiere ligne d'Instagram. Les operations qui
+// touchent NSUserDefaults / NSHTTPCookieStorage / keychain (restauration
+// du conteneur actif, langue systeme, vault) ne sont PAS fiables avant
+// main() : elles sont deplacees dans NWStartUI (queue principale). En
+// w10-3 elles tournaient au constructeur, d'ou la restauration perdue
+// (compte/cookies/langue du dernier conteneur visibles partout).
+static void NWLoadStateReadonly(void) {
+    @try {
+        NSDictionary *st = NWLoadState();
+        NSDictionary *cs = st[@"containers"];
+        if (![cs isKindOfClass:[NSDictionary class]] || !cs.count) return;
+        NWSaveState(st);   // pose NWState / NWActiveID / NWActiveFP / NWActiveLoc
+        NWLog("etat lu au constructeur : %lu conteneur(s), actif=%@",
+              (unsigned long)cs.count, NWActiveID ?: @"(aucun)");
+    } @catch (NSException *e) {
+        NWLog("etat (lecture seule) : %@", e.reason);
+    }
+}
+
 #pragma mark - Menu flottant @nine9wham (design Blaze)
 
 // ---------------------------------------------------------------------------
@@ -7306,18 +7327,21 @@ static CFTypeRef NWHook_SecTaskCopy(void *task, CFStringRef ent) {
         for (NSString *gid in NWAppGroupIDs()) {
             if (![gs containsObject:gid]) [gs addObject:gid];
         }
-        if (real) {
-            // Copy... = le recepteur recupere une reference +1 : la reponse
-            // remplacee est la notre, on ferme la reponse reelle.
-            CFRelease(real);
-        }
         static dispatch_once_t onceLog;
         dispatch_once(&onceLog, ^{
             NWLog("sectask : entitlement app-groups spoofe (%lu groupes)", (unsigned long)gs.count);
         });
-        return CFBridgingRetain(gs);
+        CFTypeRef out = CFBridgingRetain(gs);
+        // On ne libere la reponse reelle qu'APRES avoir construit la notre :
+        // si une exception survenait avant, le @catch retomberait sur un
+        // pointeur deja libere (crash). Ici real n'est plus reference.
+        if (real) CFRelease(real);
+        return out;
     } @catch (NSException *e) {
         NWLog("sectask copy : %@", e.reason);
+        // Jamais libere ici : l'exception est survenue AVANT la liberation
+        // (le @catch ne peut se declencher qu'a ce moment) — le +1 du Copy
+        // reel est donc rendu tel quel a l'appelant, comme prevu.
         return real;
     }
 }
@@ -8122,7 +8146,7 @@ static void NWPresentSafeModeUI(void) {
 
 // Change a chaque build publie : un nouveau dylib re-tente TOUTES les etapes
 // (sinon une etape neutralisee le resterait pour toujours).
-#define NWBuildID @"w10-3"
+#define NWBuildID @"w10-4"
 
 static int NWBootStopAt = 0;      // etapes >= cette valeur : neutralisees
 static int NWBootFaultStage = 0;  // etape responsable de l'echec precedent
@@ -8161,7 +8185,19 @@ static void NWBootBegin(void) {
         double t0 = [u doubleForKey:NW_BOOT_KEY_T0];
         int last = (int)[u integerForKey:NW_BOOT_KEY_STAGE];
         double now = [NSDate date].timeIntervalSince1970;
-        BOOL failed = (!done && t0 > 0 && (now - t0) < 180.0);
+        // Vague 10-4 : un lancement n'est considere echoue QUE s'il y a la
+        // PREUVE d'un plantage (rapport plus recent que t0). Une fermeture
+        // rapide de l'app (avant la marque finale) n'ecrit aucun rapport :
+        // sans cette preuve, elle etait prise pour un crash et neutralisait
+        // une etape pour TOUTE la duree du build — par exemple l'etape 3
+        // (sideload fix), d'ou le plantage a la creation de compte qui
+        // revenait a chaque lancement suivant.
+        double rpt = 0;
+        NSDictionary *rat = [[NSFileManager defaultManager]
+            attributesOfItemAtPath:NWCrashLogPath() error:nil];
+        NSDate *rmt = rat[NSFileModificationDate];
+        if (rmt) rpt = rmt.timeIntervalSince1970;
+        BOOL failed = (!done && t0 > 0 && (now - t0) < 180.0 && rpt > t0);
         // --- Vague 9 : le scan getDeviceId a-t-il tue le lancement precedent ?
         //     Le scan note son heure de debut ; un crash ecrit le rapport a cet
         //     instant. Si le rapport est plus recent que le debut du scan, la
@@ -8219,6 +8255,18 @@ static void NWBootBegin(void) {
 static void NWBootMark(int stage) {
     @try {
         NSUserDefaults *u = NSUserDefaults.standardUserDefaults;
+        // Vague 10-4 : la marque est MONOTONE (elle ne redescend jamais).
+        // L'ordre reel d'execution est 1,3,4,5,6,7,8 au constructeur, puis
+        // l'UI (2), puis le scan (9) : ecrire 2 apres 8 faisait descendre
+        // la marque, et « fault = derniere marque + 1 » pointait alors
+        // l'etape 3 (sideload fix). Toute fermeture rapide de l'app (avant
+        // la marque finale) deactivait donc 3,4,5,6,7,8,9 pour tout le
+        // build : conteneurs plus restaures (compte/langue par defaut) +
+        // fix sideload coupe (plantage a la creation de compte). Avec la
+        // marque monotone, une erreur n'atteint plus que l'etape 9 (scan),
+        // jamais les etapes essentielles.
+        int cur = (int)[u integerForKey:NW_BOOT_KEY_STAGE];
+        if (stage <= cur) return;
         [u setInteger:stage forKey:NW_BOOT_KEY_STAGE];
         [u synchronize];
     } @catch (NSException *e) { (void)e; }
@@ -8341,13 +8389,22 @@ static void NWStartCore(void) {
 
         // --- Etape 1. Rapporteur de crash : installe AVANT tout hook, pour
         //     capturer le plantage a la creation de compte (nom + raison + pile).
-        if (!NWBootSkip(1)) NWInstallCrashReporter();
+        if (!NWBootSkip(1)) {
+            @try { NWInstallCrashReporter(); }
+            @catch (NSException *e) { NWLog("rapporteur: %@", e.reason); }
+        }
         NWBootMark(1);
 
         // --- Etape 3. Sideload fix : conteneur de groupe + accessGroup keychain.
         //     Sans cela Instagram plante a l'inscription en sideloading
         //     (certificat personnel sans entitlement de groupe).
-        if (!NWBootSkip(3)) NWInstallSideloadFix();
+        //     Vague 10-4 : protege par @try — une exception ici ne doit PAS
+        //     faire aborter tout le reste du core (sinon l'etat ne serait
+        //     jamais charge et les conteneurs perdraient leur isolation).
+        if (!NWBootSkip(3)) {
+            @try { NWInstallSideloadFix(); }
+            @catch (NSException *e) { NWLog("sideload fix: %@", e.reason); }
+        }
         NWBootMark(3);
 
         // --- SAFE MODE (vague 7) : si l'utilisateur a demande la coupe
@@ -8372,8 +8429,11 @@ static void NWStartCore(void) {
 
         NWLog("demarrage - Instagram %@", UIDevice.currentDevice.systemVersion);
 
-        // --- Etape 5. Etat (disque ou vault keychain si re-install)
-        if (!NWBootSkip(5)) NWBootstrapState();
+        // --- Etape 5. Etat : lecture SEULE du disque au constructeur
+        //     (vague 10-4) — la restauration complete tourne sur la queue
+        //     principale dans NWStartUI : avant main(), NSUserDefaults /
+        //     cookies / keychain ne sont pas fiables.
+        if (!NWBootSkip(5)) NWLoadStateReadonly();
         NWBootMark(5);
 
         // --- Etape 6. Hooks d'empreinte + fake GPS
@@ -8388,7 +8448,10 @@ static void NWStartCore(void) {
         NWBootMark(6);
 
         // --- Etape 7. Rebind GOT (SecItem*/sysctl/uname, images de l'app)
-        if (!NWBootSkip(7)) NWRebindGOT();
+        if (!NWBootSkip(7)) {
+            @try { NWRebindGOT(); }
+            @catch (NSException *e) { NWLog("rebind GOT: %@", e.reason); }
+        }
         NWBootMark(7);
 
         // --- Etape 8. Proxy NSURLSession
@@ -8403,7 +8466,7 @@ static void NWStartCore(void) {
         }
         NWBootMark(8);
 
-        NWLog("noyau w10-3 pose au constructeur dyld : rapporteur, sideload fix, identity, empreinte+GPS, rebind GOT, proxy");
+        NWLog("noyau w10-4 pose au constructeur dyld : rapporteur, sideload fix, identity, etat (lecture seule), empreinte+GPS, rebind GOT, proxy");
     }
 }
 
@@ -8421,6 +8484,19 @@ static void NWStartUI(void) {
             NWBootFinish();
             return;
         }
+
+        // --- Etape 5 (suite, vague 10-4). Restauration COMPLETE de l'etat :
+        //     vault keychain si re-install, migrations, prefs + cookies du
+        //     conteneur actif, langue systeme. Ces operations touchent
+        //     NSUserDefaults / NSHTTPCookieStorage / keychain : elles doivent
+        //     tourner SUR LA QUEUE PRINCIPALE apres main() (en w10-3 elles
+        //     tournaient au constructeur dyld AVANT main() : restauration
+        //     silencieusement perdue -> conteneurs non isoles + crash).
+        if (!NWBootSkip(5)) {
+            @try { NWBootstrapState(); }
+            @catch (NSException *e) { NWLog("etat/conteneurs: %@", e.reason); }
+        }
+        NWBootMark(5);
 
         // --- Etape 2. UI : bouton flottant + pill des que le run loop tourne.
         //     C'est aussi la preuve visible que le dylib est bien charge.
