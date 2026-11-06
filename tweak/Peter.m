@@ -1462,17 +1462,8 @@ static void NWReportAppendLine(const char *tag, NSString *msg) {
     } @catch (NSException *e) { (void)e; }
 }
 
-// Append de texte brut (blocs crash) : meme protocole, un seul write().
-static void NWReportAppendRaw(NSString *text) {
-    if (!text.length) return;
-    if (NWReportFD < 0) NWReportOpen();
-    if (NWReportFD < 0) return;
-    NSData *d = [text dataUsingEncoding:NSUTF8StringEncoding];
-    if (!d.length) return;
-    pthread_mutex_lock(&NWReportLock);
-    ssize_t w = write(NWReportFD, d.bytes, d.length); (void)w;
-    pthread_mutex_unlock(&NWReportLock);
-}
+// Append de texte brut (blocs crash) : creee dans la Task 3 (rapporteur) —
+// definir ici produirait un warning "unused function" en CI intermediaire.
 
 // Rotation : au-dela de 2 Mo on garde le Mo final (apercu + copie restent
 // utilisables, le fichier ne grossit plus). Appelée au boot et au flush 15 s.
@@ -1494,57 +1485,8 @@ static void NWReportMaybeRotate(void) {
     } @catch (NSException *e) { (void)e; }
 }
 
-// Efface le rapport (bouton Clear de l'onglet Report).
-static void NWReportClear(void) {
-    if (NWReportFD < 0) return;
-    pthread_mutex_lock(&NWReportLock);
-    ftruncate(NWReportFD, 0);
-    pthread_mutex_unlock(&NWReportLock);
-}
-
-// Apercu pour l'onglet Report : 60 000 derniers octets. Si la lecture est
-// partielle, la premiere ligne (potentiellement coupee au milieu d'un
-// caractere UTF-8) est ecartee — l'apercu commence par un timestamp complet.
-static NSString *NWReportPreview(void) {
-    @try {
-        NSDictionary *at = [[NSFileManager defaultManager]
-            attributesOfItemAtPath:NWReportPath() error:nil];
-        unsigned long long sz = [at[NSFileSize] unsignedLongLongValue];
-        NSData *d = NWReportReadTail(60000ULL);
-        if (!d.length) return @"(empty)";
-        NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-        if (!s.length) return @"(empty)";
-        if (sz > 60000ULL) {
-            NSRange nl = [s rangeOfString:@"\n"];
-            if (nl.location != NSNotFound && nl.location + 1 < s.length)
-                s = [s substringFromIndex:nl.location + 1];
-        }
-        return s;
-    } @catch (NSException *e) {
-        return [NSString stringWithFormat:@"(read error: %@)", e.reason];
-    }
-}
-
-// Texte complet pour « Copier tout » : rapport entier + rapport de crash.
-static NSString *NWReportFullText(void) {
-    @try {
-        NSMutableString *out = [NSMutableString string];
-        NSData *rep = [NSData dataWithContentsOfFile:NWReportPath()];
-        if (rep.length) {
-            NSString *s = [[NSString alloc] initWithData:rep encoding:NSUTF8StringEncoding];
-            if (s) [out appendString:s];
-        }
-        NSData *crash = [NSData dataWithContentsOfFile:NWCrashLogPath()];
-        if (crash.length) {
-            [out appendString:@"\n\n=== nine9wham_crash.log ===\n"];
-            NSString *cs = [[NSString alloc] initWithData:crash encoding:NSUTF8StringEncoding];
-            if (cs) [out appendString:cs];
-        }
-        return out.length ? out : @"(empty)";
-    } @catch (NSException *e) {
-        return [NSString stringWithFormat:@"(read error: %@)", e.reason];
-    }
-}
+// Clear / Preview / FullText : creees dans la Task 4 (onglet Report) —
+// definir ici produirait des warnings "unused function" en CI intermediaire.
 
 // Corps de NWLog (macro l.45) : la sortie console est identique a l'ancien
 // NSLog([nine9wham] ...), et la ligne part DANS le rapport (tag [NW]).
