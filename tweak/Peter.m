@@ -41,8 +41,11 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <execinfo.h>
+#include <stdio.h>
+#include <pthread.h>
 
-#define NWLog(fmt, ...) NSLog(@"[nine9wham] " fmt, ##__VA_ARGS__)
+static void NWLogImpl(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
+#define NWLog(fmt, ...) NWLogImpl(@"[nine9wham] " fmt, ##__VA_ARGS__)
 
 // ---- Cles device identity / safe-mode (vague 7) : #define en TETE du
 // fichier car utilisees des la ligne 420 (pin IDFV) et dans l'UI.
@@ -53,6 +56,13 @@
 #define NWDevKeyAttBlock @"nw9.dev.noattest"
 #define NWDevKeyHidePill @"nw9.dev.hidepill"   // one-shot (jusqu'au relaunch)
 #define NWDevKeyPill     @"nw9.dev.pill"       // bouton flottant (defaut ON)
+
+// Change a chaque build publie : un nouveau dylib re-tente TOUTES les etapes
+// (sinon une etape neutralisee le resterait pour toujours).
+// Vague 10-6 : en TETE du fichier — le marqueur de session du rapport
+// persistant (NWReportOpen, section Rapport) l'utilise AVANT sa position
+// historique en fin de fichier.
+#define NWBuildID @"w10-6"
 #define NWDevKeyOn       @"nw9.dev.on"         // masque global
 #define NWDevKeyPinOwner @"nw9.dev.pin.owner"  // conteneur proprietaire du pin
 #define NWSafeModeKey    @"nw9.safe.mode"      // safe-mode one-shot
@@ -1366,6 +1376,187 @@ static NSString *NWBackupDir(void) {
     NSString *d = [NWDocumentsDir() stringByAppendingPathComponent:@"nine9wham_backups"];
     [[NSFileManager defaultManager] createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil];
     return d;
+}
+
+#pragma mark - Rapport persistant (vague 10-6)
+
+// Journal COMPLET de l'application, survivant au crash : chaque ligne est
+// ecrite en write() direct sur un fd O_APPEND ouvert en permanence (aucun
+// buffer stdio -> la derniere ligne avant un plantage est deja sur disque,
+// c'est exactement ce qui manquait a « crash a la creation de compte »).
+// Sources : [NW] = NWLog (notre code), [IG] = NSLog/NSLogv rebindes (code
+// Instagram, task rebind), blocs CRASH appendes par le rapporteur.
+// UI : onglet Report du menu (apercu + Copier tout + Partager + Effacer).
+// Limite assumee : os_log interne d'iOS reste hors portee (buffer systeme).
+
+static NSString *NWCrashLogPath(void);   // definition juste apres (section crash)
+
+static NSString *NWReportPath(void) {
+    return [NWDocumentsDir() stringByAppendingPathComponent:@"nine9wham_report.txt"];
+}
+
+static int NWReportFD = -1;               // -1 = pas encore ouvert
+static char NWReportPathC[1024] = "";     // chemin C (handler signal, si besoin)
+static pthread_mutex_t NWReportLock = PTHREAD_MUTEX_INITIALIZER;
+
+// Ouverture lazy + idempotente. Un marqueur de session est append a chaque
+// lancement : le fichier peut contenir plusieurs sessions, separables.
+static void NWReportOpen(void) {
+    if (NWReportFD >= 0) return;
+    NSString *p = NWReportPath();
+    NWReportFD = open(p.fileSystemRepresentation, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (NWReportFD < 0) return;   // silencieux : la console NSLog continue
+    strncpy(NWReportPathC, p.fileSystemRepresentation ?: "", sizeof(NWReportPathC) - 1);
+    NWReportPathC[sizeof(NWReportPathC) - 1] = '\0';
+    @try {
+        NSString *hdr = [NSString stringWithFormat:@"=== session %@ (build %@) ===\n",
+                         [NSDate date], NWBuildID];
+        NSData *d = [hdr dataUsingEncoding:NSUTF8StringEncoding];
+        if (d.length) { ssize_t w = write(NWReportFD, d.bytes, d.length); (void)w; }
+    } @catch (NSException *e) { (void)e; }
+}
+
+// Lecture des N derniers octets du rapport (0 = tout). C pur via open/pread :
+// pas de NSFileHandle (methodes legacy = risque de warning -Wdeprecated).
+static NSData *NWReportReadTail(unsigned long long n) {
+    int fd = open(NWReportPath().fileSystemRepresentation, O_RDONLY);
+    if (fd < 0) return nil;
+    off_t sz = lseek(fd, 0, SEEK_END);
+    if (sz < 0) { close(fd); return nil; }
+    unsigned long long off = (n && (unsigned long long)sz > n)
+        ? (unsigned long long)sz - n : 0;
+    lseek(fd, (off_t)off, SEEK_SET);
+    NSMutableData *d = [NSMutableData data];
+    char buf[8192];
+    ssize_t r;
+    while ((r = read(fd, buf, sizeof(buf))) > 0) [d appendBytes:buf length:(NSUInteger)r];
+    close(fd);
+    return d;
+}
+
+// Append SOUS LOCK. write() pur — jamais de fwrite/fopen : un buffer stdio
+// serait perdu au crash. O_APPEND rend chaque write() atomique entre threads.
+static void NWReportAppendLine(const char *tag, NSString *msg) {
+    if (!msg) return;
+    if (NWReportFD < 0) NWReportOpen();
+    if (NWReportFD < 0) return;
+    @try {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        struct tm tmv;
+        localtime_r(&ts.tv_sec, &tmv);
+        char head[64];
+        int n = snprintf(head, sizeof(head), "%02d:%02d:%02d.%03d [%s] ",
+                         tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
+                         (int)(ts.tv_nsec / 1000000L), tag ?: "?");
+        NSData *body = [msg dataUsingEncoding:NSUTF8StringEncoding];
+        if (n <= 0 || !body) return;
+        // Lock uniquement autour des write() : aucune exception possible
+        // entre lock et unlock (sinon le mutex resterait pris).
+        pthread_mutex_lock(&NWReportLock);
+        ssize_t w;
+        w = write(NWReportFD, head, (size_t)n); (void)w;
+        w = write(NWReportFD, body.bytes, body.length); (void)w;
+        w = write(NWReportFD, "\n", 1); (void)w;
+        pthread_mutex_unlock(&NWReportLock);
+    } @catch (NSException *e) { (void)e; }
+}
+
+// Append de texte brut (blocs crash) : meme protocole, un seul write().
+static void NWReportAppendRaw(NSString *text) {
+    if (!text.length) return;
+    if (NWReportFD < 0) NWReportOpen();
+    if (NWReportFD < 0) return;
+    NSData *d = [text dataUsingEncoding:NSUTF8StringEncoding];
+    if (!d.length) return;
+    pthread_mutex_lock(&NWReportLock);
+    ssize_t w = write(NWReportFD, d.bytes, d.length); (void)w;
+    pthread_mutex_unlock(&NWReportLock);
+}
+
+// Rotation : au-dela de 2 Mo on garde le Mo final (apercu + copie restent
+// utilisables, le fichier ne grossit plus). Appelée au boot et au flush 15 s.
+static void NWReportMaybeRotate(void) {
+    if (NWReportFD < 0) return;
+    @try {
+        NSDictionary *at = [[NSFileManager defaultManager]
+            attributesOfItemAtPath:NWReportPath() error:nil];
+        unsigned long long sz = [at[NSFileSize] unsignedLongLongValue];
+        if (sz <= 2000000ULL) return;
+        NSData *tail = NWReportReadTail(1000000ULL);
+        if (!tail.length) return;
+        pthread_mutex_lock(&NWReportLock);
+        ftruncate(NWReportFD, 0);
+        const char *mark = "--- rotated ---\n";
+        ssize_t w = write(NWReportFD, mark, strlen(mark)); (void)w;
+        w = write(NWReportFD, tail.bytes, tail.length); (void)w;
+        pthread_mutex_unlock(&NWReportLock);
+    } @catch (NSException *e) { (void)e; }
+}
+
+// Efface le rapport (bouton Clear de l'onglet Report).
+static void NWReportClear(void) {
+    if (NWReportFD < 0) return;
+    pthread_mutex_lock(&NWReportLock);
+    ftruncate(NWReportFD, 0);
+    pthread_mutex_unlock(&NWReportLock);
+}
+
+// Apercu pour l'onglet Report : 60 000 derniers octets. Si la lecture est
+// partielle, la premiere ligne (potentiellement coupee au milieu d'un
+// caractere UTF-8) est ecartee — l'apercu commence par un timestamp complet.
+static NSString *NWReportPreview(void) {
+    @try {
+        NSDictionary *at = [[NSFileManager defaultManager]
+            attributesOfItemAtPath:NWReportPath() error:nil];
+        unsigned long long sz = [at[NSFileSize] unsignedLongLongValue];
+        NSData *d = NWReportReadTail(60000ULL);
+        if (!d.length) return @"(empty)";
+        NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+        if (!s.length) return @"(empty)";
+        if (sz > 60000ULL) {
+            NSRange nl = [s rangeOfString:@"\n"];
+            if (nl.location != NSNotFound && nl.location + 1 < s.length)
+                s = [s substringFromIndex:nl.location + 1];
+        }
+        return s;
+    } @catch (NSException *e) {
+        return [NSString stringWithFormat:@"(read error: %@)", e.reason];
+    }
+}
+
+// Texte complet pour « Copier tout » : rapport entier + rapport de crash.
+static NSString *NWReportFullText(void) {
+    @try {
+        NSMutableString *out = [NSMutableString string];
+        NSData *rep = [NSData dataWithContentsOfFile:NWReportPath()];
+        if (rep.length) {
+            NSString *s = [[NSString alloc] initWithData:rep encoding:NSUTF8StringEncoding];
+            if (s) [out appendString:s];
+        }
+        NSData *crash = [NSData dataWithContentsOfFile:NWCrashLogPath()];
+        if (crash.length) {
+            [out appendString:@"\n\n=== nine9wham_crash.log ===\n"];
+            NSString *cs = [[NSString alloc] initWithData:crash encoding:NSUTF8StringEncoding];
+            if (cs) [out appendString:cs];
+        }
+        return out.length ? out : @"(empty)";
+    } @catch (NSException *e) {
+        return [NSString stringWithFormat:@"(read error: %@)", e.reason];
+    }
+}
+
+// Corps de NWLog (macro l.45) : la sortie console est identique a l'ancien
+// NSLog([nine9wham] ...), et la ligne part DANS le rapport (tag [NW]).
+// Peter.dylib est EXCLU du rebind NSLog : pas de double ecriture [IG].
+static void NWLogImpl(NSString *fmt, ...) {
+    if (!fmt) return;
+    va_list args;
+    va_start(args, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    NWReportAppendLine("NW", s);
+    NSLog(@"%@", s);
 }
 
 #pragma mark - Rapporteur de crash (preuves, pas de suppositions)
@@ -8381,8 +8572,8 @@ static void NWPresentSafeModeUI(void) {
 #define NW_BOOT_KEY_CRLAST @"nw9.cralert.mtime"   // vague 10-3 : heure du rapport deja affiche
 
 // Change a chaque build publie : un nouveau dylib re-tente TOUTES les etapes
-// (sinon une etape neutralisee le resterait pour toujours).
-#define NWBuildID @"w10-5"
+// (sinon une etape neutralisee le resterait pour toujours) — voir NWBuildID
+// en tete du fichier (vague 10-6).
 
 static int NWBootStopAt = 0;      // etapes >= cette valeur : neutralisees
 static int NWBootFaultStage = 0;  // etape responsable de l'echec precedent
@@ -8802,6 +8993,9 @@ static void NWStartUI(void) {
             @autoreleasepool {
                 @try {
                     if (NWActiveID) { NWSnapshotActive(); NWPersistState(); }
+                    // Vague 10-6 : le rapport grossit a chaque ligne —
+                    // rotation a 2 Mo (append fd, verrou deja pris dedans).
+                    @try { NWReportMaybeRotate(); } @catch (NSException *e2) { (void)e2; }
                 } @catch (NSException *e) { NWLog("flush: %@", e.reason); }
             }
         });
