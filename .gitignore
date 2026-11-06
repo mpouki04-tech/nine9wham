@@ -4,6 +4,10 @@ build/
 *.ipa
 !base_ipa/.gitkeep
 
+# Python
+__pycache__/
+*.pyc
+
 # OS / editeurs
 .DS_Store
 Thumbs.db
