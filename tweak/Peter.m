@@ -86,6 +86,7 @@ static void NWOpenDeviceIdentity(void);
 static void NWCloseMenu(void);
 static void NWPresentSafeModeUI(void);
 static void NWSessionForensicsShow(void);   // vague 10-5 (diagnostic session)
+static id NWWKDefaultDataStore(void);       // vague 10-5 (WebKit en dynamique)
 
 #pragma mark - Chemins
 
