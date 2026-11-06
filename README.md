@@ -2,7 +2,7 @@
 
 **Instagram modifié** — menu flottant, **conteneurs** (téléphones virtuels isolés) et **fake GPS** par conteneur.
 
-> Base : Instagram **454.0.0** propre (`cryptid=0`, aucun dylib injecté) — voir [Choix de la base](#choix-de-la-base).
+> Base : Instagram **449.0.0** propre (`cryptid=0`, aucun dylib injecté) — voir [Choix de la base](#choix-de-la-base).
 
 ---
 
@@ -89,7 +89,7 @@ Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). San
 - **Safe mode** : *Support → « Disable all tweaks & relaunch »* coupe **tous** les hooks au prochain lancement (seuls le rapporteur de crash et le fix sideload restent actifs) ; l'UI de réactivation propose *Re-enable & relaunch* / *Keep*.
 - **`inject_dylib.py` idempotent** : si le `LC_LOAD_WEAK_DYLIB` est déjà présent, le script ne fait rien (rebuild local sûr).
 
-### Vague 7c (build actuel) — démarrage différé : fix du plantage à l'ouverture
+### Vague 7c — démarrage différé : fix du plantage à l'ouverture
 
 - **Cause racine identifiée par analyse reverse de l'IPA de référence (elle démarre)** : notre `__attribute__((constructor))` exécutait **tout synchrone pendant l'init dyld** — I/O keychain `SecItem*`, `dlopen(AdSupport)`, scan global des classes (`objc_copyClassList`), écritures `NSUserDefaults`/`CFPreferences`, enregistrement du rebind GOT et création de fenêtres UIKit. L'IPA de référence, elle, n'a **aucun constructeur C** (section `__mod_init_func` absente de ses dylibs) et diffuse toute son initialisation (`dispatch_after`, notifications d'app) **après** le chargement de dyld.
 - **Refonte** : le constructeur ne fait plus que le **rapporteur de crash** (aucune I/O, aucun dlopen, aucune fenêtre pendant le verrou dyld). Tout le reste — sideload fix, Device identity, état, hooks empreinte/GPS, rebind, proxy, overlay — part en `dispatch_async` sur la queue principale via `NWStartTweaks()`, donc avant toute interaction utilisateur ; l'overlay et le bouton sont rattrapés par le timer de 2 s.
@@ -99,8 +99,8 @@ Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). San
 
 ## Installer
 
-1. Télécharger l'IPA : **[Release `nine9wham`](https://github.com/mpouki04-tech/nine9wham/releases/download/nine9wham/nine9wham_instagram_454.ipa)**
-   sha256 : `b95a08ef640d15d08ec7484944ec44837ba293e8aefd891befc08856888f0237` (343 771 950 octets)
+1. Télécharger l'IPA : **[Release `nine9wham`](https://github.com/mpouki04-tech/nine9wham/releases/download/nine9wham/nine9wham_instagram_449.ipa)**
+   sha256 : `6a3fafabeaeb7d0095ad09123da02c2a69c219dc9b33f36c1cede7767ba270f8` (243 899 449 octets)
 2. Ouvrir **Sideloadly** → sélectionner l'IPA → Install (certificat 7 jours, même Apple ID). Sideloadly est ici **uniquement** l'outil d'installation : aucune licence Blaze/Bumble n'est incluse.
 3. Lancer Instagram → le bouton **carré translucide (4 carrés)** apparaît **centré en bas**.
 
@@ -150,22 +150,23 @@ nine9wham/
 
 ## Choix de la base
 
-La consigne initiale visait une base tierce. La base utilisée est **454.0.0 propre** (`com.burbn.instagram_v454.0.0_sideload_clean.ipa`) :
+La consigne initiale visait une base tierce. La base utilisée est **449.0.0 propre** (`com.burbn.instagram_v449.0.0_sideload_clean.ipa`), reconstruite depuis l'app de l'IPA RyukGram qui fonctionne sur l'appareil :
 
-- `cryptid=0` (déjà décryptée), **minOS 15.0**, aucune modification du binaire d'origine,
-- **aucun dylib injecté** : les 2 `LC_LOAD_WEAK_DYLIB` résiduels d'un autre tweak ont été réécrits vers `@rpath/Peter.dylib` (même taille, NUL-pad) et les bundles/dylibs/frameworks tiers retirés de l'archive (dont `CydiaSubstrate.framework`),
+- `cryptid=0` (déjà décryptée), **minOS 16.3**, aucune modification du binaire d'origine hors slots,
+- **aucun dylib injecté** : `RyukGram.bundle`, `RyukGram.dylib`, `FLEXing.dylib`, `libflex.dylib`, `NoPluginsPatch.dylib`, `CydiaSubstrate.framework` et tous les `_CodeSignature` retirés ; les **4 `LC_LOAD_WEAK_DYLIB`** résiduels ont été réécrits **en place** vers `@rpath/Peter.dylib` (1) + `@rpath/NWSupport.dylib` (3, absents donc ignorés) — `ncmds`, `sizeofcmds` et taille du binaire inchangés,
 - `LC_RPATH @executable_path/Frameworks` **déjà présent** → injection valide sans toucher aux rpaths,
-- `CFBundleExecutable=Instagram`, zéro résidu (strings, clés Info.plist).
+- **2079 fichiers / 483 719 507 octets** après nettoyage, binaire sha256 `b3f98e677df1fe3fb0a03dda50171e4bd7ac095fbb555f5dd6de2f6ebcf31b0c`,
+- `CFBundleExecutable=Instagram`, zéro résidu (strings, clés Info.plist, balayage `ryukgram` insensible à la casse).
 
-Résultat : une base saine, sans aucun résidu d'un autre tweak.
+Résultat : une base saine, sans aucun résidu d'un autre tweak, et la même infrastructure d'injection que l'IPA d'origine.
 
-> **Contrôles avant publication** : la base est vérifiée en local (`magic MH_MAGIC_64`, `cryptid=0`, rpath présent, aucun `Peter.dylib` déjà injecté) avant d'être téléversée dans la release `base` que le CI télécharge.
+> **Contrôles avant publication** : `prepare_base.py` vérifie `magic MH_MAGIC_64`, les 4 slots, `cryptid=0`, le rpath, le hash binaire et l'absence de marqueurs avant de produire l'IPA de base ; `verify_ipa.py` revalide l'IPA finale (2080 fichiers, 152 dylibs, `cryptid=0`, 0 résidu RyukGram).
 
 ---
 
 ## Build (CI)
 
-Push sur `main` → GitHub Actions (`macos-14`) :
+Push sur `main` → GitHub Actions (`macos-15`) :
 
 ```
 xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=15.0 \
@@ -633,7 +634,7 @@ garder les CI intermediaires a 13) puis `42228689116`, `42229341246`,
 en `generalPasteboard`) puis `42231209238` et `42238509100` succes,
 **13 warnings identiques**.
 
-### Vague 10-7 (build actuel) — purge du keychain hérité (compte fantôme)
+### Vague 10-7 — purge du keychain hérité (compte fantôme)
 
 **Symptome.** Un compte fantôme (`61516395224`) revient a chaque
 connexion, et la creation d'un compte plante a la saisie du prenom.
@@ -694,3 +695,49 @@ binaire Instagram **byte-identique** a la reference (sha256
 (`check_markers.py`). CI : runs `42265851626` puis `42271788266`
 (revue finale : purge sur les 2 classes) succes, **13 warnings
 identiques** a chaque run.
+
+### Vague 11 (build actuel) — base 449 + purge fantome etendue
+
+**Base 449 reconstruite.** L'IPA repart de l'app **449.0.0** de l'IPA
+RyukGram qui fonctionne sur l'appareil (et non de la 454) : 2079 fichiers /
+483 719 507 o, artefacts retires, 4 slots faibles reecrits en place (1
+`Peter.dylib` + 3 `NWSupport.dylib` absents), binaire sha256
+`b3f98e67...`. Meme infrastructure d'injection, meme dylib.
+
+**Purge du fantome etendue.** En plus des items `_ryg_` (w10-7), la purge
+cible desormais les **familles natives** qui memorisent le dernier compte
+(`device_based_login.growth`, `cloud_based_login.growth`,
+`persistent_accounts.growth`, `com.instagram.users.persistent_accounts`,
+`com.instagram.users.last_logged_in_user_pk`, `last_logged_in_user_pk`) et
+le compte injecte par l'ancien shim (`"zx" + "PluginsInjectGenericEntry"`).
+Le PK fantome est construit par arithmetique (aucun litteral) ; un item de
+famille est supprime seulement si sa data contient le PK en ASCII **ou** en
+entier 8 octets BE/LE ; un item partage qui contient le PK est supprime
+**en entier** (pas de reecriture de blob). Les prefs correspondantes sont
+nettoyees en defense en profondeur. `NWKeychainPurgeLegacy` et
+`NWKeychainPurgeGhost` remontent un statut de completude : le flag de boot
+`nw9_kcpurge_done` n'est ecrit que si `okL && okG`.
+
+**Declencheurs et preuve.** Boot 12 s, Reset (synchrone avant `exit(0)`) et
+bouton **Device identity > Purge stale keychain** (compteur legacy + ghost
+dans l'alerte). La forensique affiche `SESSION FORENSICS w11` et
+`4) keychain: N items (L legacy, G ghost)`, avec `LEGACY ITEMS PRESENT` /
+`GHOST ITEMS PRESENT` tant qu'il en reste ; son flag est build-keyed
+(`nw9_forensics_done` contient `NWBuildID`), donc la preuve se rejoue apres
+chaque bump.
+
+**IPA publiee (release `nine9wham`)** : `nine9wham_instagram_449.ipa` —
+**243 899 449 octets**, sha256
+`6a3fafabeaeb7d0095ad09123da02c2a69c219dc9b33f36c1cede7767ba270f8`.
+Verifiee `verify_ipa.py` (RESULT: OK) : **2080 fichiers**, `cryptid=0`,
+**152 dylibs** (1 Peter + 3 NWSupport), hash binaire
+`b3f98e67...`, `Peter.dylib` **574 896 o** contenant `w11` et `kc-ghost`,
+**0 residu RyukGram** (balayage des 2080 fichiers). CI : run `42306690637`
+succes, **13 warnings identiques** a la reference.
+
+**Test appareil (a confirmer).** Installer avec Sideloadly ; apres 12 s la
+forensique doit afficher `SESSION FORENSICS w11` puis
+`0 legacy, 0 ghost`. Relancer : le compte fantome ne doit plus revenir.
+Creer un compte et saisir le prenom. Si le crash persiste, le bloc `CRASH`
+du Report (**Copy all**) + une capture d'ecran sont la piece obligatoire :
+aucun fix speculatif n'a ete applique.
