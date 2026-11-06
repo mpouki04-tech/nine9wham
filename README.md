@@ -350,3 +350,55 @@ comptes se retrouvent connectes sans en recreer un seul).
 `@executable_path/Frameworks`, `Peter.dylib` **533 776 o** contenant `w10-1`,
 aucun residu RyukGram. CI : run `42128074601`, succes, **13 warnings**
 (identiques a la reference).
+
+### Vague 10-2
+
+**Cause racine (preuve binaire) : App Attest / DeviceCheck.** Instagram 454
+embarque `FBAppAttestationKit`, `AttestationReceiptKit`,
+`AttestationKeystore.swift`, `KeychainReceiptStorage.swift`, `DCDevice`
+(x34), `DCAppAttestService` (x4) et les jobs
+`IGAppJobStartAttestationReceipts` / `IGAppJobAttestationReceiptsAfterWarmStart`.
+Son keystore vit dans le groupe **`group.com.facebook.family.appattestation`**.
+Notre fix ne fournissait que `group.com.burbn.instagram` : conteneur absent,
+keystore nil, crash a la saisie du prenom. Le shim de l'IPA RyukGram (qui cree
+les comptes) gere n'importe quel groupe et bloque l'attestation.
+
+**Tous les groupes d'app Meta sont fournis.** `NWAppGroupIDs()` liste les 13
+groupes releves dans Instagram + FBSharedFramework (`group.com.burbn.instagram`,
+`.family`, `group.com.facebook.family[.appattestation]`,
+`instagramtokenshare.*`, `Bishop`, `Messenger`, `msysstorage`, `lantern`,
+`group.metaplatforms.family`, `group.meta.*`). `containerURLForSecurityApplicationGroupIdentifier:`,
+`LSBundleProxy.groupContainerURLs` et `CKEntitlements` les resolvent tous vers
+un conteneur sandbox cree a la demande.
+
+**Keychain : dernier repli sans access group.** Si `SecItemAdd/CopyMatching/
+Update/Delete` renvoie encore `-34018` (`errSecMissingEntitlement`) ou `-50`
+(`errSecParam`) — et `-25300` en lecture — la requete est rejouee SANS
+`kSecAttrAccessGroup` : le systeme attribue alors le groupe par defaut du
+certificat, toujours autorise.
+
+**Attestation Apple bloquee PAR DEFAUT.** Une app sideloadee n'a jamais
+l'entitlement `com.apple.developer.devicecheck.appattest-environment`,
+l'attestation ne peut donc pas aboutir. `+[DCDevice isSupported]` et
+`+[DCAppAttestService isSupported]` repondent **NO**, et
+`generateTokenWithCompletionHandler:`, `generateKeyWithCompletionHandler:` et
+`attestKey:clientDataHash:completionHandler:` repondent une erreur. Instagram
+suit alors ses chemins `appAttestationNotSupported` / `attestation_unsupported`
+au lieu d'un keystore vide. Le reglage reste basculable dans le pill
+(Device identity -> *Block Apple attestation*).
+
+**Suites NSUserDefaults des groupes.** `initWithSuiteName:` (et la variante
+privee `initWithSuiteName:container:`) redirige toute suite `group.*` — sauf
+`group.com.apple.*` — vers `nw9.<conteneur>.<suite>`, propre au conteneur : le
+SDK Facebook retrouve un magasin partage fonctionnel la ou le sideloading
+renvoyait nil, sans melanger les conteneurs.
+
+**IPA publiee (release `nine9wham`)** : `nine9wham_instagram_454.ipa` —"
+**343 781 524 octets**, sha256
+`8dac6d4d2a953c2aac8d040988b3ed3cc1ca5c161a50b56ccf2b2b3a13e48bb4`
+(digest GitHub identique). Contenu verifie : 3258 fichiers, 23
+`LC_LOAD_WEAK_DYLIB` dont `@rpath/Peter.dylib` (+ `@rpath/NWSupport.dylib`
+non fourni, comme dans l'IPA de reference), `cryptid=0`, binaire Instagram
+**byte-identique** a w10-1 (sha256 `fdf2faf8...`), `Peter.dylib`
+**534 752 o** contenant `w10-2` et les nouveaux hooks, aucun residu RyukGram.
+CI : run `42142236664`, succes, **13 warnings** (identiques a la reference).
