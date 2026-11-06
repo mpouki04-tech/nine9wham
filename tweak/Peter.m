@@ -1082,7 +1082,7 @@ static void NWRebindGOT(void) {
         if (mh) NWRbImage(mh, _dyld_get_image_vmaddr_slide(i));
     }
     _dyld_register_func_for_add_image(NWRbImage);
-    NWLog("rebind app : 8 cibles SecItem*/SecTask/sysctl/uname, %u images balayees + add_image arme", n);
+    NWLog("rebind app : 10 cibles (SecItem*/SecTask/sysctl/uname/NSLog/NSLogv), %u images balayees + add_image arme", n);
 }
 
 #pragma mark - Fake GPS (localisation par conteneur)
@@ -1408,14 +1408,21 @@ static NSString *NWReportPath(void) {
 static int NWReportFD = -1;               // -1 = pas encore ouvert
 static char NWReportPathC[1024] = "";     // chemin C (handler signal, si besoin)
 static pthread_mutex_t NWReportLock = PTHREAD_MUTEX_INITIALIZER;
+static void NWReportMaybeRotate(void);    // definition plus bas (rotation)
 
 // Ouverture lazy + idempotente. Un marqueur de session est append a chaque
 // lancement : le fichier peut contenir plusieurs sessions, separables.
+// SOUS LOCK (revue finale F2) : deux threads sur la premiere ligne feraient
+// deux open() — un fd fuite + un marqueur duplique.
 static void NWReportOpen(void) {
-    if (NWReportFD >= 0) return;
+    pthread_mutex_lock(&NWReportLock);
+    if (NWReportFD >= 0) { pthread_mutex_unlock(&NWReportLock); return; }
     NSString *p = NWReportPath();
     NWReportFD = open(p.fileSystemRepresentation, O_WRONLY | O_APPEND | O_CREAT, 0644);
-    if (NWReportFD < 0) return;   // silencieux : la console NSLog continue
+    if (NWReportFD < 0) {   // silencieux : la console NSLog continue
+        pthread_mutex_unlock(&NWReportLock);
+        return;
+    }
     strncpy(NWReportPathC, p.fileSystemRepresentation ?: "", sizeof(NWReportPathC) - 1);
     NWReportPathC[sizeof(NWReportPathC) - 1] = '\0';
     @try {
@@ -1424,15 +1431,23 @@ static void NWReportOpen(void) {
         NSData *d = [hdr dataUsingEncoding:NSUTF8StringEncoding];
         if (d.length) { ssize_t w = write(NWReportFD, d.bytes, d.length); (void)w; }
     } @catch (NSException *e) { (void)e; }
+    pthread_mutex_unlock(&NWReportLock);
+    // Revue finale F5 : rotation verifiee AU BOOT (pas seulement au flush
+    // 15 s) — appel hors lock (ReadTail reprend le verrou lui-meme).
+    NWReportMaybeRotate();
 }
 
-// Lecture des N derniers octets du rapport (0 = tout). C pur via open/pread :
-// pas de NSFileHandle (methodes legacy = risque de warning -Wdeprecated).
+// Lecture des N derniers octets du rapport (0 = tout). C pur via open/lseek/
+// read : pas de NSFileHandle (methodes legacy = risque de warning
+// -Wdeprecated). SOUS LOCK (revue finale F1) : une ligne est ecrite en 3
+// write() — sans verrou, un lecteur s'arrete au milieu d'un caractere et
+// le decodage UTF-8 echoue. Aucun chemin d'appel ne tient deja le verrou.
 static NSData *NWReportReadTail(unsigned long long n) {
+    pthread_mutex_lock(&NWReportLock);
     int fd = open(NWReportPath().fileSystemRepresentation, O_RDONLY);
-    if (fd < 0) return nil;
+    if (fd < 0) { pthread_mutex_unlock(&NWReportLock); return nil; }
     off_t sz = lseek(fd, 0, SEEK_END);
-    if (sz < 0) { close(fd); return nil; }
+    if (sz < 0) { close(fd); pthread_mutex_unlock(&NWReportLock); return nil; }
     unsigned long long off = (n && (unsigned long long)sz > n)
         ? (unsigned long long)sz - n : 0;
     lseek(fd, (off_t)off, SEEK_SET);
@@ -1441,6 +1456,7 @@ static NSData *NWReportReadTail(unsigned long long n) {
     ssize_t r;
     while ((r = read(fd, buf, sizeof(buf))) > 0) [d appendBytes:buf length:(NSUInteger)r];
     close(fd);
+    pthread_mutex_unlock(&NWReportLock);
     return d;
 }
 
@@ -1460,7 +1476,9 @@ static void NWReportAppendLine(const char *tag, NSString *msg) {
                          tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
                          (int)(ts.tv_nsec / 1000000L), tag ?: "?");
         NSData *body = [msg dataUsingEncoding:NSUTF8StringEncoding];
-        if (n <= 0 || !body) return;
+        // Revue finale F4 : snprintf renvoie la longueur VOULUE — bornage
+        // strict avant write() (sinon lecture au-dela du tampon si tag long).
+        if (n <= 0 || n >= (int)sizeof(head) || !body) return;
         // Lock uniquement autour des write() : aucune exception possible
         // entre lock et unlock (sinon le mutex resterait pris).
         pthread_mutex_lock(&NWReportLock);
@@ -1488,7 +1506,8 @@ static void NWReportAppendRaw(NSString *text) {
 }
 
 // Rotation : au-dela de 2 Mo on garde le Mo final (apercu + copie restent
-// utilisables, le fichier ne grossit plus). Appelée au boot et au flush 15 s.
+// utilisables, le fichier ne grossit plus). Appelée au boot (NWReportOpen)
+// et au flush 15 s.
 static void NWReportMaybeRotate(void) {
     if (NWReportFD < 0) return;
     @try {
@@ -1498,6 +1517,18 @@ static void NWReportMaybeRotate(void) {
         if (sz <= 2000000ULL) return;
         NSData *tail = NWReportReadTail(1000000ULL);
         if (!tail.length) return;
+        // Revue finale F1 : l'offset sz-1000000 tombe au milieu d'un
+        // octet UTF-8 ET au milieu d'une ligne — le fichier repartirait
+        // par un caractere coupe et TOUT decodage UTF-8 ulterieur
+        // echouerait (FullText -> "(empty)"). On aligne la queue sur la
+        // frontiere de ligne : saut jusqu'au premier \n (0x0A ne peut pas
+        // apparaitre au sein d'un octet de suite UTF-8).
+        const uint8_t *tb = (const uint8_t *)tail.bytes;
+        NSUInteger tl = tail.length, skip = 0;
+        while (skip < tl && tb[skip] != '\n') skip++;
+        if (skip < tl) skip++;            // commencer APRES le \n
+        else skip = 0;                    // aucune ligne complete : tel quel
+        if (skip) tail = [tail subdataWithRange:NSMakeRange(skip, tl - skip)];
         pthread_mutex_lock(&NWReportLock);
         ftruncate(NWReportFD, 0);
         const char *mark = "--- rotated ---\n";
@@ -1519,9 +1550,11 @@ static void NWReportClear(void) {
     pthread_mutex_unlock(&NWReportLock);
 }
 
-// Apercu pour l'onglet Report : 60 000 derniers octets. Si la lecture est
-// partielle, la premiere ligne (potentiellement coupee au milieu d'un
-// caractere UTF-8) est ecartee — l'apercu commence par un timestamp complet.
+// Apercu pour l'onglet Report : 60 000 derniers octets. La premiere ligne
+// (potentiellement coupee au milieu d'un caractere UTF-8) est ecartee au
+// niveau OCTETS avant tout decodage (revue finale F1 : decoder d'abord
+// echoue sur octet invalide -> "(empty)"). Repli Latin-1 si malgre tout
+// le decodage echoue (jamais d'octet invalide en Latin-1).
 static NSString *NWReportPreview(void) {
     @try {
         NSDictionary *at = [[NSFileManager defaultManager]
@@ -1529,32 +1562,37 @@ static NSString *NWReportPreview(void) {
         unsigned long long sz = [at[NSFileSize] unsignedLongLongValue];
         NSData *d = NWReportReadTail(60000ULL);
         if (!d.length) return @"(empty)";
-        NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-        if (!s.length) return @"(empty)";
         if (sz > 60000ULL) {
-            NSRange nl = [s rangeOfString:@"\n"];
-            if (nl.location != NSNotFound && nl.location + 1 < s.length)
-                s = [s substringFromIndex:nl.location + 1];
+            const uint8_t *b = (const uint8_t *)d.bytes;
+            NSUInteger i = 0, len = d.length;
+            while (i < len && b[i] != '\n') i++;   // 0x0A = frontiere UTF-8 sure
+            if (i + 1 < len) d = [d subdataWithRange:NSMakeRange(i + 1, len - i - 1)];
         }
-        return s;
+        NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+        if (!s.length) s = [[NSString alloc] initWithData:d encoding:NSISOLatin1StringEncoding];
+        return s.length ? s : @"(empty)";
     } @catch (NSException *e) {
         return [NSString stringWithFormat:@"(read error: %@)", e.reason];
     }
 }
 
 // Texte complet pour « Copier tout » : rapport entier + rapport de crash.
+// Repli Latin-1 (revue finale F1) : un seul octet mal aligne ne doit JAMAIS
+// transformer « tout le rapport » en "(empty)".
 static NSString *NWReportFullText(void) {
     @try {
         NSMutableString *out = [NSMutableString string];
         NSData *rep = [NSData dataWithContentsOfFile:NWReportPath()];
         if (rep.length) {
             NSString *s = [[NSString alloc] initWithData:rep encoding:NSUTF8StringEncoding];
+            if (!s) s = [[NSString alloc] initWithData:rep encoding:NSISOLatin1StringEncoding];
             if (s) [out appendString:s];
         }
         NSData *crash = [NSData dataWithContentsOfFile:NWCrashLogPath()];
         if (crash.length) {
             [out appendString:@"\n\n=== nine9wham_crash.log ===\n"];
             NSString *cs = [[NSString alloc] initWithData:crash encoding:NSUTF8StringEncoding];
+            if (!cs) cs = [[NSString alloc] initWithData:crash encoding:NSISOLatin1StringEncoding];
             if (cs) [out appendString:cs];
         }
         return out.length ? out : @"(empty)";
@@ -5008,7 +5046,7 @@ static void NWEnsureDevPill(UIView *root) {
         @"location": @"Location Spoofer", @"orbit": @"Location Spoofer",
         @"ghost": @"Ghost", @"containers": @"Containers",
         @"proxy": @"Proxy", @"changelog": @"Changelog",
-        @"report": @"Report",
+        @"report": NWL(@"rp_title", @"Report", @"Rapport", @"Informe"),
         @"support": @"Support", @"reset": @"Reset",
         @"deviceid": @"Device identity",
     };
@@ -5562,7 +5600,7 @@ static void NWStartSpin(UIImageView *v) {
         @[@"Containers", @"square.stack.3d.up.fill", @"containers", NWAccent()],
         @[@"App & Device", @"iphone", @"device", NWBlue()],
         @[@"Changelog", @"note.text", @"changelog", NWDim()],
-        @[@"Report", @"doc.text", @"report", NWAccent()],
+        @[NWL(@"rp_grid", @"Report", @"Rapport", @"Informe"), @"doc.text", @"report", NWAccent()],
     ];
 
     for (NSUInteger i = 0; i < mods.count; i += 2) {
@@ -7220,7 +7258,7 @@ static void NWStartSpin(UIImageView *v) {
 - (void)buildReport {
     __weak typeof(self) weakSelf = self;
 
-    [self addSection:@"Report"];
+    [self addSection:NWL(@"rp_sec", @"Report", @"Rapport", @"Informe")];
     UILabel *hint = NWLabelMake(NWL(@"rp_hint", @"Full log — copy it and send it as is.",
                                     @"Journal complet — copiez-le tel quel et envoyez-le.",
                                     @"Registro completo — cópialo tal cual y envíalo."),
@@ -7246,7 +7284,8 @@ static void NWStartSpin(UIImageView *v) {
     // Copier tout : rapport complet + fichier de crash.
     [self addRow:card icon:@"doc.on.doc"
            title:NWL(@"rp_copy", @"Copy all", @"Tout copier", @"Copiar todo")
-           value:@"Report + crash log" action:^{
+           value:NWL(@"rp_val_c", @"Report + crash log",
+                     @"Rapport + journal de crash", @"Informe + registro de crash") action:^{
         NSString *t = NWReportFullText();
         [UIPasteboard generalPasteboard].string = t;
         NWAlert(NWL(@"rp_cop_t", @"Copied", @"Copié", @"Copiado"),
@@ -7261,7 +7300,8 @@ static void NWStartSpin(UIImageView *v) {
     UIView *shareAnchor = self.view;
     [self addRow:card icon:@"square.and.arrow.up"
            title:NWL(@"rp_share", @"Share", @"Partager", @"Compartir")
-           value:@"Send the report" action:^{
+           value:NWL(@"rp_val_s", @"Send the report",
+                     @"Envoyer le rapport", @"Enviar el informe") action:^{
         __strong typeof(weakSelf) self2 = weakSelf;
         if (!self2) return;
         UIActivityViewController *av = [[UIActivityViewController alloc]
@@ -7276,7 +7316,8 @@ static void NWStartSpin(UIImageView *v) {
     // Effacer : confirmation en 3 voies (rapport / tout / annuler).
     [self addRow:card icon:@"trash.fill"
            title:NWL(@"rp_clear", @"Clear", @"Effacer", @"Borrar")
-           value:@"Erase report" action:^{
+           value:NWL(@"rp_val_e", @"Erase report",
+                     @"Effacer le rapport", @"Borrar informe") action:^{
         __strong typeof(weakSelf) self2 = weakSelf;
         if (!self2) return;
         UIAlertController *a = [UIAlertController
