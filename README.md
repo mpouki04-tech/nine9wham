@@ -512,7 +512,7 @@ reference (sha256 `fdf2faf8...`), `Peter.dylib` **535 632 o** contenant
 puis `42208711359` (nettoyage), succes, **13 warnings** (identiques : memes
 types, decalages +21 / +76 exactement expliques par les insertions).
 
-### Vague 10-5 (build actuel) — meme compte partout + reset sans effet : 3 causes prouvees
+### Vague 10-5 — meme compte partout + reset sans effet : 3 causes prouvees
 
 **Symptomes.** Apres la 10-4 : (1) un compte est la par defaut au
 lancement ; (2) « Reset everything » n'efface pas le compte ; (3) un
@@ -571,3 +571,58 @@ dylibs, binaire Instagram **byte-identique** a la reference (sha256
 echecs de compilation WebKit, corriges par appels dynamiques) puis
 `42220002658` (forward declaration) puis `42220162701` succes, **13
 warnings identiques** (memes types, seuls les numeros de ligne ont bouge).
+
+### Vague 10-6 (build actuel) — onglet Report : journal persistant complet
+
+**Symptome.** L'app plante a l'entree du nom a la creation d'un compte —
+et tout diagnostic exigeait de REJOUER le plantage devant soi pour le
+photographier : les logs tenaient en memoire (NSLog = console, ephemere)
+et le rapporteur de crash ECRASAIT le fichier a chaque exception. Il
+fallait un journal complet, sur disque, survivant au crash, copiable en
+un geste.
+
+**Causes.**
+- `NWLog` (notre macro) n'ecrivait que `NSLog` : rien n'etait conserve
+  au-dela du processus.
+- Les `NSLog`/`NSLogv` du code Instagram n'etaient pas captes du tout.
+- `NWCrashExceptionHandler` faisait `writeToFile:atomically:` — chaque
+  nouveau crash **remplaçait** le precedent (pas d'historique), et le
+  bloc signal n'etait ecrit que dans `nine9wham_crash.log`, pas dans un
+  journal lu par l'UI.
+
+**Mecanique.**
+- **Moteur persistant** : fd `O_APPEND` ouvert en permanence sur
+  `Documents/nine9wham_report.txt`, chaque ligne en `write()` direct
+  (aucun buffer stdio : la derniere ligne avant le plantage est deja sur
+  disque), verrou mutex, rotation a 2 Mo (garde le Mo final) au flush
+  15 s. Marqueur `=== session ... (build w10-6) ===` a chaque lancement.
+- **`NWLog` reecrit** : la macro appelle `NWLogImpl` qui append `[NW]`
+  puis logge en console comme avant.
+- **Rebind `NSLog`/`NSLogv`** (table `NWRbTargets` 8 -> 10) : le code
+  Instagram append en `[IG]` ; garde `__thread NWInReportHook` contre la
+  recursion (notre image reste exclue du rebind).
+- **Crashs appendes** : handler de signal en miroir (`NWCrashWBoth`
+  ecrit sur le fichier de crash ET sur le rapport, paires `write()`
+  pures, aucun lock), exception ObjC en append (plus d'ecrasement) sur
+  le rapport ET `nine9wham_crash.log`.
+- **Onglet Report** (grille du dashboard, apres Changelog) : apercu 60
+  000 derniers octets (1re ligne partielle ecartee — jamais de caractere
+  UTF-8 coupe), **Copy all** (rapport complet + crash log dans le
+  presse-papier), **Share** (popover ancre sur `self.view`, hors bloc),
+  **Clear** (rapport seul / tout / annuler).
+
+**Limites assumees.** `os_log` interne d'iOS reste hors portee (buffer
+systeme, non accessible sans entitlement) ; aucun upload réseau du
+rapport — c'est l'utilisateur qui le copie-colle.
+
+**IPA publiee (release `nine9wham`)** : `nine9wham_instagram_454.ipa` —
+**343 796 384 octets**, sha256
+`c920614d79faf09998e1add3aad0838f677e85478c5416f39197abef19b68cd2`.
+Contenu verifie : 3258 fichiers, **0 residu RyukGram**, `cryptid=0`, 154
+dylibs, binaire Instagram **byte-identique** a la reference (sha256
+`fdf2faf8...`), `Peter.dylib` **556 544 o** contenant `w10-6` et
+`nine9wham_report.txt`. CI : runs `42227446636` (17 warnings — 4 helpers
+deplaces vers leurs tasks pour garder les CI intermediaires a 13) puis
+`42228689116`, `42229341246`, `42229938609`, `42230958480` (1 erreur
+`UIPasteboard.general`, corrigee en `generalPasteboard`) puis
+`42231209238` succes, **13 warnings identiques**.
