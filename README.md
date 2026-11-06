@@ -572,7 +572,7 @@ echecs de compilation WebKit, corriges par appels dynamiques) puis
 `42220002658` (forward declaration) puis `42220162701` succes, **13
 warnings identiques** (memes types, seuls les numeros de ligne ont bouge).
 
-### Vague 10-6 (build actuel) — onglet Report : journal persistant complet
+### Vague 10-6 — onglet Report : journal persistant complet
 
 **Symptome.** L'app plante a l'entree du nom a la creation d'un compte —
 et tout diagnostic exigeait de REJOUER le plantage devant soi pour le
@@ -632,3 +632,60 @@ garder les CI intermediaires a 13) puis `42228689116`, `42229341246`,
 `42229938609`, `42230958480` (1 erreur `UIPasteboard.general`, corrigee
 en `generalPasteboard`) puis `42231209238` et `42238509100` succes,
 **13 warnings identiques**.
+
+### Vague 10-7 (build actuel) — purge du keychain hérité (compte fantôme)
+
+**Symptome.** Un compte fantôme (`61516395224`) revient a chaque
+connexion, et la creation d'un compte plante a la saisie du prenom.
+Rien dans NOTRE build n'ecrit ces items : `check_markers.py` prouve que
+l'IPA w10-6 embarquait **0 marqueur** `_ryg_` (binaire Instagram +
+`Peter.dylib` : ni `ryg_`, ni `activeaccount`, ni le compte fantome).
+
+**Cause prouvee.** L'héritage vient de l'ancienne IPA RyukGram :
+`NoPluginsPatch.dylib` (shim « SideloadPatch ») fishhookait `SecItem*`
+avec les prefixes `_ryg_` / `group.ryukgram.default`. Les items écrits
+alors **survivent a la re-install** (keychain partage par team Apple ID)
+— d'ou la resurrection permanente. Le Reset ne les effaçait pas (il ne
+touche que conteneurs/prefs/vault), et aucun dylib RyukGram n'existe
+dans notre IPA (conflit de tweak écarte).
+
+**Mecanique.**
+- **`NWKeychainIsLegacyKC`** : marqueur `ryg_` / `ryuk` construit
+  lettre par lettre (`'r','y','g','_'` — la chaine contiguee n'existe
+  jamais dans le binaire), test insensible a la casse sur
+  service/account/accessGroup.
+- **`NWKeychainPurgeLegacy(trigger)`** : enum `SecItemCopyMatching`
+  (generic passwords, `MatchLimitAll`), filtres dans l'ordre — pas de
+  marqueur -> ignore ; `nine9wham` -> skip vault ; sinon
+  `SecItemDelete` stricte (classe+service+account[+group]). Chaque item
+  loggue `[NW] kc-purge: [trigger] deleted service=… account=…` ->
+  preuve visible dans l'onglet Report.
+- **3 declencheurs** : (1) **boot 12 s**, une fois par build — flag
+  `Documents/nw9_kcpurge_done` contenant `NWBuildID` (`w10-7`), purge
+  **avant** la forensique ; (2) **Reset** (synchrone, avant `exit(0)`,
+  flag de purge efface aussi) ; (3) bouton **Device identity >
+  Purge legacy keychain** avec compteur dans l'alerte.
+- **Forensique enrichie** : inventaire COMPLET du keychain logue dans
+  le Report (`[NW] forensics: kc[i] service=… account=…` + marque
+  `LEGACY`), ligne 4 = `keychain N items (M legacy)`, mention
+  `LEGACY ITEMS PRESENT: M` tant qu'il en reste.
+
+**Risques assumes.** Items `group.ryukgram.default` invisibles a
+l'enumeration : suppression best-effort, aucun blocage. Item herite
+portant un mid encore valide : identite regeneree (« Roll a new
+fingerprint » en secours). Le crash prenom n'est PAS corrige
+speculativement : si la purge ne suffit pas, le bloc `CRASH` du Report
+(w10-6) est la piece manquante — **Copy all** et coller.
+
+**Tests.** (1) relancer l'app -> a 12 s la forensique affiche
+`0 legacy` ; (2) sinon Device identity > Purge legacy keychain ->
+`N legacy item(s) removed` puis relecture de la forensique ; (3) test du
+prenom a la creation d'un compte ; (4) en cas de crash : Report ->
+Copy all.
+
+**IPA publiee (release `nine9wham`)** : `nine9wham_instagram_454.ipa` —
+verifiee `verify_w10_7.py` (RESULT: OK) : `cryptid=0`, 154 dylibs,
+binaire Instagram **byte-identique** a la reference (sha256
+`fdf2faf8...`), `Peter.dylib` contenant `w10-7`, `nw9_kcpurge_done`,
+`kc-purge`, **0 residu RyukGram** (`check_markers.py`). CI : run
+`42265851626` succes, **13 warnings identiques**.
