@@ -449,7 +449,7 @@ binaire Instagram **toujours byte-identique** a la reference (sha256
 `SecTaskCopyValueForEntitlement`, aucun residu RyukGram. CI : run
 `42149924437`, succes, **13 warnings** (identiques, memes types).
 
-### Vague 10-4 (build actuel) — conteneurs isoles + crash elimine (garde de boot honnete)
+### Vague 10-4 — conteneurs isoles + crash elimine (garde de boot honnete)
 
 **Symptomes.** Depuis la vague 10-3 : (1) un compte « par defaut »
 reapparait a chaque lancement ; (2) choisir la langue d'un conteneur met
@@ -511,3 +511,63 @@ reference (sha256 `fdf2faf8...`), `Peter.dylib` **535 632 o** contenant
 `w10-4` et `SecTaskCopyValueForEntitlement`. CI : runs `42205864242`
 puis `42208711359` (nettoyage), succes, **13 warnings** (identiques : memes
 types, decalages +21 / +76 exactement expliques par les insertions).
+
+### Vague 10-5 (build actuel) — meme compte partout + reset sans effet : 3 causes prouvees
+
+**Symptomes.** Apres la 10-4 : (1) un compte est la par defaut au
+lancement ; (2) « Reset everything » n'efface pas le compte ; (3) un
+nouveau conteneur contient TOUJOURS le meme compte Instagram.
+
+**Causes (etablies par lecture du code, pas par essai).**
+- **RC1 — contamination apres bascule.** Apres un changement de conteneur,
+  Instagram reste connectee EN MEMOIRE dans le processus. Le timer de flush
+  (15 s) et `NWFlushOnExit` (arriere-plan/fermeture) appelaient
+  `NWSnapshotActive()` : la session de l'ancien conteneur etait COPIEE dans
+  le nouveau -> « le meme compte dans chaque conteneur ».
+- **RC2 — restauration trop tardive.** `NWStartUI` est lance par
+  `dispatch_async(main)` depuis le constructeur, mais `UIApplicationMain`
+  appelle `application:didFinishLaunching` AVANT de vider la file
+  principale : Instagram lisait cookies/prefs du magasin partag encore
+  sale AVANT notre restauration -> « compte par defaut » au lancement.
+- **RC3 — magasins hors swap.** Notre isolation n'echange que 2 magasins
+  (domaine du bundle + `NSHTTPCookieStorage`) alors que la session peut
+  vivre ailleurs : suites redirigees `nw9.<cid>.group.*`
+  (`Library/Preferences`, hors domaine du bundle), `WKWebsiteDataStore`
+  (cookies + localStorage des webviews) et surtout le **keychain**
+  (`FBKeychainItemController` / `UICKeyChainStore` en symboles du binaire)
+  — jamais isole par conteneur alors que l'UI le promet. « Reset
+  everything » ne touchait qu'aux 2 premiers magasins -> le compte
+  survivait.
+
+**Correctifs.**
+- **Anti-contamination** : flag `NWNoSnapshot` pose a la bascule — plus
+  AUCUN snapshot jusqu'au relancement (le flag est en memoire : il meurt
+  avec le processus, exactement la fenetre desiree).
+- **Restauration au constructeur** : etape 5 fait desormais
+  `NWLoadStateReadonly()` + `NWBootstrapState()` (best-effort `@try`, si
+  l'etat existe deja) SYNCHRONEMENT dans `NWStartCore` — donc AVANT que
+  Instagram ne lise le magasin partag ; second passage idempotent sur la
+  queue principale dans `NWStartUI`.
+- **Reset durci** : en plus de prefs + cookies + dossier nine9wham, le
+  reset supprime les plists `nw9.*`, purge le `WKWebsiteDataStore`
+  (appel dynamique : le SDK 18.5 n'expose pas `+defaultWebsiteDataStore`
+  dans le chemin d'inclusion) et le flag forensique ; `exit(0)` maintenu
+  (delai porte a 1,5 s).
+- **« Session forensics »** (nouveau, Reset du menu + affichage unique a
+  12 s) : inventorie les 6 magasins possibles (cookies partages, prefs
+  bundle, suites `nw9.*`, keychain, fichiers contenant `sessionid`/
+  `ds_user_id`, cookies webview) et rend un **VERDICT** — une capture
+  d'ecran suffit pour savoir ou vit la session (le keychain, non isole, est
+  le principal suspect : il n'est pas touche par le reset, machine id et
+  attestation dependants).
+
+**IPA publiee (release `nine9wham`)** : `nine9wham_instagram_454.ipa` —
+**343 790 378 octets**, sha256
+`dbd056f09ddb9fb210d8e0160d4b312b9342906298aca3ce8fcc17997bc7c625`.
+Contenu verifie : 3258 fichiers, **0 residu RyukGram**, `cryptid=0`, 154
+dylibs, binaire Instagram **byte-identique** a la reference (sha256
+`fdf2faf8...`), `Peter.dylib` **554 208 o** contenant `w10-5`,
+`SESSION FORENSICS` et `nw9_forensics_done`. CI : runs `42219059868` (2
+echecs de compilation WebKit, corriges par appels dynamiques) puis
+`42220002658` (forward declaration) puis `42220162701` succes, **13
+warnings identiques** (memes types, seuls les numeros de ligne ont bouge).
