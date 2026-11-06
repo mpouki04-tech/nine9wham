@@ -6972,10 +6972,16 @@ static void NWStartSpin(UIImageView *v) {
                 if ([[NSFileManager defaultManager] removeItemAtPath:[nwPrefDir stringByAppendingPathComponent:f] error:nil]) nwSuiteN++;
             }
         }
-        [[WKWebsiteDataStore defaultWebsiteDataStore]
-            removeDataOfTypes:[WKWebsiteDataStore allWebsiteDataTypes]
-            modifiedSince:[NSDate dateWithTimeIntervalSince1970:0]
-            completionHandler:^(NSError *e) { NWLog(@"reset donnees webview: %@", e ?: @"ok"); }];
+        id nwStore = NWWKDefaultDataStore();
+        SEL nwRm = sel_registerName("removeDataOfTypes:modifiedSince:completionHandler:");
+        if (nwStore && [nwStore respondsToSelector:nwRm]) {
+            ((void (*)(id, SEL, NSSet *, NSDate *, void (^)(void)))objc_msgSend)(
+                nwStore, nwRm, [WKWebsiteDataStore allWebsiteDataTypes],
+                [NSDate dateWithTimeIntervalSince1970:0],
+                ^{ NWLog(@"reset donnees webview: ok"); });
+        } else {
+            NWLog(@"reset donnees webview: WKWebsiteDataStore indisponible");
+        }
         NWLog(@"reset : %ld suite(s) nw9.* supprimee(s)", (long)nwSuiteN);
         // La forensique se rejoue au lancement suivant (flag en Documents).
         [[NSFileManager defaultManager]
@@ -7671,6 +7677,18 @@ static BOOL NWForensicLooksLikeSession(NSString *s) {
             [l containsString:@"cookie"] || [l containsString:@"instagram"]);
 }
 
+// Vague 10-5 : le SDK 18.5 n'expose pas +defaultWebsiteDataStore ni
+// -httpCookieStore dans le chemin d'inclusion de ce fichier (l'instance
+// removeDataOfTypes: est connue, pas ces deux-la) : on les appelle
+// dynamiquement via objc_msgSend — aucun warning, aucun lien
+// supplementaire (WebKit deja lie), meme comportement au runtime.
+static id NWWKDefaultDataStore(void) {
+    Class cls = NSClassFromString(@"WKWebsiteDataStore");
+    SEL s = sel_registerName("defaultWebsiteDataStore");
+    if (!cls || ![cls respondsToSelector:s]) return nil;
+    return ((id (*)(Class, SEL))objc_msgSend)(cls, s);
+}
+
 static void NWSessionForensicsShow(void) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSMutableString *rep = [NSMutableString stringWithString:@"SESSION FORENSICS w10-5\n"];
@@ -7772,12 +7790,23 @@ static void NWSessionForensicsShow(void) {
         // 6. WKWebsiteDataStore (magasin des webviews, asynchrone)
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
         __block NSArray *wkNames = nil;
-        [[WKWebsiteDataStore defaultWebsiteDataStore].httpCookieStore
-            getAllCookies:^(NSArray<NSHTTPCookie *> *cookies) {
-                wkNames = [cookies valueForKey:@"name"];
-                dispatch_semaphore_signal(sem);
-            }];
-        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)));
+        // Appels magasin en dynamique (voir NWWKDefaultDataStore) : le SDK
+        // n'expose ni +defaultWebsiteDataStore ni -httpCookieStore ici.
+        id nwStore = NWWKDefaultDataStore();
+        id nwCK = nwStore
+            ? ((id (*)(id, SEL))objc_msgSend)(nwStore, sel_registerName("httpCookieStore"))
+            : nil;
+        SEL nwGet = sel_registerName("getAllCookies:");
+        if (nwCK && [nwCK respondsToSelector:nwGet]) {
+            ((void (*)(id, SEL, void (^)(NSArray *)))objc_msgSend)(nwCK, nwGet,
+                ^(NSArray *cookies) {
+                    wkNames = [cookies valueForKey:@"name"];
+                    dispatch_semaphore_signal(sem);
+                });
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)));
+        } else {
+            wkNames = @[];
+        }
         BOOL wkSid = NO;
         for (NSString *n in wkNames) if ([n.lowercaseString isEqualToString:@"sessionid"]) wkSid = YES;
         [rep appendFormat:@"6) webview cookies: %lu (sessionid=%@)\n",
