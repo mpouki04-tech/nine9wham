@@ -9485,6 +9485,20 @@ static void NWPresentLastCrashAlert(void) {
 //  - NWStartUI : bouton flottant + pill, timers de maintenance, alertes —
 //    tout ce qui exige le run loop principal, planifie juste apres sur la
 //    queue principale.
+// ---------------------------------------------------------------------------
+// DIAGNOSTIC (bisect du crash au lancement) --------------------------------
+// NW_DIAG_MAXSTEP borne le deroulement du noyau : le noyau s'arrete apres
+// l'etape N (1 = rapporteur, 3 = sideload fix, 4 = identity, 5 = etat,
+// 6 = empreinte+GPS, 7 = rebind GOT, 8 = proxy NSURLSession).
+// L'UI est desactivee pour toute valeur < 99.
+//
+// Par defaut 99 : comportement STRICTEMENT identique a la production
+// (le #if ci-dessous est donc compile hors, aucun warning ajoute).
+// ---------------------------------------------------------------------------
+#ifndef NW_DIAG_MAXSTEP
+#define NW_DIAG_MAXSTEP 99
+#endif
+
 static void NWStartCore(void) {
     @autoreleasepool {
         NWBootBegin();
@@ -9526,7 +9540,7 @@ static void NWStartCore(void) {
         //     le flag one-shot « Hide button until relaunch » du pill.
         //     Le scan global des classes (getDeviceId) est DIFFERE de 6 s
         //     (etape 9) : c'est l'operation la plus lourde du tweak.
-        if (!NWBootSkip(4)) NWInstallDeviceIdentity();
+        if (!NWBootSkip(4) && NW_DIAG_MAXSTEP >= 4) NWInstallDeviceIdentity();
         NWBootMark(4);
 
         NWLog("demarrage - Instagram %@", UIDevice.currentDevice.systemVersion);
@@ -9542,7 +9556,7 @@ static void NWStartCore(void) {
         //     magasin partag encore sale -> « compte par defaut » au lancement.
         //     On restaure ici (best-effort, @try) puis de nouveau sur la queue
         //     principale (idempotent) : les deux passages doivent passer.
-        if (!NWBootSkip(5)) {
+        if (!NWBootSkip(5) && NW_DIAG_MAXSTEP >= 5) {
             NWLoadStateReadonly();
             // Uniquement si l'etat existe deja : la CREATION d'un premier
             // conteneur (empreinte, UIDevice) reste sur la queue principale.
@@ -9556,7 +9570,7 @@ static void NWStartCore(void) {
         NWBootMark(5);
 
         // --- Etape 6. Hooks d'empreinte + fake GPS
-        if (!NWBootSkip(6)) {
+        if (!NWBootSkip(6) && NW_DIAG_MAXSTEP >= 6) {
             @try {
                 NWInstallFingerprintHooks();
                 NWInstallLocationHooks();
@@ -9567,14 +9581,14 @@ static void NWStartCore(void) {
         NWBootMark(6);
 
         // --- Etape 7. Rebind GOT (SecItem*/sysctl/uname, images de l'app)
-        if (!NWBootSkip(7)) {
+        if (!NWBootSkip(7) && NW_DIAG_MAXSTEP >= 7) {
             @try { NWRebindGOT(); }
             @catch (NSException *e) { NWLog("rebind GOT: %@", e.reason); }
         }
         NWBootMark(7);
 
         // --- Etape 8. Proxy NSURLSession
-        if (!NWBootSkip(8)) {
+        if (!NWBootSkip(8) && NW_DIAG_MAXSTEP >= 8) {
             @try {
                 NWSwizzle(object_getClass([NSURLSessionConfiguration class]),
                           @selector(defaultSessionConfiguration),
@@ -9594,6 +9608,12 @@ static void NWStartCore(void) {
 // initialisateurs dyld, aucune fenetre d'application n'existe encore.
 static void NWStartUI(void) {
     @autoreleasepool {
+#if NW_DIAG_MAXSTEP < 99
+        // Variante de diagnostic : aucune UI, aucun timer, aucune restauration
+        // d'etat. On isole ainsi le noyau (constructeur) du reste.
+        NWLog("DIAG: NWStartUI desactive (NW_DIAG_MAXSTEP=%d)", NW_DIAG_MAXSTEP);
+        return;
+#endif
         // SAFE MODE : aucun hook UI, aucune timer — alerte + fin de garde.
         if (NWSafeModeOn()) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),

@@ -10,11 +10,14 @@ on:
   workflow_dispatch:
     inputs:
       variant:
-        description: "Variante de build (full=publication, inert=diagnostic crash)"
+        description: "Variante de build (full=publication, inert/core*=diagnostic crash)"
         type: choice
         options:
           - full
           - inert
+          - core3
+          - core6
+          - core7
         default: full
 
 permissions:
@@ -40,13 +43,42 @@ jobs:
           V="${{ inputs.variant }}"
           if [ -z "$V" ]; then V=full; fi
           echo "VARIANT=$V" >> "$GITHUB_OUTPUT"
-          if [ "$V" = "inert" ]; then
-            echo "SRC=tweak/diag_inert.m" >> "$GITHUB_OUTPUT"
-            echo "OUT_TAG=diag" >> "$GITHUB_OUTPUT"
-          else
-            echo "SRC=tweak/Peter.m" >> "$GITHUB_OUTPUT"
-            echo "OUT_TAG=nine9wham" >> "$GITHUB_OUTPUT"
-          fi
+          case "$V" in
+            full)
+              echo "SRC=tweak/Peter.m" >> "$GITHUB_OUTPUT"
+              echo "CC_DEFS=" >> "$GITHUB_OUTPUT"
+              echo "OUT_IPA=nine9wham_instagram_449.ipa" >> "$GITHUB_OUTPUT"
+              echo "OUT_TAG=nine9wham" >> "$GITHUB_OUTPUT"
+              ;;
+            inert)
+              echo "SRC=tweak/diag_inert.m" >> "$GITHUB_OUTPUT"
+              echo "CC_DEFS=" >> "$GITHUB_OUTPUT"
+              echo "OUT_IPA=diag_inert_449.ipa" >> "$GITHUB_OUTPUT"
+              echo "OUT_TAG=diag" >> "$GITHUB_OUTPUT"
+              ;;
+            core3)
+              echo "SRC=tweak/Peter.m" >> "$GITHUB_OUTPUT"
+              echo "CC_DEFS=-DNW_DIAG_MAXSTEP=3" >> "$GITHUB_OUTPUT"
+              echo "OUT_IPA=diag_core3_449.ipa" >> "$GITHUB_OUTPUT"
+              echo "OUT_TAG=diag" >> "$GITHUB_OUTPUT"
+              ;;
+            core6)
+              echo "SRC=tweak/Peter.m" >> "$GITHUB_OUTPUT"
+              echo "CC_DEFS=-DNW_DIAG_MAXSTEP=6" >> "$GITHUB_OUTPUT"
+              echo "OUT_IPA=diag_core6_449.ipa" >> "$GITHUB_OUTPUT"
+              echo "OUT_TAG=diag" >> "$GITHUB_OUTPUT"
+              ;;
+            core7)
+              echo "SRC=tweak/Peter.m" >> "$GITHUB_OUTPUT"
+              echo "CC_DEFS=-DNW_DIAG_MAXSTEP=7" >> "$GITHUB_OUTPUT"
+              echo "OUT_IPA=diag_core7_449.ipa" >> "$GITHUB_OUTPUT"
+              echo "OUT_TAG=diag" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "variante inconnue: $V" >&2
+              exit 1
+              ;;
+          esac
           echo "variante: $V"
 
       - name: Telecharger la base IPA (release asset "base")
@@ -63,6 +95,8 @@ jobs:
           test -f "$RUNNER_TEMP/base/$BASE_IPA"
 
       - name: Compiler Peter.dylib (arm64, iOS)
+        env:
+          CC_DEFS: ${{ steps.variant.outputs.CC_DEFS }}
         run: |
           set -euo pipefail
           mkdir -p build
@@ -77,6 +111,7 @@ jobs:
             -framework MapKit -framework CoreGraphics -framework QuartzCore \
             -framework WebKit \
             -framework UniformTypeIdentifiers \
+            $CC_DEFS \
             -o build/Peter.dylib \
             "${{ steps.variant.outputs.SRC }}"
           echo "--- infos dylib ---"
@@ -112,7 +147,7 @@ jobs:
         run: |
           set -euo pipefail
           WORK="$RUNNER_TEMP/ipa"
-          OUT="$RUNNER_TEMP/$OUT_IPA"
+          OUT="$RUNNER_TEMP/${{ steps.variant.outputs.OUT_IPA }}"
           rm -f "$OUT"
           cd "$WORK"
           # zip -r sans metadonnees Apple, ordre Payload/ en premier
@@ -139,9 +174,9 @@ jobs:
           fi
           gh release upload "$TAG" "$OUT" \
             --repo "$GITHUB_REPOSITORY" --clobber
-          echo "URL: https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$OUT_IPA"
+          echo "URL: https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/${{ steps.variant.outputs.OUT_IPA }}"
 
       - name: Lien de telechargement
         run: |
           echo "### @nine9wham" >> "$GITHUB_STEP_SUMMARY"
-          echo "IPA: https://github.com/$GITHUB_REPOSITORY/releases/download/$OUT_TAG/$OUT_IPA" >> "$GITHUB_STEP_SUMMARY"
+          echo "IPA: https://github.com/$GITHUB_REPOSITORY/releases/download/${{ steps.variant.outputs.OUT_TAG }}/${{ steps.variant.outputs.OUT_IPA }}" >> "$GITHUB_STEP_SUMMARY"
