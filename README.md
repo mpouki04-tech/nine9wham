@@ -100,7 +100,7 @@ Le fichier de backup est chiffre (mot de passe derive + chiffre symetrique). San
 ## Installer
 
 1. Télécharger l'IPA : **[Release `nine9wham`](https://github.com/mpouki04-tech/nine9wham/releases/download/nine9wham/nine9wham_instagram_449.ipa)**
-   sha256 : `6a3fafabeaeb7d0095ad09123da02c2a69c219dc9b33f36c1cede7767ba270f8` (243 899 449 octets)
+   sha256 : `0a5fa18b727dd986a481db7303d81a96bad9c8dc817d725d95f6445b1c73f6c1` (243 899 449 octets)
 2. Ouvrir **Sideloadly** → sélectionner l'IPA → Install (certificat 7 jours, même Apple ID). Sideloadly est ici **uniquement** l'outil d'installation : aucune licence Blaze/Bumble n'est incluse.
 3. Lancer Instagram → le bouton **carré translucide (4 carrés)** apparaît **centré en bas**.
 
@@ -728,12 +728,26 @@ chaque bump.
 
 **IPA publiee (release `nine9wham`)** : `nine9wham_instagram_449.ipa` —
 **243 899 449 octets**, sha256
-`6a3fafabeaeb7d0095ad09123da02c2a69c219dc9b33f36c1cede7767ba270f8`.
+`0a5fa18b727dd986a481db7303d81a96bad9c8dc817d725d95f6445b1c73f6c1`.
 Verifiee `verify_ipa.py` (RESULT: OK) : **2080 fichiers**, `cryptid=0`,
 **152 dylibs** (1 Peter + 3 NWSupport), hash binaire
-`b3f98e67...`, `Peter.dylib` **574 896 o** contenant `w11` et `kc-ghost`,
-**0 residu RyukGram** (balayage des 2080 fichiers). CI : run `42306690637`
-succes, **13 warnings identiques** a la reference.
+`b3f98e67...`, `Peter.dylib` **574 896 o** (sha256 `2ca7e1e9...`) contenant
+`w11` et `kc-ghost`, **0 residu RyukGram** (balayage des 2080 fichiers).
+CI : runs `42306690637` puis `42328881796` succes, **13 warnings
+identiques** a chaque run.
+
+> Le sha256 de l'**archive** change a chaque republication du CI (le zip est
+> reconstruit avec de nouveaux timestamps) ; les hashs du **contenu** sont
+> stables : binaire `b3f98e67...`, `Peter.dylib` `2ca7e1e9...`. Pour
+> verifier une IPA telechargee : `python scripts/verify_ipa.py <ipa>`.
+
+**Tests.** `scripts/test_prepare_base.py` + `scripts/test_verify_ipa.py` =
+**9 tests verts** : reecriture des 4 slots, determinisme de la base,
+rejet des marqueurs `ryukgram` (insensible a la casse) et `activeaccount`
+(casse stricte, `ActiveAccount` accepte), rejet d'un **mauvais hash**,
+d'un **mauvais nombre de fichiers** (2079 au lieu de 2080) et d'un
+`Peter.dylib` sans `w11` — c'est ce qui fait echouer la CI **avant**
+publication si l'asset de base n'est pas la 449.
 
 **Test appareil (a confirmer).** Installer avec Sideloadly ; apres 12 s la
 forensique doit afficher `SESSION FORENSICS w11` puis
