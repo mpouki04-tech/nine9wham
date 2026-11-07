@@ -41,6 +41,13 @@ class VerifyTest(unittest.TestCase):
                        b"\xcf\xfa\xed\xfe" + b"w11 kc-ghost")
         return ipa
 
+    def _ipa_peter(self, td, binary, peter=b"\xcf\xfa\xed\xfe" + b"w11 kc-ghost"):
+        ipa = Path(td) / "test.ipa"
+        with zipfile.ZipFile(ipa, "w") as z:
+            z.writestr("Payload/Instagram.app/Instagram", binary)
+            z.writestr("Payload/Instagram.app/Frameworks/Peter.dylib", peter)
+        return ipa
+
     def test_case_sensitive_marker_rule(self):
         base = macho()
         with tempfile.TemporaryDirectory() as td:
@@ -51,6 +58,35 @@ class VerifyTest(unittest.TestCase):
             ok = base + b"ActiveAccount"   # casse stock Instagram : autorisee
             ipa = self._ipa(td, ok)
             verify(ipa, hashlib.sha256(ok).hexdigest(), 2, 152)
+
+    def test_rejects_wrong_hash(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = macho()
+            ipa = self._ipa(td, base)
+            wrong = hashlib.sha256(b"wrong").hexdigest()
+            with self.assertRaises(AssertionError) as ctx:
+                verify(ipa, wrong, 2, 152)
+            self.assertIn("sha256 binaire", str(ctx.exception))
+
+    def test_rejects_wrong_file_count(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = macho()
+            ipa = self._ipa(td, base)
+            # ajouter des fichiers factices pour atteindre 2080 fichiers
+            with zipfile.ZipFile(ipa, "a") as z:
+                for i in range(2078):
+                    z.writestr("Payload/Instagram.app/dummy%d" % i, b"x")
+            with self.assertRaises(AssertionError) as ctx:
+                verify(ipa, hashlib.sha256(base).hexdigest(), 2079, 152)
+            self.assertIn("fichiers: 2080 != 2079", str(ctx.exception))
+
+    def test_rejects_broken_peter(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = macho()
+            ipa = self._ipa_peter(td, base, b"\xcf\xfa\xed\xfe" + b"old build")
+            with self.assertRaises(AssertionError) as ctx:
+                verify(ipa, hashlib.sha256(base).hexdigest(), 2, 152)
+            self.assertIn("Peter.dylib ne contient pas w11", str(ctx.exception))
 
 
 if __name__ == "__main__":
