@@ -111,6 +111,20 @@ class PrepareBaseTest(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 verify_output(out, None, 2)
 
+            bad = make_binary(NEW_SLOTS) + b"activeaccount"
+            (app / "Instagram").write_bytes(bad)
+            out = Path(td) / "bad2.ipa"
+            build_ipa(app, out)
+            with self.assertRaises(AssertionError) as ctx:
+                verify_output(out, hashlib.sha256(bad).hexdigest(), 2)
+            self.assertIn("marqueur interdit dans le binaire", str(ctx.exception))
+
+            good = make_binary(NEW_SLOTS) + b"ActiveAccount"
+            (app / "Instagram").write_bytes(good)
+            out = Path(td) / "ok.ipa"
+            build_ipa(app, out)
+            verify_output(out, hashlib.sha256(good).hexdigest(), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
