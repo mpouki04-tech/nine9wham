@@ -7,7 +7,15 @@ on:
       - "tweak/**"
       - "scripts/**"
       - ".github/workflows/build.yml"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "Variante de build (full=publication, inert=diagnostic crash)"
+        type: choice
+        options:
+          - full
+          - inert
+        default: full
 
 permissions:
   contents: write
@@ -24,6 +32,22 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Choisir la variante
+        id: variant
+        run: |
+          set -euo pipefail
+          V="${{ inputs.variant }}"
+          if [ -z "$V" ]; then V=full; fi
+          echo "VARIANT=$V" >> "$GITHUB_OUTPUT"
+          if [ "$V" = "inert" ]; then
+            echo "SRC=tweak/diag_inert.m" >> "$GITHUB_OUTPUT"
+            echo "OUT_TAG=diag" >> "$GITHUB_OUTPUT"
+          else
+            echo "SRC=tweak/Peter.m" >> "$GITHUB_OUTPUT"
+            echo "OUT_TAG=nine9wham" >> "$GITHUB_OUTPUT"
+          fi
+          echo "variante: $V"
 
       - name: Telecharger la base IPA (release asset "base")
         env:
@@ -54,7 +78,7 @@ jobs:
             -framework WebKit \
             -framework UniformTypeIdentifiers \
             -o build/Peter.dylib \
-            tweak/Peter.m
+            "${{ steps.variant.outputs.SRC }}"
           echo "--- infos dylib ---"
           vtool -show build/Peter.dylib | sed -n '1,40p' || true
           file build/Peter.dylib
@@ -99,22 +123,23 @@ jobs:
       - name: Verifier l'IPA (structure + signature)
         run: |
           set -euo pipefail
-          python3 scripts/verify_ipa.py "$OUT"
+          python3 scripts/verify_ipa.py "$OUT" --variant "${{ steps.variant.outputs.VARIANT }}"
 
       - name: Publier l'IPA en release publique
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if ! gh release view "$OUT_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$OUT_TAG" \
+          TAG="${{ steps.variant.outputs.OUT_TAG }}"
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --title "@nine9wham - Instagram modifie (conteneurs + fake GPS)" \
               --notes "Build automatique. Installe via Sideloadly (cert 7 jours)."
           fi
-          gh release upload "$OUT_TAG" "$OUT" \
+          gh release upload "$TAG" "$OUT" \
             --repo "$GITHUB_REPOSITORY" --clobber
-          echo "URL: https://github.com/$GITHUB_REPOSITORY/releases/download/$OUT_TAG/$OUT_IPA"
+          echo "URL: https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$OUT_IPA"
 
       - name: Lien de telechargement
         run: |

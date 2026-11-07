@@ -90,7 +90,7 @@ def cmd_string(data, off):
 
 
 def verify(path, expected_sha256=EXPECTED_SHA256, expected_files=EXPECTED_FILES,
-           expected_dylibs=EXPECTED_DYLIBS):
+           expected_dylibs=EXPECTED_DYLIBS, variant="full"):
     with zipfile.ZipFile(path) as z:
         names = z.namelist()
         files = [
@@ -145,8 +145,12 @@ def verify(path, expected_sha256=EXPECTED_SHA256, expected_files=EXPECTED_FILES,
 
         peter_data = z.read(peter_name)
         assert struct.unpack_from("<I", peter_data, 0)[0] == MH_MAGIC_64, "Peter.dylib invalide"
-        assert b"w11" in peter_data, "Peter.dylib ne contient pas w11"
-        assert b"kc-ghost" in peter_data, "Peter.dylib ne contient pas kc-ghost"
+        if variant == "full":
+            # Le build de diagnostic "inert" ne contient ni w11 ni kc-ghost :
+            # ce sont des marqueurs du coeur de tweak/Peter.m, absents par
+            # construction dans la variante inerte.
+            assert b"w11" in peter_data, "Peter.dylib ne contient pas w11"
+            assert b"kc-ghost" in peter_data, "Peter.dylib ne contient pas kc-ghost"
 
         for marker in CASE_SENSITIVE_MARKERS:
             assert marker not in binary, "marqueur interdit dans le binaire: %r" % marker
@@ -169,15 +173,23 @@ def verify(path, expected_sha256=EXPECTED_SHA256, expected_files=EXPECTED_FILES,
 
 def main(argv=None):
     args = sys.argv[1:] if argv is None else argv
+    variant = "full"
+    if "--variant" in args:
+        i = args.index("--variant")
+        if i + 1 >= len(args):
+            print("--variant exige une valeur (full|inert)")
+            return 2
+        variant = args[i + 1]
+        args = args[:i] + args[i + 2:]
     if len(args) != 1:
         print(__doc__)
         return 2
     try:
-        counters = verify(args[0])
+        counters = verify(args[0], variant=variant)
     except (AssertionError, OSError, ValueError, struct.error, zipfile.BadZipFile) as exc:
         print("ECHEC: %s" % exc)
         return 1
-    print("OK: IPA valide")
+    print("OK: IPA valide (variante %s)" % variant)
     print("  hash binaire : %s" % counters["sha256"])
     print("  fichiers     : %d" % counters["files"])
     print("  dylibs       : %d (%d Peter + %d NWSupport)" % (
